@@ -112,7 +112,11 @@ def main():
                     help="log a per-step timing breakdown (data/text/ref/fwd/bwd/opt)")
     ap.add_argument("--no-preencode-text", action="store_false", dest="preencode_text",
                     help="skip the upfront unique-prompt text pre-encode (cache lazily instead)")
-    ap.set_defaults(preencode_text=True)
+    ap.add_argument("--no-checkpoint", action="store_false", dest="use_checkpointing",
+                    help="disable DiT gradient checkpointing — much faster backward if VRAM fits "
+                         "(only the 116M adapter trains, but checkpointing recomputes the whole "
+                         "2.4B forward in backward; the bwd was ~90%% of step time)")
+    ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
                          "less memory); fp32 for max numerical stability")
@@ -214,7 +218,8 @@ def main():
             # checkpointing, which re-runs the block forward during backward — the
             # adapter branch must see the same ContextVar on recompute or tensor counts mismatch.
             with use_control_context(ControlContext(ctrl)):
-                v = dit(noised, t, **cond_inputs, cfg_scale=1.0, cfg_dropout_prob=0.0)
+                v = dit(noised, t, **cond_inputs, cfg_scale=1.0, cfg_dropout_prob=0.0,
+                        use_checkpointing=args.use_checkpointing)
                 loss = torch.nn.functional.mse_loss(v.float(), target.float())
                 if args.profile:
                     _sync(); _tf = time.time(); prof["fwd"] += _tf - _tt
