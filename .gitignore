@@ -162,3 +162,8 @@ cython_debug/
 *.ckpt
 *.wav
 wandb/*
+
+# SA Small finetune scaffolding
+.sa_small_stage2_patched/
+sa_small_stage1_unwrapped.ckpt
+wandb/

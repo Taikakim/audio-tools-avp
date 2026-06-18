@@ -32,6 +32,8 @@ SAVE_DIR="${SAVE_DIR:-/run/media/kim/Lehto/sa3_control_runs/riffer}"
 WB_ARGS=""                                            # wandb on by default; WANDB=0 disables
 if [ "${WANDB:-1}" != "0" ]; then
   WB_ARGS="--wandb --wandb-project ${WANDB_PROJECT:-sa3-riffer} --run-name ${RUN_NAME:-$(basename "$SAVE_DIR")-$(date +%m%d-%H%M)}"
+  mkdir -p "$SAVE_DIR"                                 # write wandb run data to the save-dir (Lehto),
+  export WANDB_DIR="$SAVE_DIR"                         # not under the repo where it could shadow imports
 fi
 
 "$PY" sa3_control/train.py \

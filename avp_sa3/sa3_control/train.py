@@ -16,7 +16,9 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# append (not insert(0)) so site-packages resolves first — a wandb run-data dir that
+# wandb writes under the package root must not shadow the real `wandb` package on reimport.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
