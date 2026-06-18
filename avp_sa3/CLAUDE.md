@@ -29,6 +29,13 @@ Tooling lives **here** (`audio-tools-avp`). The **SA3 fork stays upstream-syncab
 only genuine SA3-side interface code (LatCH, ROCm env) belongs there. The control
 adapter needs **no** SA3-fork changes (it wraps `Attention` at runtime).
 
+## Gotchas
+- **Saving audio — never write raw model output.** File writers (esp. the new
+  **torchcodec** backend `torchaudio.save` routes through) clip **fp16** / **>1.0**
+  float; SA3 output regularly peaks above 1.0. Always go through
+  **`sa3_control.audio_io.save_audio()`** (float32 → peak-normalize/clamp → int16 PCM) —
+  never `torchaudio.save(x.float().cpu(), …)` raw. This bit the riffer auditions. See MASTER §5.
+
 ## Keep docs current
 When you add or change a component, update this folder's `ARCHITECTURE.md` **and**
 add the new plumbing to the SAO-level `ARCHITECTURE.md` so the next instance can find

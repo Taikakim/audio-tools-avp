@@ -18,6 +18,7 @@ import torch
 import torchaudio
 
 from sa3_control.adapters import ControlContext, use_control_context
+from sa3_control.audio_io import save_audio
 from sa3_control.conditioner import AudioRefEncoder
 from sa3_control.inject import install_adapters
 
@@ -80,7 +81,7 @@ def main():
         audio = sam.generate(prompt=args.prompt, duration=args.duration, steps=args.steps,
                              cfg_scale=args.cfg, seed=args.seed, sampler_type="euler")
 
-    torchaudio.save(args.out, audio[0].float().cpu(), sam.model.sample_rate)
+    save_audio(args.out, audio[0], sam.model.sample_rate)   # float32+peak-norm+int16 (no clip)
     print(f"riff -> {args.out}  (ref={os.path.basename(args.reference)}, "
           f"prompt={args.prompt!r}, cfg={args.cfg})")
 

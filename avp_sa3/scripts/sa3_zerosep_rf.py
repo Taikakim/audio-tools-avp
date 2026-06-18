@@ -42,8 +42,13 @@ Examples:
 import argparse
 import json
 import logging
+import os
+import sys
 import time
 from pathlib import Path
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from sa3_control.audio_io import save_audio  # noqa: E402  float32+peak-norm+int16 (no clip)
 
 logger = logging.getLogger(__name__)
 
@@ -194,13 +199,13 @@ def main():
 
     out_dir = Path(args.out_dir) / f"{Path(args.input).stem}_{int(time.time())}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    torchaudio.save(str(out_dir / "original.wav"), wav.float().cpu(), sr)
+    save_audio(out_dir / "original.wav", wav, sr, normalize=False)   # keep input level
 
     def decode_save(latent, name):
         pt_dtype = next(sam.model.pretransform.parameters()).dtype
         audio = sam.model.pretransform.decode(latent.to(pt_dtype))
-        audio = audio.to(torch.float32).clamp(-1, 1)[0, :, :int(duration * out_sr)]
-        torchaudio.save(str(out_dir / name), audio.cpu(), out_sr)
+        audio = audio.to(torch.float32)[0, :, :int(duration * out_sr)]
+        save_audio(out_dir / name, audio, out_sr, normalize=False)
 
     with torch.inference_mode():
         # Encode mixture at a window-length latent grid (no silence padding).
