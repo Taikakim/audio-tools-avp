@@ -15,15 +15,23 @@ wraps SA3 at runtime, so `Taikakim/stable-audio-3` stays upstream-syncable.
 Trains **decoupled cross-attention adapters** on pre-encoded SAME-L latents +
 grid-aligned `mir` control features. The adapter wraps the fork's `Attention` (its
 own K/V, zero-init output, additive — base frozen). The **audio-reference branch is
-the "similarity riffer."** Status: **dataset done + tested**; adapter / inject /
-conditioner / train / generate in progress.
+the "similarity riffer."** Status: **training loop smoke-validated against `medium-base`**
+(wraps 24 cross-attn, 4.8% params trainable, RF loss + backward + adapter grads OK with
+gradient checkpointing). Remaining: `generate.py`, attribute branches, `stretch.py`, full run.
 - `dataset.py` — `LatentControlDataset`: reads `Lehto/latents_sa3` (`.npy` + `.json`
   + `.TIMESERIES.npz`) → `latent (256,4096)` + controls (dynamics 4 / rhythm 3 /
   melody 12, **already T=4096, no resampling**) + prompt + `ref_latent` (a different
   crop of the same track = the riffer pairing) + padding_mask. **No audio I/O.**
-- *(planned)* `adapters.py`, `inject.py`, `conditioner.py`, `train.py`,
-  `generate.py`, `stretch.py` (pluggable: **bungee** binding in `mir/pitch_venv`,
-  rubberband fallback).
+- `adapters.py` ✓ — decoupled cross-attn adapter (own K/V, shared frozen `to_q`/
+  `apply_attn`, zero-init out) + `ControlledCrossAttention`. Control tokens via a
+  **module-global holder** (NOT a ContextVar — dropped by gradient-checkpoint recompute).
+- `inject.py` ✓ — `install_adapters` (wraps every `…layers[i].cross_attn` in place at
+  runtime, no fork edit), `freeze_base_train_adapters`, `adapter_state_dict`.
+- `conditioner.py` ✓ — `AudioRefEncoder`: ref latent → control tokens (strided convs + pool).
+- `train.py` ✓ — fp32 RF training, adapter-only optimizer, per-item control cfg-dropout,
+  `--smoke` sanity. *(perf TODO: bf16 base, TunableOp, grad-accum, larger T.)*
+- *(planned)* `generate.py` (decoupled-CFG inference), attribute branches,
+  `stretch.py` (pluggable: **bungee** binding in `mir/pitch_venv`, rubberband fallback).
 
 ### `scripts/` — generation-time CLI tools (training-free)
 - `sa3_flowsep.py` — generative source separation via **FlowEdit/AUDEDIT**
