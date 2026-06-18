@@ -116,6 +116,8 @@ def main():
                     help="disable DiT gradient checkpointing — much faster backward if VRAM fits "
                          "(only the 116M adapter trains, but checkpointing recomputes the whole "
                          "2.4B forward in backward; the bwd was ~90%% of step time)")
+    ap.add_argument("--max-hours", type=float, default=None,
+                    help="wall-clock stop after this many hours (saves riffer_final.pt)")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -242,7 +244,8 @@ def main():
                     tot = sum(prof.values()) or 1.0
                     brk = "  ".join(f"{k}={v / args.log_every * 1000:.0f}ms/{100 * v / tot:.0f}%"
                                     for k, v in prof.items())
-                    print(f"    [profile] per-step avg: {brk}", flush=True)
+                    peak = torch.cuda.max_memory_allocated() / 1e9 if device == "cuda" else 0.0
+                    print(f"    [profile] per-step avg: {brk}  | peak VRAM {peak:.1f} GB", flush=True)
                     for k in prof:
                         prof[k] = 0.0
                 if wb:
@@ -252,6 +255,10 @@ def main():
                 p = os.path.join(args.save_dir, f"riffer_step{step}.pt")
                 torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)}, p)
                 print(f"[save] {p}", flush=True)
+            if args.max_hours and (time.time() - t0) >= args.max_hours * 3600:
+                print(f"[time] reached {args.max_hours}h limit at step {step}", flush=True)
+                step = args.steps   # force the outer while to exit -> final save runs
+                break
             if step >= args.steps:
                 break
 
