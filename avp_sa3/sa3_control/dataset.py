@@ -49,7 +49,7 @@ class LatentControlDataset(Dataset):
     """(latent, controls, prompt, ref_latent) from a latents_sa3 directory."""
 
     def __init__(self, root, controls=("dynamics", "rhythm", "melody"),
-                 audio_ref="same_track", seed=0):
+                 audio_ref="same_track", seed=0, subset_tracks=None):
         self.root = root
         self.controls = [c for c in controls if c in CONTROL_FIELDS]
         self.audio_ref = audio_ref
@@ -61,6 +61,13 @@ class LatentControlDataset(Dataset):
             m = json.load(open(j)) if os.path.exists(j) else {}
             self.meta[p] = m
             self.by_track[track_key(m, p)].append(p)
+        if subset_tracks is not None:           # keep a random subset of TRACKS (not crops),
+            keys = sorted(self.by_track)         # so each kept track keeps all its crops and the
+            np.random.default_rng(seed).shuffle(keys)   # audio-reference pairing still works
+            n = int(subset_tracks * len(keys)) if subset_tracks <= 1 else int(subset_tracks)
+            keep = set(keys[:max(1, n)])
+            self.by_track = defaultdict(list, {k: v for k, v in self.by_track.items() if k in keep})
+            self.paths = [p for p in self.paths if track_key(self.meta[p], p) in keep]
         self._rng = np.random.default_rng(seed)
 
     def __len__(self):

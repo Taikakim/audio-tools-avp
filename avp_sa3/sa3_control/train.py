@@ -67,6 +67,9 @@ def main():
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--subset-tracks", type=float, default=None,
+                    help="train on a random fraction (0.2 = 20%% of tracks, all their crops; "
+                         "preserves the riffer pairing) or count (>1) of tracks. None = all.")
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
                          "less memory); fp32 for max numerical stability")
@@ -107,7 +110,8 @@ def main():
 
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
 
-    ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track", seed=args.seed)
+    ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track",
+                              seed=args.seed, subset_tracks=args.subset_tracks)
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True, drop_last=True,
                     num_workers=args.num_workers, collate_fn=collate)
     print(f"[data] {len(ds)} crops, {ds.track_stats()['tracks']} tracks; "
