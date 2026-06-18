@@ -28,12 +28,18 @@ else
 fi
 export PYTORCH_TUNABLEOP_ENABLED=0                    # negligible on 7.14
 
+SAVE_DIR="${SAVE_DIR:-/run/media/kim/Lehto/sa3_control_runs/riffer}"
+WB_ARGS=""                                            # wandb on by default; WANDB=0 disables
+if [ "${WANDB:-1}" != "0" ]; then
+  WB_ARGS="--wandb --wandb-project ${WANDB_PROJECT:-sa3-riffer} --run-name ${RUN_NAME:-$(basename "$SAVE_DIR")-$(date +%m%d-%H%M)}"
+fi
+
 "$PY" sa3_control/train.py \
   --encoded_dir /run/media/kim/Lehto/latents_sa3 \
   --model medium-base --precision bf16 \
   --crop-frames "${CROP:-2048}" --batch "${BATCH:-1}" \
   --lr "${LR:-1e-4}" --steps "${STEPS:-20000}" \
-  ${SUBSET:+--subset-tracks "$SUBSET"} \
+  ${SUBSET:+--subset-tracks "$SUBSET"} $WB_ARGS \
   --control-dim 768 --n-tokens 256 --cfg-dropout 0.1 \
-  --save-dir "${SAVE_DIR:-/run/media/kim/Lehto/sa3_control_runs/riffer}" \
+  --save-dir "$SAVE_DIR" \
   --save-every "${SAVE_EVERY:-1000}" --num-workers 4 --seed 42

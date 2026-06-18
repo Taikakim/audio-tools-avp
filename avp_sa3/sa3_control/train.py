@@ -70,6 +70,9 @@ def main():
     ap.add_argument("--subset-tracks", type=float, default=None,
                     help="train on a random fraction (0.2 = 20%% of tracks, all their crops; "
                          "preserves the riffer pairing) or count (>1) of tracks. None = all.")
+    ap.add_argument("--wandb", action="store_true", help="log to Weights & Biases")
+    ap.add_argument("--wandb-project", default="sa3-riffer")
+    ap.add_argument("--run-name", default=None)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
                          "less memory); fp32 for max numerical stability")
@@ -117,6 +120,15 @@ def main():
     print(f"[data] {len(ds)} crops, {ds.track_stats()['tracks']} tracks; "
           f"crop {args.crop_frames}f ({crop_seconds:.1f}s)", flush=True)
 
+    wb = None
+    if args.wandb:
+        try:
+            import wandb as wb
+            wb.init(project=args.wandb_project, name=args.run_name, config=vars(args))
+        except Exception as e:
+            print(f"[wandb] disabled ({e})", flush=True)
+            wb = None
+
     os.makedirs(args.save_dir, exist_ok=True)
     step = 0
     t0 = time.time()
@@ -157,6 +169,9 @@ def main():
                 rate = step / (time.time() - t0)
                 print(f"[step {step}/{args.steps}] loss {loss.item():.4f} "
                       f"gnorm {float(gnorm):.3f} {rate:.2f} it/s", flush=True)
+                if wb:
+                    wb.log({"loss": loss.item(), "gnorm": float(gnorm), "it_s": rate,
+                            "epoch": step / max(1, len(ds))}, step=step)
             if step % args.save_every == 0 and not args.smoke:
                 p = os.path.join(args.save_dir, f"riffer_step{step}.pt")
                 torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)}, p)
@@ -174,6 +189,8 @@ def main():
     else:
         torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)},
                    os.path.join(args.save_dir, "riffer_final.pt"))
+    if wb:
+        wb.finish()
     print(f"done -> {args.save_dir}", flush=True)
 
 
