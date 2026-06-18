@@ -39,12 +39,45 @@ def collate(batch):
     }
 
 
-def build_train_cond(sam, prompts, seconds, latent_T, device, dtype):
-    """cond_inputs for a training batch (cfg_scale=1.0 path), mirroring generate()."""
-    conditioning = [{"prompt": p, "seconds_total": float(seconds)} for p in prompts]
-    ct = sam.model.conditioner(conditioning, device)
+# The prompt is fixed per crop, so the frozen text encoder gives the same output every
+# epoch — re-running it every step was the per-step bottleneck (GPU starved between DiT
+# bursts). Encode each unique prompt ONCE and reuse. Cached output is on `device`.
+_TEXT_COND_CACHE = {}   # prompt -> conditioner output dict
+
+
+def _encode_text(sam, prompt, seconds, device):
+    """Run the frozen text conditioner for ONE prompt. no_grad: the encoder is frozen,
+    so no graph is built and the cached tensors act as constants in the train forward."""
+    with torch.no_grad():
+        return sam.model.conditioner([{"prompt": prompt, "seconds_total": float(seconds)}], device)
+
+
+def preencode_text(sam, prompts, seconds, device):
+    """Encode every unique prompt once into the cache, so no training step pays the
+    text-encoder cost."""
+    uniq = sorted(set(prompts))
+    for i, p in enumerate(uniq):
+        if p not in _TEXT_COND_CACHE:
+            _TEXT_COND_CACHE[p] = _encode_text(sam, p, seconds, device)
+        if (i + 1) % 200 == 0:
+            print(f"[preencode] {i + 1}/{len(uniq)} prompts", flush=True)
+    print(f"[preencode] cached {len(uniq)} unique prompts", flush=True)
+
+
+def build_train_cond(sam, prompts, seconds, latent_T, device, dtype, use_cache=True):
+    """cond_inputs for a training batch (cfg_scale=1.0 path), mirroring generate(). The
+    frozen text-encoder output is cached per prompt (batch==1 path)."""
     B = len(prompts)
     io = sam.model.io_channels
+    if use_cache and B == 1:
+        ct = _TEXT_COND_CACHE.get(prompts[0])
+        if ct is None:
+            ct = _encode_text(sam, prompts[0], seconds, device)
+            _TEXT_COND_CACHE[prompts[0]] = ct
+        ct = dict(ct)                                   # shallow copy: don't mutate the cached dict
+    else:
+        conditioning = [{"prompt": p, "seconds_total": float(seconds)} for p in prompts]
+        ct = dict(sam.model.conditioner(conditioning, device))
     ct["inpaint_mask"] = [torch.zeros((B, 1, latent_T), device=device)]
     ct["inpaint_masked_input"] = [torch.zeros((B, io, latent_T), device=device)]
     ci = sam.model.get_conditioning_inputs(ct)
@@ -75,6 +108,11 @@ def main():
     ap.add_argument("--wandb", action="store_true", help="log to Weights & Biases")
     ap.add_argument("--wandb-project", default="sa3-riffer")
     ap.add_argument("--run-name", default=None)
+    ap.add_argument("--profile", action="store_true",
+                    help="log a per-step timing breakdown (data/text/ref/fwd/bwd/opt)")
+    ap.add_argument("--no-preencode-text", action="store_false", dest="preencode_text",
+                    help="skip the upfront unique-prompt text pre-encode (cache lazily instead)")
+    ap.set_defaults(preencode_text=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
                          "less memory); fp32 for max numerical stability")
@@ -131,12 +169,24 @@ def main():
             print(f"[wandb] disabled ({e})", flush=True)
             wb = None
 
+    if args.preencode_text:
+        preencode_text(sam, [ds.meta[p].get("prompt", "") for p in ds.paths], crop_seconds, device)
+
     os.makedirs(args.save_dir, exist_ok=True)
+    prof = {"data": 0.0, "text": 0.0, "ref": 0.0, "fwd": 0.0, "bwd": 0.0, "opt": 0.0}
+
+    def _sync():
+        if device == "cuda":
+            torch.cuda.synchronize()
+
     step = 0
     t0 = time.time()
+    t_iter = time.time()
     cond_enc.train()
     while step < args.steps:
         for b in dl:
+            if args.profile:
+                _sync(); _tm = time.time(); prof["data"] += _tm - t_iter
             T = args.crop_frames
             clean = b["latent"][:, :, :T].to(device=device, dtype=dtype)
             ref = b["ref_latent"].to(device=device, dtype=dtype)
@@ -152,8 +202,12 @@ def main():
             if args.cfg_dropout > 0:                        # per-item control dropout
                 drop = (torch.rand(B, device=device) < args.cfg_dropout).view(B, 1, 1)
                 ctrl = ctrl.masked_fill(drop, 0.0)
+            if args.profile:
+                _sync(); _tr = time.time(); prof["ref"] += _tr - _tm
 
             cond_inputs = build_train_cond(sam, b["prompt"], crop_seconds, T, device, dtype)
+            if args.profile:
+                _sync(); _tt = time.time(); prof["text"] += _tt - _tr
 
             opt.zero_grad(set_to_none=True)
             # keep the control context active THROUGH backward: the DiT uses gradient
@@ -162,15 +216,30 @@ def main():
             with use_control_context(ControlContext(ctrl)):
                 v = dit(noised, t, **cond_inputs, cfg_scale=1.0, cfg_dropout_prob=0.0)
                 loss = torch.nn.functional.mse_loss(v.float(), target.float())
+                if args.profile:
+                    _sync(); _tf = time.time(); prof["fwd"] += _tf - _tt
                 loss.backward()
+            if args.profile:
+                _sync(); _tb = time.time(); prof["bwd"] += _tb - _tf
             gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             step += 1
+            if args.profile:
+                _sync(); t_iter = time.time(); prof["opt"] += t_iter - _tb
+            else:
+                t_iter = time.time()
 
             if step % args.log_every == 0 or args.smoke:
                 rate = step / (time.time() - t0)
                 print(f"[step {step}/{args.steps}] loss {loss.item():.4f} "
                       f"gnorm {float(gnorm):.3f} {rate:.2f} it/s", flush=True)
+                if args.profile:
+                    tot = sum(prof.values()) or 1.0
+                    brk = "  ".join(f"{k}={v / args.log_every * 1000:.0f}ms/{100 * v / tot:.0f}%"
+                                    for k, v in prof.items())
+                    print(f"    [profile] per-step avg: {brk}", flush=True)
+                    for k in prof:
+                        prof[k] = 0.0
                 if wb:
                     wb.log({"loss": loss.item(), "gnorm": float(gnorm), "it_s": rate,
                             "epoch": step / max(1, len(ds))}, step=step)
