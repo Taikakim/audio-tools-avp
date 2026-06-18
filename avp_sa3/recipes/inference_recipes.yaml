@@ -1,0 +1,150 @@
+# Inference recipes — validated technique + parameter sets for working with SA3 / SAO.
+#
+# Each recipe is a reusable config: a named technique with the VALIDATED defaults we
+# found, the tool that runs it, the venv, and when to reach for it. Consumers:
+#   - CLI tools in avp_sa3/scripts/ (separation, riffer) read these as starting params.
+#   - The mir latent feature explorer (mir/plots/explorer, port 7895) — its Viewer tab
+#     can surface these as selectable recipes (steering recipes apply in-app via ridge
+#     directions; script recipes hand off to the SA3 .venv CLI).
+#
+# venv keys:  sa3 = /home/kim/Projects/SAO/stable-audio-3/.venv/bin/python (3.13, torch ROCm)
+#             mir = /home/kim/Projects/mir/mir/bin/python (3.12, librosa/essentia)
+#             sat = /home/kim/Projects/SAO/stable-audio-tools/sat-venv/bin/python (3.10)
+# Add a recipe: copy a block, set validated params, cite the source (WORKLOG/LATCH_RESULTS).
+
+recipes:
+
+  # ── Generative source separation ──────────────────────────────────────────────
+  - id: flowsep-anchored
+    title: Generative source separation (FlowEdit/AUDEDIT + fidelity anchor)
+    kind: separation
+    tool: avp_sa3/scripts/sa3_flowsep.py
+    venv: sa3
+    model: medium-base
+    when: >
+      Isolate a named source from a mix, open-vocabulary ("the acid lead"). Inversion-free,
+      robust to high cfg, anchored to the input. The keeper for generative separation.
+    params:
+      steps: 50
+      n_max: 33                 # how far up the noise the edit reaches
+      cfg_src: 3.5
+      cfg_tar: 13.5
+      n_avg: 2                  # >1 reduces "pumping"
+      anchor_eta: 0.05          # FIDELITY DIAL: 0 = clean but untethered, ~0.05 faithful-and-shaped,
+                                #   >=0.1 collapses toward rebuilding the whole mix. bass anchors fastest.
+      tau: 0.3                  # anchor active for t>=tau (high noise)
+      prompt_prefix: "TrackType: Instrument,"
+      source_prefix: "TrackType: Music, VocalType: Instrumental,"
+      bpm: null                 # set if known (from stem folder names) — improves quality
+    notes: >
+      env-corr-to-input climbs monotonically with anchor_eta. Use the stem-named BPM.
+      Not masking → re-synthesis, not clean stems; for clean drums/bass use mir Demucs.
+    source: WORKLOG 2026-06-18
+
+  - id: zerosep-rf-eta
+    title: RF-Solver flow-inversion separation (η z0-anchor dial)
+    kind: separation
+    tool: avp_sa3/scripts/sa3_zerosep_rf.py
+    venv: sa3
+    model: medium-base
+    when: >
+      When you want a cleaner isolated-instrument TIMBRE than FlowEdit and a continuous
+      fidelity dial off a near-transparent inversion (round-trip rel-err ~0.23).
+    params:
+      steps: 28                 # Taylor reverse-Euler doubles NFE (~50 plain Euler)
+      cfg_invert: 1.0           # MUST be ~1; high cfg ruins recoverability
+      cfg_tar: 8.0
+      eta: [0.0, 0.3, 0.5, 0.7] # z0-anchor sweep; sweet spot ~0.3-0.5 (anchored + prompt-shaped)
+      tau: 0.3
+      taylor: true
+    notes: "η=0 clean-but-far, ~0.5 faithful, ~0.7 over-anchors to the mix."
+    source: WORKLOG 2026-06-18
+
+  # ── Similarity riffer (trained control adapter) ───────────────────────────────
+  - id: riffer-audio-ref
+    title: Similarity riffer (audio-reference control adapter)
+    kind: riffer
+    tool: avp_sa3/sa3_control/generate.py
+    venv: sa3
+    model: medium-base
+    when: >
+      Generate new material that riffs on a reference track's style/content. Needs a
+      trained adapter checkpoint (avp_sa3/sa3_control/train.py / launch_riffer.sh).
+    params:
+      adapter: null             # path to riffer_*.pt
+      reference: null           # audio file to riff on
+      ref_seconds: 30
+      duration: 30
+      steps: 50
+      cfg: 7.0
+      control_dim: 768
+      n_tokens: 256
+    notes: "Decoupled cross-attn adapter (4.8% params), base frozen. Trained on latents_sa3."
+    source: WORKLOG 2026-06-18
+
+  - id: init-audio-style
+    title: Style / timbre transfer (SA3 init_audio / SDEdit)
+    kind: riffer
+    tool: stable_audio_3 model.generate(init_audio=..., init_noise_level=...)
+    venv: sa3
+    model: medium-base
+    when: "Quick remix/style-transfer of an existing track (SA3's supported audio-to-audio)."
+    params:
+      init_noise_level_timbre: 0.4   # change instrument, keep notes
+      init_noise_level_style: 0.6    # shift overall style
+    notes: "This is what sa3_zerosep_lite did — right tool for RIFFING, wrong one for separation."
+    source: "SA3 Prompt Guide (Init Audio)"
+
+  # ── Steering / guidance ───────────────────────────────────────────────────────
+  - id: chroma-steer
+    title: Chroma steering (refit linear readout, training-free latent guidance)
+    kind: steering
+    tool: mir-same-chroma/scripts/sa3_steer_chroma.py
+    venv: sa3
+    model: medium-base
+    when: "Steer generated pitch content toward a target chroma profile during sampling."
+    params:
+      mu: 0.5                   # SA3-medium needs ~15x the script's 0.03 default to move pitch
+      n_iter: 8
+      frac: 0.3
+    notes: "SAME's 256-d latent is ~10x less gain-sensitive than SAO-Small; judge by spread."
+    source: same-chroma REVIEW / WORKLOG
+
+  - id: ridge-steer-explorer
+    title: Training-free ridge steering (in-explorer)
+    kind: steering
+    tool: mir/plots/explorer (latch.py)
+    venv: mir
+    when: "Shift a latent along a feature direction live in the explorer Viewer tab."
+    params:
+      formula: "z += strength * sigma * beta"
+      directions: models/latch/steer_directions.npz   # compute_steer_directions.py
+    notes: >
+      Authority is latent-dependent: gentle on SAO-Small 64-d, strong on SA3 SAME (R² 0.6-0.9).
+      Re-run compute_steer_directions.py for the SA3 latent.
+    source: TOOLS.md / explorer
+
+  - id: latch-guided-sa3
+    title: LatCH training-free guidance (SA3-medium)
+    kind: guidance
+    tool: stable-audio-3 inference/latch_guided.py (via model.generate latch_configs)
+    venv: sa3
+    model: medium-base
+    when: "Steer generation with a trained LatCH head (chroma/rms/beat) at inference."
+    params:
+      gain: 48                  # SA3-medium needs ~48-96, NOT the SAO-Small default of 8
+      head_loss: smooth_l1
+    notes: "Probe R² predicts per-head control. corr=1.0 is a mirage; judge by spread."
+    source: MASTER §5 / LATCH_RESULTS
+
+  # ── Reference / evaluation ────────────────────────────────────────────────────
+  - id: stem-score
+    title: Ground-truth bracketing (score outputs vs reference stems)
+    kind: eval
+    tool: avp_sa3/scripts/stem_score.py
+    venv: mir
+    when: "Pick separation/riffer params objectively against real project stems."
+    params:
+      sort_by: logmel_l1        # also lsd / env_corr; SI-SDR de-emphasized (generative, not phase-locked)
+      role_patterns: "drums=kick|snare|perc; bass=desertbass|bb; lead=lead|acid|..."
+    source: WORKLOG 2026-06-18

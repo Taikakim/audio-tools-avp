@@ -31,6 +31,6 @@ class AudioRefEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(n_tokens)
 
     def forward(self, ref_latent):                 # (B, latent_dim, T)
-        h = self.net(ref_latent.float())           # (B, control_dim, ~T/16)
+        h = self.net(ref_latent.to(self.net[0].weight.dtype))   # (B, control_dim, ~T/16)
         h = self.pool(h)                           # (B, control_dim, n_tokens)
         return h.transpose(1, 2).contiguous()      # (B, n_tokens, control_dim)
