@@ -44,9 +44,11 @@ def main():
     ap.add_argument("--duration", type=float, default=30.0)
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--cfg", type=float, default=7.0)
-    ap.add_argument("--gain", type=float, default=6.0,
-                    help="control strength (1.0 = as trained; ~4-8 = audible reference-riffing — "
-                         "SA3-medium's 256-d latent needs gain>1, validated 2026-06-19)")
+    ap.add_argument("--gain", type=float, default=2.0,
+                    help="control strength. BY EAR (2026-06-19): 1.0 already clean+matching on "
+                         "out-of-dist refs (subtle), ~1.5-3 clean + clearly riffing, >4 glitchy/"
+                         "experimental. (chroma-corr keeps rising past that but the metric ignores "
+                         "the artifacts — trust ears.)")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--out", default="riff.wav")
     args = ap.parse_args()
