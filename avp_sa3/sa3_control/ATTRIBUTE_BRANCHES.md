@@ -71,6 +71,26 @@ the input curve:
 Success = the output *follows the curve* and follows a **different** curve differently
 (the cross-ref-diff lesson: vary the control, the output must vary with it). Gain sweep as before.
 
+**Primary metric: MERIT disentangled similarity** (`github.com/AMAAI-Lab/MERIT`, cloned to
+`Projects/MERIT`). Frozen MERT-330M + 3 tiny pre-trained heads (~11 MB each) → three *independent*
+cosine scores per audio pair: **`S_mel` (melody), `S_rhy` (rhythm), `S_tim` (timbre)**. This is the
+fix for our whole metric crisis: chroma can't see collapse and only sees key; cross-ref-diff is a
+blunt RMS that can't say *which* factor matched. MERIT decomposes it.
+- **Attribute-branch eval:** the control curve came from a source track → decode the output, run
+  MERIT against that source. Steering **melody** must raise **`S_mel`** *while `S_rhy`/`S_tim` stay
+  put* — that's **control + disentanglement** in one shot. Our factors (mel/rhy/dynamics) map ~1:1
+  to MERIT's (mel/rhy/tim). The hand-rolled per-frame correlations above stay as the *time-resolved*
+  check; MERIT is the *factor-identity* check.
+- **Riffer eval too:** output-vs-each-reference per factor tells us *what* the riffer transfers
+  (e.g. high `S_tim`, low `S_rhy`) — and collapse = uniform similarity to all references.
+- **Validation-during-training (solves "loss is a non-metric"):** every N steps, generate a few
+  and log `S_*` to target — a **meaningful curve to watch** instead of the flat RF loss. Cheap-ish
+  (decode + one MERT-330M forward; fits ~1.3 GB).
+- **Heavier, later:** a MERIT *perceptual loss* on the 1-step `x0` decode (disentangled training
+  signal). Caveats: per-step decode cost + noisy `x0` → defer past the validation use.
+- **License:** heads are CC BY-NC-SA (MoisesDB-derived) — fine for research/eval, flag before any
+  commercial use.
+
 ## Alignment with the SA3 Latent Explorer (`mir/plots/explorer_sa3/`)
 
 Built 2026-06-19; it's the natural UI + eval harness for this milestone — **use it, don't
