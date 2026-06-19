@@ -36,6 +36,7 @@ def zero_module(module: nn.Module) -> nn.Module:
 @dataclass
 class ControlContext:
     control_tokens: Optional[torch.Tensor] = None   # (B, T_ctrl, control_dim)
+    gain: float = 1.0                               # generation-time control strength (1.0 = as trained)
 
 
 # Module-global holder for the active control tokens. We deliberately DON'T use a
@@ -43,21 +44,23 @@ class ControlContext:
 # NOT preserve ContextVar state into the backward RECOMPUTE, so the adapter branch would
 # be skipped on recompute (saved-tensor count mismatch -> CheckpointError). A plain module
 # global is read live during recompute, so the original forward and the recompute agree.
-_ACTIVE = {"tokens": None}
+_ACTIVE = {"tokens": None, "gain": 1.0}
 
 
 def current_control_context() -> Optional[ControlContext]:
     tok = _ACTIVE["tokens"]
-    return ControlContext(tok) if tok is not None else None
+    return ControlContext(tok, _ACTIVE["gain"]) if tok is not None else None
 
 
 @contextmanager
 def use_control_context(ctx: Optional[ControlContext]):
     _ACTIVE["tokens"] = ctx.control_tokens if ctx is not None else None
+    _ACTIVE["gain"] = ctx.gain if ctx is not None else 1.0
     try:
         yield
     finally:
         _ACTIVE["tokens"] = None
+        _ACTIVE["gain"] = 1.0
 
 
 # ── head reshape (mirrors the fork's layout) ────────────────────────────────────
@@ -152,5 +155,5 @@ class ControlledCrossAttention(nn.Module):
         base = self.base_attention(x, context=context, **kwargs)
         ctx = current_control_context()
         if ctx is not None and ctx.control_tokens is not None:
-            base = base + self.adapter(x, self.base_attention, ctx.control_tokens)
+            base = base + ctx.gain * self.adapter(x, self.base_attention, ctx.control_tokens)
         return base
