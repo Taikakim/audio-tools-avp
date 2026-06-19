@@ -169,7 +169,8 @@ def main():
         from stable_audio_tools.training.fusion_groups import build_fusion_param_groups
         trainable_mod = torch.nn.ModuleList([w.adapter for w in wrappers] + [cond_enc])
         groups = build_fusion_param_groups(trainable_mod, spectral_wd=0.01, scalar_wd=0.0)
-        opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps, hot_dtype="fp32")
+        opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps,
+                        hot_dtype="bf16", components={"ns5", "normuon", "sf"})  # SF-NorMuon: README's sweet spot
         _sf = bool(getattr(opt, "uses_sf_averaging", False))
         if _sf:
             opt.train()
