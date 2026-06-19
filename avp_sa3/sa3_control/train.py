@@ -118,6 +118,12 @@ def main():
                          "2.4B forward in backward; the bwd was ~90%% of step time)")
     ap.add_argument("--max-hours", type=float, default=None,
                     help="wall-clock stop after this many hours (saves riffer_final.pt)")
+    ap.add_argument("--warmup-steps", type=int, default=0,
+                    help="linear LR warmup over this many steps (0 = none). Best practice for "
+                         "higher LRs — prevents the early gradient explosion seen at lr 1e-3.")
+    ap.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw",
+                    help="adamw (default) or FusionOpt (bifurcated Muon+MONA+Shampoo / SF-AdamW; "
+                         "uses its own built-in warmup_steps).")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -157,7 +163,20 @@ def main():
     print(f"[adapters] wrapped {len(wrappers)} cross-attn; trainable {n_train/1e6:.1f}M "
           f"of {n_base/1e6:.0f}M base ({100*n_train/n_base:.2f}%)", flush=True)
 
-    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+    if args.optimizer == "fusion":
+        sys.path.append("/home/kim/Projects/SAO/stable-audio-tools")
+        from stable_audio_tools.training.fusion_opt import FusionOpt
+        from stable_audio_tools.training.fusion_groups import build_fusion_param_groups
+        trainable_mod = torch.nn.ModuleList([w.adapter for w in wrappers] + [cond_enc])
+        groups = build_fusion_param_groups(trainable_mod, spectral_wd=0.01, scalar_wd=0.0)
+        opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps, hot_dtype="fp32")
+        _sf = bool(getattr(opt, "uses_sf_averaging", False))
+        if _sf:
+            opt.train()
+        print(f"[opt] FusionOpt  (SF-averaging={_sf})", flush=True)
+    else:
+        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
+        _sf = False
 
     ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track",
                               seed=args.seed, subset_tracks=args.subset_tracks)
@@ -229,6 +248,9 @@ def main():
             if args.profile:
                 _sync(); _tb = time.time(); prof["bwd"] += _tb - _tf
             gnorm = torch.nn.utils.clip_grad_norm_(params, 1.0)
+            if args.warmup_steps > 0 and args.optimizer == "adamw":  # FusionOpt warms up internally
+                for pg in opt.param_groups:
+                    pg["lr"] = args.lr * min(1.0, (step + 1) / args.warmup_steps)
             opt.step()
             step += 1
             if args.profile:
@@ -253,7 +275,11 @@ def main():
                             "epoch": step / max(1, len(ds))}, step=step)
             if step % args.save_every == 0 and not args.smoke:
                 p = os.path.join(args.save_dir, f"riffer_step{step}.pt")
+                if _sf:
+                    opt.eval()                               # SF: save the averaged iterate
                 torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)}, p)
+                if _sf:
+                    opt.train()
                 print(f"[save] {p}", flush=True)
             if args.max_hours and (time.time() - t0) >= args.max_hours * 3600:
                 print(f"[time] reached {args.max_hours}h limit at step {step}", flush=True)
@@ -270,6 +296,8 @@ def main():
         print(f"[smoke OK] {len(g)} adapter tensors got grads; mean grad-norm {np.mean(g):.4e}; "
               f"base cross-attn frozen={base_frozen} got_no_grad={base_no_grad}", flush=True)
     else:
+        if _sf:
+            opt.eval()                                       # SF: final save = averaged iterate
         torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)},
                    os.path.join(args.save_dir, "riffer_final.pt"))
     if wb:
