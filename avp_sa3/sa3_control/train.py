@@ -45,6 +45,23 @@ def collate(batch):
 _TEXT_COND_CACHE = {}   # prompt -> conditioner output dict
 
 
+def _sample_t(sampler, B, device):
+    """Diffusion timestep sampler (ported from underfit/SAT). 'logit_normal' is our
+    original (= sigmoid(randn)); 'log_snr' samples Gaussian on logSNR (mean -1.2, std 2.0)
+    -> t=sigmoid(-logsnr), biasing toward the informative band instead of pure mid-noise."""
+    if sampler == "uniform":
+        return torch.rand(B, device=device)
+    if sampler == "logit_normal":
+        return torch.sigmoid(torch.randn(B, device=device)).clamp(1e-4, 1 - 1e-4)
+    if sampler == "log_snr":
+        ls = torch.randn(B, device=device) * 2.0 - 1.2
+        return torch.sigmoid(-ls).clamp(1e-4, 1 - 1e-4)
+    if sampler == "log_snr_uniform":
+        ls = torch.rand(B, device=device) * 11.0 - 6.0
+        return torch.sigmoid(-ls).clamp(1e-4, 1 - 1e-4)
+    raise ValueError(f"unknown timestep_sampler: {sampler}")
+
+
 def _encode_text(sam, prompt, seconds, device):
     """Run the frozen text conditioner for ONE prompt. no_grad: the encoder is frozen,
     so no graph is built and the cached tensors act as constants in the train forward."""
@@ -124,6 +141,10 @@ def main():
     ap.add_argument("--optimizer", choices=["adamw", "fusion", "sfadamw"], default="adamw",
                     help="adamw (default), fusion (FusionOpt SF-NorMuon @ bf16), or sfadamw "
                          "(FusionOpt sf-only = ScheduleFree-AdamW).")
+    ap.add_argument("--timestep-sampler",
+                    choices=["logit_normal", "log_snr", "log_snr_uniform", "uniform"], default="logit_normal",
+                    help="diffusion t sampler (underfit borrow). logit_normal = original; "
+                         "log_snr biases toward the informative sigma band (may de-noise the loss).")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -218,7 +239,7 @@ def main():
             ref = b["ref_latent"].to(device=device, dtype=dtype)
             B = clean.shape[0]
 
-            t = torch.sigmoid(torch.randn(B, device=device)).clamp(1e-4, 1 - 1e-4)
+            t = _sample_t(args.timestep_sampler, B, device)
             tb = t.view(B, 1, 1)
             noise = torch.randn_like(clean)
             noised = clean * (1 - tb) + noise * tb
