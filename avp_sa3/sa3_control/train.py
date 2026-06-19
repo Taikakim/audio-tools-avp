@@ -138,9 +138,12 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=0,
                     help="linear LR warmup over this many steps (0 = none). Best practice for "
                          "higher LRs — prevents the early gradient explosion seen at lr 1e-3.")
-    ap.add_argument("--optimizer", choices=["adamw", "fusion", "sfadamw"], default="adamw",
-                    help="adamw (default), fusion (FusionOpt SF-NorMuon @ bf16), or sfadamw "
-                         "(FusionOpt sf-only = ScheduleFree-AdamW).")
+    ap.add_argument("--optimizer", choices=["adamw", "fusion", "sfadamw", "fusion_full"], default="adamw",
+                    help="adamw (default), fusion (FusionOpt SF-NorMuon @ bf16), sfadamw "
+                         "(FusionOpt sf-only = ScheduleFree-AdamW), or fusion_full (all 5 components: "
+                         "mona+shampoo+ns5+normuon+sf — the full composition).")
+    ap.add_argument("--resume", default="", help="warm-start: load adapter+conditioner weights from a "
+                    "checkpoint .pt (optimizer restarts fresh; not an exact-state resume).")
     ap.add_argument("--timestep-sampler",
                     choices=["logit_normal", "log_snr", "log_snr_uniform", "uniform"], default="logit_normal",
                     help="diffusion t sampler (underfit borrow). logit_normal = original; "
@@ -183,14 +186,20 @@ def main():
     n_base = sum(p.numel() for p in sam.model.parameters())
     print(f"[adapters] wrapped {len(wrappers)} cross-attn; trainable {n_train/1e6:.1f}M "
           f"of {n_base/1e6:.0f}M base ({100*n_train/n_base:.2f}%)", flush=True)
+    if args.resume:                                          # warm-start (weights only; optimizer fresh)
+        from sa3_control.generate import load_adapter_state
+        load_adapter_state(torch.load(args.resume, map_location="cpu")["state"], wrappers, cond_enc)
+        print(f"[resume] warm-started adapter+conditioner from {args.resume}", flush=True)
 
-    if args.optimizer in ("fusion", "sfadamw"):
+    if args.optimizer in ("fusion", "sfadamw", "fusion_full"):
         sys.path.append("/home/kim/Projects/SAO/stable-audio-tools")
         from stable_audio_tools.training.fusion_opt import FusionOpt
         from stable_audio_tools.training.fusion_groups import build_fusion_param_groups
         trainable_mod = torch.nn.ModuleList([w.adapter for w in wrappers] + [cond_enc])
         groups = build_fusion_param_groups(trainable_mod, spectral_wd=0.01, scalar_wd=0.0)
-        comps = {"sf"} if args.optimizer == "sfadamw" else {"ns5", "normuon", "sf"}  # sf-only = ScheduleFree-AdamW
+        comps = ({"sf"} if args.optimizer == "sfadamw"
+                 else None if args.optimizer == "fusion_full"        # None = all 5 (mona+shampoo+ns5+normuon+sf)
+                 else {"ns5", "normuon", "sf"})                      # fusion = SF-NorMuon
         opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps, hot_dtype="bf16", components=comps)
         _sf = bool(getattr(opt, "uses_sf_averaging", False))
         if _sf:
