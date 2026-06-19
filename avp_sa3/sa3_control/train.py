@@ -121,9 +121,9 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=0,
                     help="linear LR warmup over this many steps (0 = none). Best practice for "
                          "higher LRs — prevents the early gradient explosion seen at lr 1e-3.")
-    ap.add_argument("--optimizer", choices=["adamw", "fusion"], default="adamw",
-                    help="adamw (default) or FusionOpt (bifurcated Muon+MONA+Shampoo / SF-AdamW; "
-                         "uses its own built-in warmup_steps).")
+    ap.add_argument("--optimizer", choices=["adamw", "fusion", "sfadamw"], default="adamw",
+                    help="adamw (default), fusion (FusionOpt SF-NorMuon @ bf16), or sfadamw "
+                         "(FusionOpt sf-only = ScheduleFree-AdamW).")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -163,18 +163,18 @@ def main():
     print(f"[adapters] wrapped {len(wrappers)} cross-attn; trainable {n_train/1e6:.1f}M "
           f"of {n_base/1e6:.0f}M base ({100*n_train/n_base:.2f}%)", flush=True)
 
-    if args.optimizer == "fusion":
+    if args.optimizer in ("fusion", "sfadamw"):
         sys.path.append("/home/kim/Projects/SAO/stable-audio-tools")
         from stable_audio_tools.training.fusion_opt import FusionOpt
         from stable_audio_tools.training.fusion_groups import build_fusion_param_groups
         trainable_mod = torch.nn.ModuleList([w.adapter for w in wrappers] + [cond_enc])
         groups = build_fusion_param_groups(trainable_mod, spectral_wd=0.01, scalar_wd=0.0)
-        opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps,
-                        hot_dtype="bf16", components={"ns5", "normuon", "sf"})  # SF-NorMuon: README's sweet spot
+        comps = {"sf"} if args.optimizer == "sfadamw" else {"ns5", "normuon", "sf"}  # sf-only = ScheduleFree-AdamW
+        opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps, hot_dtype="bf16", components=comps)
         _sf = bool(getattr(opt, "uses_sf_averaging", False))
         if _sf:
             opt.train()
-        print(f"[opt] FusionOpt  (SF-averaging={_sf})", flush=True)
+        print(f"[opt] {args.optimizer} (components={sorted(comps)}, SF={_sf})", flush=True)
     else:
         opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
         _sf = False
