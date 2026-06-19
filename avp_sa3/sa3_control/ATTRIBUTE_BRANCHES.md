@@ -98,6 +98,34 @@ duplicate it.**
 5. Feature-following eval (above). Iterate gains.
 6. If it follows: separate per-attribute branches + independent gains (compose controls).
 
+## audioscope (activation steering) — borrow the probe + a cheap baseline
+
+`github.com/guglielmocamporese/audioscope` (cloned to `Projects/audioscope`) does
+mechanistic-interp **activation steering** on SA3's DiT: mean-difference a direction in the
+**1536-d residual stream** (`v_l = mean(acts_pos) − mean(acts_neg)`, unit-norm), add `α·v_l` to
+the block output at inference → mood shifts, no prompt change. A **third control paradigm** next
+to our trained adapter and LatCH — and the lightest (zero training). Three concrete borrows:
+
+1. **The per-layer probe answers our "where to inject" question.** audioscope fits a logistic
+   probe on every DiT layer's activations → valence is most linear at **layers 4–11** (first half;
+   "middle layers encode semantics"). **Run the same probe for rhythm/melody/dynamics** → pick the
+   injection layer(s) empirically instead of guessing. This is **step 1** of the execution order
+   (do it alongside the `modular_local_cond` probe).
+2. **Free global-mood vectors from OUR labels.** audioscope uses contrastive *prompts*; we have
+   thousands of crops with **essentia mood labels** (and 496 class labels total). Collect DiT
+   activations on `happy` vs `sad` crops (real labeled audio, better-grounded than prompts) →
+   mean-diff → an instant **mood dial**, and a **training-free baseline** to measure the trained
+   adapter against. Cheap, GPU-gated, no training.
+3. **`@torch.compile` gotcha (cross-check our adapter).** SA3's `TransformerBlock` is
+   `@torch.compile`'d on CUDA → `register_forward_hook` *fires but doesn't modify the graph*; the
+   fix is monkey-patching `block.forward` (which is what our adapter already does). We run
+   `TORCH_COMPILE=0` (ROCm), so hooks likely work for us — but the wrap approach is robust either way.
+
+**Scope boundary:** activation steering is a **global, constant** direction (one `α`) → great for
+*categorical/global* attributes (mood, valence), **cannot** do a time-varying curve. So it
+*complements*, not replaces, the attribute branches: global moods → steering (free); time-varying
+rhythm/melody/dynamics → the trained adapter (this milestone).
+
 ## Open questions for Kim
 - Which attributes first? (chroma is the most striking demo; dynamics the easiest to verify.)
 - One fused control or per-attribute branches from the start?
