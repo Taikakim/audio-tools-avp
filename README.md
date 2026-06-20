@@ -4,7 +4,21 @@
 
 The base library trains and runs Stable Audio models. This fork is about the next question: once a model can generate convincing audio from a prompt, **how do you steer it** — at training time and at inference time — toward the specific musical things you can hear in your head but cannot say in words? Bass that breathes with the downbeat, brightness that follows a phrase, a key, a density, a groove. The work here is a growing set of *intervention points* layered onto the base models: trained latent-control heads, control adapters, training-free guidance, a purpose-built optimizer, and the tooling to train, audition, and score it all.
 
-> Personal research fork by **[aavepyora.online](https://aavepyora.online)** ("AVP"). It is one of three repos in a small MIR → control → generation pipeline (a feature-extraction repo feeds targets to the control heads trained here, which steer a Stable Audio 3 inference repo). Primary development is on **AMD (RDNA4 / ROCm)** — see [`install.sh`](install.sh) and [`CLAUDE.md`](CLAUDE.md).
+> Personal research fork by **[aavepyora.online](https://aavepyora.online)** ("AVP"). Primary development is on **AMD (RDNA4 / ROCm)** — see [`install.sh`](install.sh) and [`CLAUDE.md`](CLAUDE.md).
+
+---
+
+## The pipeline — related repositories
+
+This repository is one of three that together form a small pipeline for **controllable** AI music generation:
+
+| Repository | Role |
+|---|---|
+| **[mir-feature-extraction](https://github.com/Taikakim/mir-feature-extraction)** | Extracts musical features from audio — rhythm/beat, loudness, spectral, harmonic, timbral, aesthetic — as whole-track timeseries and labels. The analysis backbone and the source of **control targets**. |
+| **audio-tools-avp** *(this repo)* | Trains the **control** layer: latent-control heads (LatCH) against those features, the FusionOpt optimizer, SAO-Small finetuning, and Stable Audio 3 control adapters. A fork of `stable-audio-tools`. |
+| **[stable-audio-3](https://github.com/Taikakim/stable-audio-3)** | Runs **Stable Audio 3** inference with those controls: LatCH-guided generation, LoRA finetuning, long-form rendering, and experimental samplers. A fork of `stable-audio-3`. |
+
+**Flow:** `mir-feature-extraction` (measure musical features) → **audio-tools-avp** (train heads/adapters that steer toward them) → `stable-audio-3` (generate, steered). Because the control heads read the same latent space the generator carves, **a feature `mir` can measure becomes a knob you can steer** — the throughline across all three.
 
 ---
 
