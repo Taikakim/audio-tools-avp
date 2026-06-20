@@ -11,6 +11,8 @@ It is written for a **musician and maker** — someone who knows resonance, damp
 
 → **Start with the [Preface](00-preface.md).**
 
+→ Once you know *which* control you want and need the real artifacts to build it, see the **[Control-Methods Sourcebook](CONTROL_METHODS_SOURCEBOOK.md)** — the nuts-and-bolts companion: every surveyed paper, repo, and experiment hung on these chapters, judged against SA3's exact construction (rectified flow, waveform-VAE latent, DiT), with a first experiment for each.
+
 ---
 
 ## How the book is built
