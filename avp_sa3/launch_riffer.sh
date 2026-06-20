@@ -46,6 +46,7 @@ fi
   ${SUBSET:+--subset-tracks "$SUBSET"} $WB_ARGS $CK_ARG \
   ${MAX_HOURS:+--max-hours "$MAX_HOURS"} ${WARMUP:+--warmup-steps "$WARMUP"} ${OPTIMIZER:+--optimizer "$OPTIMIZER"} \
   ${NO_PREENCODE:+--no-preencode-text} ${TIMESTEP:+--timestep-sampler "$TIMESTEP"} ${RESUME:+--resume "$RESUME"} \
+  ${CONTROL_MODE:+--control-mode "$CONTROL_MODE"} ${SCALAR_FIELD:+--scalar-field "$SCALAR_FIELD"} \
   --control-dim 768 --n-tokens 256 --cfg-dropout 0.1 \
   --save-dir "$SAVE_DIR" \
   --save-every "${SAVE_EVERY:-1000}" --num-workers 4 --seed 42
