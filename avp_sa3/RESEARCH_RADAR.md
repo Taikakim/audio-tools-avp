@@ -89,26 +89,4 @@ Self/cross-attention injection and RF inversion solvers — the toolkit for SA3 
 
 ---
 
-## 7. Top Experiments to Run Next on SA3
-
-Ordered by promise × ease. Each names the component, the SA3 hook, the concrete action, and the expected payoff.
-
-1. **Finish APG + add CFG-Zero\* to the sampler** (hook b). Add the missing **negative-momentum** term to the existing `apg_project()`, and add CFG-Zero\*'s per-step scalar + first-step zero-init to `sampling.py`. *Payoff:* higher usable CFG without saturation, and reduced early-step tonal/structural drift — both ~free, both validated on RF-DiTs. (2503.18886, 2410.02416)
-
-2. **TADA activation steering on SA3-medium** (hook c). Run activation-patching to locate SA3's semantic bottleneck (strong prior: layers ~{11,12}/24 from Stable Audio Open), build ~256 contrast pairs from our labeled crops, inject CAA mean-difference vectors. *Payoff:* one-liner additive control of tempo/genre/instrument presence, cheaper than LatCH and reported to beat LoRA on precision. (2602.11910)
-
-3. **Lookahead denoising + latent partitioning in the FIFO prototype** (hooks b,c). Add the missing lookahead step (skip Euler updates below a sigma cutoff) and tighten per-slot sigma ranges in `build_slot_sigmas()`. *Payoff:* potentially converts the untested FIFO prototype into a working long-form generator in one ~50-LOC change. (2405.11473)
-
-4. **MPGD audio-classifier guidance via SAME-L** (hook c). Decode z0-hat→audio through SAME-L, compute a loss from a frozen audio model (CLAP / beat tracker / Audiobox Aesthetics), gradient through the decoder with manifold projection, fp32. *Payoff:* zero-shot guidance toward any audio metric with no head training and without latent-space garbage. (2311.16424)
-
-5. **FireFlow + LQR-SDE inversion in `sa3_zerosep_rf.py`** (hook b). Swap the reverse-Euler for FireFlow's velocity-reuse solver and replace the ad-hoc η with the LQR stochastic-reverse term. *Payoff:* lower round-trip error than current 0.23, 3× cheaper inversion, and a principled fix for the t→1 blow-up gotcha — directly improves separation/editing faithfulness. (2412.07517, 2410.10792)
-
-6. **MIR Concept Sliders on SA3's LoRA API** (hook d). Train tiny contrastive-pair LoRAs (with preservation prompts) for single axes — bass prominence, BPM feel, reverb density — using our existing RMS/BPM labels; compose via `set_lora_strength`. *Payoff:* stackable, runtime-modulatable continuous dials with zero new infrastructure. (2311.12092)
-
-7. **SAE on the latents_sa3 corpus** (hook e). Train a sparse autoencoder on the 5400 `(1,256,4096)` crops (hours, not days), probe for pitch/amplitude/timbre directions, test as additive offsets in `latch_guided.py`. *Payoff:* monosemantic latent knobs that need no diffusion forward pass; foundation for interpretable SA3 control. (openreview 5fsYFQzzMX)
-
-8. **KV-Edit background anchoring for inpainting/continuation** (hook c). Cache unedited-region KV from one pass, inject throughout denoise with a 1D temporal mask. *Payoff:* hard-anchored context (frozen bars truly don't drift) — a strict upgrade over the current sliding-window inpaint. (2502.17363)
-
-9. **TreeG with a LatCH-head reward** (hook f). Branch SA3's Euler loop at a few intermediate sigmas, score x0-hat with a LatCH head or a black-box beat-tracker, keep top-K. Prototype on `small-music`/CPU to control cost. *Payoff:* trade compute for control fidelity on non-differentiable rewards; the closest published method to our use case (music-validated). (2502.11420)
-
-10. **MuseControlLite RoPE cross-attn adapters (LatCH phase-2)** (hooks a,d). Freeze the DiT, add decoupled RoPE cross-attention adapters, train ~85M params on `latents_sa3/*.TIMESERIES.npz` per-frame targets (beat/onset/RMS/chroma). *Payoff:* temporally-precise time-varying control built on the proven Stable-Audio-Open recipe — the efficient path beyond global-prompt conditioning. (2506.18729)
+*A neutral full list of these components (no ranking) is in [`CONTROL_FINDINGS.md`](CONTROL_FINDINGS.md).*
