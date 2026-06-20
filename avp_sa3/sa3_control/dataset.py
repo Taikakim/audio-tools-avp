@@ -77,6 +77,8 @@ class LatentControlDataset(Dataset):
         return len(self.paths)
 
     def _load_controls(self, stem: str) -> dict:
+        if not self.controls:                       # scalar/no-timeseries mode: don't touch the npz
+            return {}                               # (some crops, e.g. 'silence', have no .TIMESERIES.npz)
         z = np.load(stem + ".TIMESERIES.npz")
         out = {}
         for name in self.controls:
