@@ -25,18 +25,22 @@ import torch
 from torch.utils.data import DataLoader
 
 from sa3_control.adapters import ControlContext, use_control_context
-from sa3_control.conditioner import AudioRefEncoder
+from sa3_control.conditioner import AudioRefEncoder, ScalarAttributeEncoder
 from sa3_control.dataset import LatentControlDataset
 from sa3_control.inject import (adapter_state_dict, freeze_base_train_adapters,
                                 install_adapters)
 
 
 def collate(batch):
-    return {
+    out = {
         "latent": torch.stack([b["latent"] for b in batch]),
-        "ref_latent": torch.stack([b["ref_latent"] for b in batch]),
         "prompt": [b["prompt"] for b in batch],
     }
+    if "ref_latent" in batch[0]:
+        out["ref_latent"] = torch.stack([b["ref_latent"] for b in batch])
+    if "scalar" in batch[0]:
+        out["scalar"] = torch.stack([b["scalar"] for b in batch])
+    return out
 
 
 # The prompt is fixed per crop, so the frozen text encoder gives the same output every
@@ -148,6 +152,11 @@ def main():
                     choices=["logit_normal", "log_snr", "log_snr_uniform", "uniform"], default="logit_normal",
                     help="diffusion t sampler (underfit borrow). logit_normal = original; "
                          "log_snr biases toward the informative sigma band (may de-noise the loss).")
+    ap.add_argument("--control-mode", choices=["audio_ref", "scalar"], default="audio_ref",
+                    help="audio_ref = the riffer (opaque reference latent); scalar = an explicit "
+                         "per-crop attribute (e.g. onset_density) — the first attribute branch.")
+    ap.add_argument("--scalar-field", default="onset_density",
+                    help="which per-crop .json scalar to condition on when --control-mode scalar")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -176,8 +185,13 @@ def main():
 
     # adapters + conditioner
     wrappers = install_adapters(sam, control_dim=args.control_dim)
-    cond_enc = AudioRefEncoder(latent_dim=256, control_dim=args.control_dim,
-                               n_tokens=args.n_tokens).to(device=device, dtype=dtype)
+    if args.control_mode == "scalar":
+        cond_enc = ScalarAttributeEncoder(control_dim=args.control_dim,
+                                          n_tokens=min(args.n_tokens, 16)).to(device=device, dtype=dtype)
+        print(f"[control] scalar attribute '{args.scalar_field}' -> ScalarAttributeEncoder", flush=True)
+    else:
+        cond_enc = AudioRefEncoder(latent_dim=256, control_dim=args.control_dim,
+                                   n_tokens=args.n_tokens).to(device=device, dtype=dtype)
     if dtype != torch.float32:
         for w in wrappers:
             w.adapter.to(dtype)
@@ -209,8 +223,17 @@ def main():
         opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
         _sf = False
 
-    ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track",
-                              seed=args.seed, subset_tracks=args.subset_tracks)
+    if args.control_mode == "scalar":
+        ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref=None,
+                                  seed=args.seed, subset_tracks=args.subset_tracks,
+                                  scalar_field=args.scalar_field)
+        vals = np.array([m[args.scalar_field] for m in ds.meta.values() if args.scalar_field in m], dtype=np.float32)
+        ds.scalar_mean, ds.scalar_std = float(vals.mean()), float(vals.std())
+        print(f"[control] {args.scalar_field}: mean {ds.scalar_mean:.3f} std {ds.scalar_std:.3f} "
+              f"(n={len(vals)}); standardized at train time", flush=True)
+    else:
+        ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track",
+                                  seed=args.seed, subset_tracks=args.subset_tracks)
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True, drop_last=True,
                     num_workers=args.num_workers, collate_fn=collate)
     print(f"[data] {len(ds)} crops, {ds.track_stats()['tracks']} tracks; "
@@ -245,7 +268,6 @@ def main():
                 _sync(); _tm = time.time(); prof["data"] += _tm - t_iter
             T = args.crop_frames
             clean = b["latent"][:, :, :T].to(device=device, dtype=dtype)
-            ref = b["ref_latent"].to(device=device, dtype=dtype)
             B = clean.shape[0]
 
             t = _sample_t(args.timestep_sampler, B, device)
@@ -254,7 +276,10 @@ def main():
             noised = clean * (1 - tb) + noise * tb
             target = noise - clean                          # rectified-flow velocity
 
-            ctrl = cond_enc(ref)                            # (B, n_tokens, control_dim)
+            if args.control_mode == "scalar":
+                ctrl = cond_enc(b["scalar"].to(device=device, dtype=dtype))    # (B, n_tokens, control_dim)
+            else:
+                ctrl = cond_enc(b["ref_latent"].to(device=device, dtype=dtype))
             if args.cfg_dropout > 0:                        # per-item control dropout
                 drop = (torch.rand(B, device=device) < args.cfg_dropout).view(B, 1, 1)
                 ctrl = ctrl.masked_fill(drop, 0.0)

@@ -49,10 +49,13 @@ class LatentControlDataset(Dataset):
     """(latent, controls, prompt, ref_latent) from a latents_sa3 directory."""
 
     def __init__(self, root, controls=("dynamics", "rhythm", "melody"),
-                 audio_ref="same_track", seed=0, subset_tracks=None):
+                 audio_ref="same_track", seed=0, subset_tracks=None,
+                 scalar_field=None, scalar_norm=(0.0, 1.0)):
         self.root = root
         self.controls = [c for c in controls if c in CONTROL_FIELDS]
         self.audio_ref = audio_ref
+        self.scalar_field = scalar_field            # e.g. "onset_density" — a per-crop .json scalar control
+        self.scalar_mean, self.scalar_std = scalar_norm
         self.paths = sorted(glob.glob(os.path.join(root, "*.npy")))
         self.meta = {}
         self.by_track = defaultdict(list)
@@ -100,6 +103,9 @@ class LatentControlDataset(Dataset):
         }
         if self.audio_ref == "same_track":
             item["ref_latent"] = self._pick_reference(p)
+        if self.scalar_field is not None:           # normalised per-crop scalar control (e.g. onset_density)
+            raw = float(m.get(self.scalar_field, self.scalar_mean))
+            item["scalar"] = torch.tensor((raw - self.scalar_mean) / (self.scalar_std + 1e-9), dtype=torch.float32)
         pm = m.get("padding_mask")
         if pm is not None:
             item["padding_mask"] = torch.tensor(np.asarray(pm, dtype=np.float32))

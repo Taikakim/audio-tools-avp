@@ -16,7 +16,8 @@ import csv
 import json
 
 sys.path.append("/home/kim/Projects/SAO/stable-audio-tools/avp_sa3")
-import torchaudio
+import soundfile as sf
+import torch
 from sa3_control.merit_eval import MeritScorer, FACTORS
 
 DIR = sys.argv[1] if len(sys.argv) > 1 else "/run/media/kim/Lehto/sa3_control_runs/bracket6"
@@ -29,8 +30,11 @@ scorer = MeritScorer(device=DEV)
 
 
 def load(path):
-    w, sr = torchaudio.load(path)
-    return w, sr
+    w, sr = sf.read(path, dtype="float32")    # (T,) mono or (T,C)
+    t = torch.from_numpy(w)
+    if t.ndim == 2:
+        t = t.T                               # (T,C) -> (C,T) for embed's mean(0)
+    return t, sr
 
 
 def cos(a, b):
