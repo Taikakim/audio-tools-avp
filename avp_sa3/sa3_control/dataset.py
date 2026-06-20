@@ -71,6 +71,11 @@ class LatentControlDataset(Dataset):
             keep = set(keys[:max(1, n)])
             self.by_track = defaultdict(list, {k: v for k, v in self.by_track.items() if k in keep})
             self.paths = [p for p in self.paths if track_key(self.meta[p], p) in keep]
+        if scalar_field is not None:            # drop crops with no scalar label (e.g. junk 'silence.npy')
+            before = len(self.paths)
+            self.paths = [p for p in self.paths if scalar_field in self.meta.get(p, {})]
+            if len(self.paths) < before:
+                print(f"[dataset] dropped {before - len(self.paths)} crops missing '{scalar_field}'", flush=True)
         self._rng = np.random.default_rng(seed)
 
     def __len__(self):
@@ -96,8 +101,11 @@ class LatentControlDataset(Dataset):
         p = self.paths[i]
         stem = p[:-4]
         m = self.meta[p]
+        lat = np.load(p).astype(np.float32)
+        while lat.ndim > 2 and lat.shape[0] == 1:   # squeeze stray batch dims, e.g. (1,256,4096) -> (256,4096)
+            lat = lat[0]
         item = {
-            "latent": torch.from_numpy(np.load(p).astype(np.float32)),   # (256, 4096)
+            "latent": torch.from_numpy(lat),                             # (256, 4096)
             "prompt": m.get("prompt", ""),
             "controls": self._load_controls(stem),
             "stem": os.path.basename(stem),
