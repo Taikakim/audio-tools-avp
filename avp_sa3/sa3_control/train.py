@@ -333,7 +333,9 @@ def main():
                 p = os.path.join(args.save_dir, f"riffer_step{step}.pt")
                 if _sf:
                     opt.eval()                               # SF: save the averaged iterate
-                torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)}, p)
+                torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
+                            "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
+                            "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]}, p)
                 if _sf:
                     opt.train()
                 print(f"[save] {p}", flush=True)
@@ -354,7 +356,9 @@ def main():
     else:
         if _sf:
             opt.eval()                                       # SF: final save = averaged iterate
-        torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args)},
+        torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
+                            "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
+                            "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]},
                    os.path.join(args.save_dir, "riffer_final.pt"))
     if wb:
         wb.finish()
