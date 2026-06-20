@@ -15,9 +15,12 @@ wraps SA3 at runtime, so `Taikakim/stable-audio-3` stays upstream-syncable.
 Trains **decoupled cross-attention adapters** on pre-encoded SAME-L latents +
 grid-aligned `mir` control features. The adapter wraps the fork's `Attention` (its
 own K/V, zero-init output, additive — base frozen). The **audio-reference branch is
-the "similarity riffer."** Status: **training loop smoke-validated against `medium-base`**
-(wraps 24 cross-attn, 4.8% params trainable, RF loss + backward + adapter grads OK with
-gradient checkpointing). Remaining: `generate.py`, attribute branches, `stretch.py`, full run.
+the "similarity riffer."** Status (2026-06-20): **riffer trained + validated** against
+`medium-base` (wraps 24 cross-attn, 4.8% params). **Reference-specific only at lr≈1e-4**
+(peaks ~step6000 then "elbow"-declines); **heavier LR mode-collapses** (lr1e-3 collapsed).
+**Metric lesson: judge by cross-reference AUDIO diff + MERIT, NOT chroma** (blind to collapse)
+and **NOT loss** (noise-dominated — flat for working *and* collapsed). Gain ~1–2 clean,
+>4 artifacts. **Next milestone → attribute branches** (`sa3_control/ATTRIBUTE_BRANCHES.md`).
 - `dataset.py` — `LatentControlDataset`: reads `Lehto/latents_sa3` (`.npy` + `.json`
   + `.TIMESERIES.npz`) → `latent (256,4096)` + controls (dynamics 4 / rhythm 3 /
   melody 12, **already T=4096, no resampling**) + prompt + `ref_latent` (a different
@@ -28,10 +31,18 @@ gradient checkpointing). Remaining: `generate.py`, attribute branches, `stretch.
 - `inject.py` ✓ — `install_adapters` (wraps every `…layers[i].cross_attn` in place at
   runtime, no fork edit), `freeze_base_train_adapters`, `adapter_state_dict`.
 - `conditioner.py` ✓ — `AudioRefEncoder`: ref latent → control tokens (strided convs + pool).
-- `train.py` ✓ — fp32 RF training, adapter-only optimizer, per-item control cfg-dropout,
-  `--smoke` sanity. *(perf TODO: bf16 base, TunableOp, grad-accum, larger T.)*
-- *(planned)* `generate.py` (decoupled-CFG inference), attribute branches,
-  `stretch.py` (pluggable: **bungee** binding in `mir/pitch_venv`, rubberband fallback).
+- `train.py` ✓ — bf16/fp32 RF training, adapter-only optimizer, per-item control cfg-dropout.
+  `--optimizer adamw|fusion|sfadamw|fusion_full` (FusionOpt SF-NorMuon / SF-AdamW / full —
+  **OOMs at crop2048 no-ckpt, run crop≤1024**), `--warmup-steps`, `--timestep-sampler`
+  (logit_normal|log_snr…, underfit borrow), `--resume` (warm-start adapter weights),
+  `--max-hours`, `--no-checkpoint`, `--no-preencode-text`, `--subset-tracks`.
+- `generate.py` ✓ — decoupled-CFG inference + `--gain`; saves via **soundfile PCM_16**
+  (never torchaudio/torchcodec — clips fp16). `load_adapter_state` shared with the bracket.
+- `merit_eval.py` ✓ — **MERIT** disentangled similarity (MERT-330M + 3 heads) →
+  S_mel/S_rhy/S_tim, the eval metric (cross-ref-diff is blunt). Wired into the collapse
+  bracket via `MERIT_EVAL=1`.
+- *(next)* **attribute branches** (`sa3_control/ATTRIBUTE_BRANCHES.md` — time-aligned
+  conditioner, the differentiator), `stretch.py` (**bungee** in `mir/pitch_venv`, rubberband fallback).
 
 ### `scripts/` — generation-time CLI tools (training-free)
 - `sa3_flowsep.py` — generative source separation via **FlowEdit/AUDEDIT**
