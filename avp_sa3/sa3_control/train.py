@@ -142,10 +142,11 @@ def main():
     ap.add_argument("--warmup-steps", type=int, default=0,
                     help="linear LR warmup over this many steps (0 = none). Best practice for "
                          "higher LRs — prevents the early gradient explosion seen at lr 1e-3.")
-    ap.add_argument("--optimizer", choices=["adamw", "fusion", "sfadamw", "fusion_full"], default="adamw",
-                    help="adamw (default), fusion (FusionOpt SF-NorMuon @ bf16), sfadamw "
-                         "(FusionOpt sf-only = ScheduleFree-AdamW), or fusion_full (all 5 components: "
-                         "mona+shampoo+ns5+normuon+sf — the full composition).")
+    ap.add_argument("--optimizer", choices=["adamw", "fusion", "sfadamw", "fusion_nm", "fusion_full"], default="adamw",
+                    help="adamw (default); fusion (SF-NorMuon = ns5+normuon+sf); sfadamw (sf-only = "
+                         "ScheduleFree-AdamW); fusion_nm (mona+ns5+normuon+sf — everything EXCEPT KL-Shampoo, "
+                         "now viable on large adapters thanks to component-gated state alloc); fusion_full "
+                         "(all 5 incl. Shampoo — heavy, may OOM on large adapters).")
     ap.add_argument("--resume", default="", help="warm-start: load adapter+conditioner weights from a "
                     "checkpoint .pt (optimizer restarts fresh; not an exact-state resume).")
     ap.add_argument("--timestep-sampler",
@@ -205,7 +206,7 @@ def main():
         load_adapter_state(torch.load(args.resume, map_location="cpu")["state"], wrappers, cond_enc)
         print(f"[resume] warm-started adapter+conditioner from {args.resume}", flush=True)
 
-    if args.optimizer in ("fusion", "sfadamw", "fusion_full"):
+    if args.optimizer in ("fusion", "sfadamw", "fusion_nm", "fusion_full"):
         sys.path.append("/home/kim/Projects/SAO/stable-audio-tools")
         from stable_audio_tools.training.fusion_opt import FusionOpt
         from stable_audio_tools.training.fusion_groups import build_fusion_param_groups
@@ -213,6 +214,7 @@ def main():
         groups = build_fusion_param_groups(trainable_mod, spectral_wd=0.01, scalar_wd=0.0)
         comps = ({"sf"} if args.optimizer == "sfadamw"
                  else None if args.optimizer == "fusion_full"        # None = all 5 (mona+shampoo+ns5+normuon+sf)
+                 else {"mona", "ns5", "normuon", "sf"} if args.optimizer == "fusion_nm"  # all but KL-Shampoo
                  else {"ns5", "normuon", "sf"})                      # fusion = SF-NorMuon
         opt = FusionOpt(groups, lr=args.lr, warmup_steps=args.warmup_steps, hot_dtype="bf16", components=comps)
         _sf = bool(getattr(opt, "uses_sf_averaging", False))
