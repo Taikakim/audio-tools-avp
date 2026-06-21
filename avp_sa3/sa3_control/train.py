@@ -25,7 +25,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from sa3_control.adapters import ControlContext, use_control_context
-from sa3_control.conditioner import AudioRefEncoder, ScalarAttributeEncoder
+from sa3_control.conditioner import AudioRefEncoder, ScalarAttributeEncoder, AttributeEncoder
 from sa3_control.dataset import LatentControlDataset
 from sa3_control.inject import (adapter_state_dict, freeze_base_train_adapters,
                                 install_adapters)
@@ -40,6 +40,8 @@ def collate(batch):
         out["ref_latent"] = torch.stack([b["ref_latent"] for b in batch])
     if "scalar" in batch[0]:
         out["scalar"] = torch.stack([b["scalar"] for b in batch])
+    if batch[0].get("controls"):                # time-varying attribute features {name: (C,T)}
+        out["controls"] = {k: torch.stack([b["controls"][k] for b in batch]) for k in batch[0]["controls"]}
     return out
 
 
@@ -153,11 +155,17 @@ def main():
                     choices=["logit_normal", "log_snr", "log_snr_uniform", "uniform"], default="logit_normal",
                     help="diffusion t sampler (underfit borrow). logit_normal = original; "
                          "log_snr biases toward the informative sigma band (may de-noise the loss).")
-    ap.add_argument("--control-mode", choices=["audio_ref", "scalar"], default="audio_ref",
-                    help="audio_ref = the riffer (opaque reference latent); scalar = an explicit "
-                         "per-crop attribute (e.g. onset_density) — the first attribute branch.")
+    ap.add_argument("--control-mode", choices=["audio_ref", "scalar", "attribute"], default="audio_ref",
+                    help="audio_ref = the riffer (opaque reference latent); scalar = a per-crop scalar "
+                         "(e.g. onset_density); attribute = a TIME-VARYING per-frame feature "
+                         "(dynamics/rhythm/melody curve) via the time-aligned AttributeEncoder.")
     ap.add_argument("--scalar-field", default="onset_density",
                     help="which per-crop .json scalar to condition on when --control-mode scalar")
+    ap.add_argument("--control-feature", default="melody",
+                    help="which .TIMESERIES.npz feature for --control-mode attribute: "
+                         "dynamics(4) | rhythm(3) | melody(12, =hpcp). (chroma384 once that data exists.)")
+    ap.add_argument("--attr-downsample", type=int, default=8,
+                    help="time downsample for the AttributeEncoder (T -> T/this control tokens)")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -190,6 +198,13 @@ def main():
         cond_enc = ScalarAttributeEncoder(control_dim=args.control_dim,
                                           n_tokens=min(args.n_tokens, 16)).to(device=device, dtype=dtype)
         print(f"[control] scalar attribute '{args.scalar_field}' -> ScalarAttributeEncoder", flush=True)
+    elif args.control_mode == "attribute":
+        from sa3_control.dataset import CONTROL_DIMS
+        in_ch = CONTROL_DIMS[args.control_feature]
+        cond_enc = AttributeEncoder(in_channels=in_ch, control_dim=args.control_dim,
+                                    downsample=args.attr_downsample).to(device=device, dtype=dtype)
+        print(f"[control] attribute '{args.control_feature}' ({in_ch}ch, /{cond_enc.downsample}) "
+              f"-> time-aligned AttributeEncoder", flush=True)
     else:
         cond_enc = AudioRefEncoder(latent_dim=256, control_dim=args.control_dim,
                                    n_tokens=args.n_tokens).to(device=device, dtype=dtype)
@@ -233,6 +248,9 @@ def main():
         ds.scalar_mean, ds.scalar_std = float(vals.mean()), float(vals.std())
         print(f"[control] {args.scalar_field}: mean {ds.scalar_mean:.3f} std {ds.scalar_std:.3f} "
               f"(n={len(vals)}); standardized at train time", flush=True)
+    elif args.control_mode == "attribute":
+        ds = LatentControlDataset(args.encoded_dir, controls=(args.control_feature,), audio_ref=None,
+                                  seed=args.seed, subset_tracks=args.subset_tracks)
     else:
         ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track",
                                   seed=args.seed, subset_tracks=args.subset_tracks)
@@ -280,6 +298,9 @@ def main():
 
             if args.control_mode == "scalar":
                 ctrl = cond_enc(b["scalar"].to(device=device, dtype=dtype))    # (B, n_tokens, control_dim)
+            elif args.control_mode == "attribute":
+                feat = b["controls"][args.control_feature][:, :, :T].to(device=device, dtype=dtype)  # (B,C,T)
+                ctrl = cond_enc(feat)                                          # (B, T/ds, control_dim)
             else:
                 ctrl = cond_enc(b["ref_latent"].to(device=device, dtype=dtype))
             if args.cfg_dropout > 0:                        # per-item control dropout
@@ -337,6 +358,7 @@ def main():
                     opt.eval()                               # SF: save the averaged iterate
                 torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
                             "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
+                            "control_feature": getattr(args, "control_feature", None),
                             "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]}, p)
                 if _sf:
                     opt.train()
@@ -360,6 +382,7 @@ def main():
             opt.eval()                                       # SF: final save = averaged iterate
         torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
                             "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
+                            "control_feature": getattr(args, "control_feature", None),
                             "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]},
                    os.path.join(args.save_dir, "riffer_final.pt"))
     if wb:

@@ -7,8 +7,41 @@ from the .TIMESERIES.npz — slot in the same way later.)
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
+
+
+class AttributeEncoder(nn.Module):
+    """Time-varying control feature (B, C_in, T) -> TIME-ORDERED control tokens (B, T', control_dim).
+
+    The time-aligned attribute branch — the chroma/curve analog of ScalarAttributeEncoder (one number)
+    and AudioRefEncoder (global pool). Strided convs reduce T -> T' = T / 2**ceil(log2(downsample)) while
+    STRICTLY preserving time order (no pooling), so the adapter's `add_fractional_positions` aligns each
+    control token to its own time region — every output latent frame can attend to the control *at its
+    moment*, approximating local conditioning.
+
+    Use for SAME chroma (C_in = 384 = 3 octave-bands x 128), or any stacked per-frame feature
+    (dynamics 4 / rhythm 3 / melody 12, …). The adapter's zero-init output gives the no-op training
+    start, so this encoder is normally initialised (it should carry the time-varying signal from step 0).
+    """
+
+    def __init__(self, in_channels: int, control_dim: int = 768, hidden: int = 512, downsample: int = 8):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.control_dim = int(control_dim)
+        n_down = max(0, round(math.log2(max(1, downsample))))     # number of stride-2 halvings
+        self.downsample = 2 ** n_down
+        layers = [nn.Conv1d(self.in_channels, hidden, 3, padding=1), nn.SiLU()]
+        for _ in range(n_down):
+            layers += [nn.Conv1d(hidden, hidden, 4, stride=2, padding=1), nn.SiLU()]   # exact T -> T/2
+        layers += [nn.Conv1d(hidden, control_dim, 1)]
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, feat):                                      # (B, C_in, T)
+        h = self.net(feat.to(self.net[0].weight.dtype))          # (B, control_dim, T')
+        return h.transpose(1, 2).contiguous()                    # (B, T', control_dim)
 
 
 class ScalarAttributeEncoder(nn.Module):
