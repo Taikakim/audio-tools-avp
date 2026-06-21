@@ -87,9 +87,17 @@ class LatentControlDataset(Dataset):
         if not self.controls:                       # scalar/no-timeseries mode: don't touch the npz
             return {}                               # (some crops, e.g. 'silence', have no .TIMESERIES.npz)
         z = np.load(stem + ".TIMESERIES.npz")
+        chroma_z = None                             # lazy: the .CHROMA.npz sidecar (e.g. same_chroma_ts)
         out = {}
         for name in self.controls:
-            chans = [_to_ct(z[f]) for f in CONTROL_FIELDS[name]]
+            chans = []
+            for f in CONTROL_FIELDS[name]:
+                if f in z:
+                    chans.append(_to_ct(z[f]))
+                else:                               # field lives in the parallel <crop>.CHROMA.npz sidecar
+                    if chroma_z is None:
+                        chroma_z = np.load(stem + ".CHROMA.npz")
+                    chans.append(_to_ct(chroma_z[f]))
             out[name] = torch.from_numpy(np.concatenate(chans, axis=0))  # (C, 4096)
         return out
 
