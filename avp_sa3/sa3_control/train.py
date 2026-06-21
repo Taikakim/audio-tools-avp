@@ -203,12 +203,18 @@ def main():
                                           n_tokens=min(args.n_tokens, 16)).to(device=device, dtype=dtype)
         print(f"[control] scalar attribute '{args.scalar_field}' -> ScalarAttributeEncoder", flush=True)
     elif args.control_mode == "attribute":
-        from sa3_control.dataset import CONTROL_DIMS
         in_ch = CONTROL_DIMS[args.control_feature]
-        cond_enc = AttributeEncoder(in_channels=in_ch, control_dim=args.control_dim,
-                                    downsample=args.attr_downsample).to(device=device, dtype=dtype)
-        print(f"[control] attribute '{args.control_feature}' ({in_ch}ch, /{cond_enc.downsample}) "
-              f"-> time-aligned AttributeEncoder", flush=True)
+        if args.control_feature == "chroma384":                # chroma-aware (pitch-circular, 3 bands)
+            from sa3_control.conditioner import ChromaAttributeEncoder
+            cond_enc = ChromaAttributeEncoder(control_dim=args.control_dim,
+                                              downsample=args.attr_downsample).to(device=device, dtype=dtype)
+            print(f"[control] attribute 'chroma384' (3x128, pitch-circular, /{cond_enc.downsample}) "
+                  f"-> ChromaAttributeEncoder", flush=True)
+        else:
+            cond_enc = AttributeEncoder(in_channels=in_ch, control_dim=args.control_dim,
+                                        downsample=args.attr_downsample).to(device=device, dtype=dtype)
+            print(f"[control] attribute '{args.control_feature}' ({in_ch}ch, /{cond_enc.downsample}) "
+                  f"-> time-aligned AttributeEncoder", flush=True)
     else:
         cond_enc = AudioRefEncoder(latent_dim=256, control_dim=args.control_dim,
                                    n_tokens=args.n_tokens).to(device=device, dtype=dtype)

@@ -44,6 +44,50 @@ class AttributeEncoder(nn.Module):
         return h.transpose(1, 2).contiguous()                    # (B, T', control_dim)
 
 
+class ChromaAttributeEncoder(nn.Module):
+    """SAME chroma (B, 384 = 3 bands x 128 bins, T) -> time-aligned control tokens (B, T', control_dim).
+
+    Chroma-AWARE (vs the generic AttributeEncoder's flat 1-D conv): reshapes the 384 channels back
+    into the 3 octave-bands x 128 pitch-class bins SAME regresses (paper §3.3.2), and convolves the
+    pitch axis CIRCULARLY — pitch class wraps at the octave, so a chord spanning bin 127->0 is seen as
+    adjacent (a plain conv would treat it as a hard edge). Bands enter as conv input channels (register
+    is preserved); strided convs downsample TIME only (time-ordered tokens for the adapter's fractional
+    positions); pitch is pooled after circular mixing. Output contract identical to AttributeEncoder.
+    """
+
+    def __init__(self, n_bands: int = 3, n_bins: int = 128, control_dim: int = 768,
+                 hidden: int = 128, downsample: int = 8, pitch_pool: int = 8, pitch_k: int = 3):
+        super().__init__()
+        self.n_bands, self.n_bins, self.pitch_k = int(n_bands), int(n_bins), int(pitch_k)
+        self.control_dim = int(control_dim)
+        self.in_channels = self.n_bands * self.n_bins
+        self.conv_in = nn.Conv2d(self.n_bands, hidden, (self.pitch_k, 3), padding=(0, 1))   # pitch pad=circular(manual)
+        n_down = max(0, round(math.log2(max(1, downsample))))
+        self.downsample = 2 ** n_down
+        self.time_convs = nn.ModuleList([
+            nn.Conv2d(hidden, hidden, (self.pitch_k, 4), stride=(1, 2), padding=(0, 1))      # time /2, pitch kept
+            for _ in range(n_down)])
+        self.pitch_pool = nn.AdaptiveAvgPool2d((pitch_pool, None))                           # pitch -> pitch_pool
+        self.proj = nn.Linear(hidden * pitch_pool, control_dim)
+
+    def _cpad(self, x):                                # circular pad the pitch axis (dim=2)
+        p = (self.pitch_k - 1) // 2
+        return torch.cat([x[:, :, -p:, :], x, x[:, :, :p, :]], dim=2) if p else x
+
+    def forward(self, feat):                           # (B, 384, T) or (B, 3, 128, T)
+        w = self.conv_in.weight
+        if feat.dim() == 3:                            # (B, 384, T) -> (B, 3, 128, T)
+            B, C, T = feat.shape
+            feat = feat.view(B, self.n_bands, self.n_bins, T)
+        x = torch.relu(self.conv_in(self._cpad(feat.to(w.dtype))))     # (B, hidden, 128, T)
+        for cv in self.time_convs:
+            x = torch.relu(cv(self._cpad(x)))                          # (B, hidden, 128, T/2^k)
+        x = self.pitch_pool(x)                                         # (B, hidden, pitch_pool, T')
+        B, h, pp, Tp = x.shape
+        x = x.permute(0, 3, 1, 2).reshape(B, Tp, h * pp)               # (B, T', hidden*pitch_pool)
+        return self.proj(x)                                            # (B, T', control_dim)
+
+
 class ScalarAttributeEncoder(nn.Module):
     """A single scalar control (e.g. normalized onset_density) -> control tokens.
 

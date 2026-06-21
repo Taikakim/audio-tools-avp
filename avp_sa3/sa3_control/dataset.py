@@ -23,8 +23,9 @@ CONTROL_FIELDS = {
     "rhythm": ["beat_activation_ts", "downbeat_activation_ts", "onset_envelope_ts"],
     "melody": ["hpcp_ts"],
     "density_ts": ["onset_envelope_ts"],   # 1-ch onset-density curve (time-varying density control)
+    "chroma384": ["same_chroma_ts"],       # SAME 384-d chroma (3 bands x 128), stored (T,384); data-gen TODO
 }
-CONTROL_DIMS = {"dynamics": 4, "rhythm": 3, "melody": 12, "density_ts": 1, "audio": 256}
+CONTROL_DIMS = {"dynamics": 4, "rhythm": 3, "melody": 12, "density_ts": 1, "chroma384": 384, "audio": 256}
 
 
 def _to_ct(arr: np.ndarray) -> np.ndarray:
