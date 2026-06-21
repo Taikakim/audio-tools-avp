@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 
 from sa3_control.adapters import ControlContext, use_control_context
 from sa3_control.conditioner import AudioRefEncoder, ScalarAttributeEncoder, AttributeEncoder
-from sa3_control.dataset import LatentControlDataset
+from sa3_control.dataset import LatentControlDataset, CONTROL_FIELDS, CONTROL_DIMS
 from sa3_control.inject import (adapter_state_dict, freeze_base_train_adapters,
                                 install_adapters)
 
@@ -166,6 +166,10 @@ def main():
                          "dynamics(4) | rhythm(3) | melody(12, =hpcp). (chroma384 once that data exists.)")
     ap.add_argument("--attr-downsample", type=int, default=8,
                     help="time downsample for the AttributeEncoder (T -> T/this control tokens)")
+    ap.add_argument("--scalar-from-timeseries", default="",
+                    help="scalar mode: derive the scalar as the WINDOW-MEAN of this .TIMESERIES feature "
+                         "(e.g. density_ts) over the trained crop [:T] instead of the full-crop .json value "
+                         "— fixes the crop-length label mismatch (the .json scalar describes all 4096 frames).")
     ap.set_defaults(preencode_text=True, use_checkpointing=True)
     ap.add_argument("--precision", choices=["bf16", "fp32"], default="bf16",
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
@@ -240,7 +244,26 @@ def main():
         opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
         _sf = False
 
-    if args.control_mode == "scalar":
+    if args.control_mode == "scalar" and args.scalar_from_timeseries:
+        # scalar = window-mean of a timeseries feature over the trained crop [:T] (crop-correct).
+        sf = args.scalar_from_timeseries
+        ds = LatentControlDataset(args.encoded_dir, controls=(sf,), audio_ref=None,
+                                  seed=args.seed, subset_tracks=args.subset_tracks)
+        T0 = args.crop_frames
+        samp = ds.paths[:: max(1, len(ds.paths) // 600)][:600]    # ~600-crop sample for stats
+        wm = []
+        for p in samp:
+            try:
+                z = np.load(p[:-4] + ".TIMESERIES.npz")
+                arr = np.concatenate([z[f][None] if z[f].ndim == 1 else z[f].T for f in CONTROL_FIELDS[sf]], 0)
+                wm.append(float(arr[:, :T0].mean()))
+            except Exception:
+                pass
+        wm = np.array(wm, dtype=np.float32)
+        ds.scalar_mean, ds.scalar_std = float(wm.mean()), float(wm.std() + 1e-8)
+        print(f"[control] scalar from '{sf}' window-mean over [:{T0}]: mean {ds.scalar_mean:.4f} "
+              f"std {ds.scalar_std:.4f} (n={len(wm)}); crop-correct", flush=True)
+    elif args.control_mode == "scalar":
         ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref=None,
                                   seed=args.seed, subset_tracks=args.subset_tracks,
                                   scalar_field=args.scalar_field)
@@ -296,7 +319,12 @@ def main():
             noised = clean * (1 - tb) + noise * tb
             target = noise - clean                          # rectified-flow velocity
 
-            if args.control_mode == "scalar":
+            if args.control_mode == "scalar" and args.scalar_from_timeseries:
+                feat = b["controls"][args.scalar_from_timeseries][:, :, :T]    # (B, C, T)
+                raw = feat.to(device=device, dtype=torch.float32).mean(dim=(1, 2))   # window-mean
+                sc = ((raw - ds.scalar_mean) / ds.scalar_std).to(dtype)
+                ctrl = cond_enc(sc)
+            elif args.control_mode == "scalar":
                 ctrl = cond_enc(b["scalar"].to(device=device, dtype=dtype))    # (B, n_tokens, control_dim)
             elif args.control_mode == "attribute":
                 feat = b["controls"][args.control_feature][:, :, :T].to(device=device, dtype=dtype)  # (B,C,T)
@@ -359,6 +387,7 @@ def main():
                 torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
                             "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
                             "control_feature": getattr(args, "control_feature", None),
+                            "scalar_from_timeseries": getattr(args, "scalar_from_timeseries", ""),
                             "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]}, p)
                 if _sf:
                     opt.train()
@@ -383,6 +412,7 @@ def main():
         torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
                             "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
                             "control_feature": getattr(args, "control_feature", None),
+                            "scalar_from_timeseries": getattr(args, "scalar_from_timeseries", ""),
                             "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]},
                    os.path.join(args.save_dir, "riffer_final.pt"))
     if wb:

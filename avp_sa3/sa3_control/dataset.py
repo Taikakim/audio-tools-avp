@@ -22,8 +22,9 @@ CONTROL_FIELDS = {
     "dynamics": ["rms_energy_bass_ts", "rms_energy_body_ts", "rms_energy_mid_ts", "rms_energy_air_ts"],
     "rhythm": ["beat_activation_ts", "downbeat_activation_ts", "onset_envelope_ts"],
     "melody": ["hpcp_ts"],
+    "density_ts": ["onset_envelope_ts"],   # 1-ch onset-density curve (time-varying density control)
 }
-CONTROL_DIMS = {"dynamics": 4, "rhythm": 3, "melody": 12, "audio": 256}
+CONTROL_DIMS = {"dynamics": 4, "rhythm": 3, "melody": 12, "density_ts": 1, "audio": 256}
 
 
 def _to_ct(arr: np.ndarray) -> np.ndarray:
