@@ -137,6 +137,38 @@ recipes:
     notes: "Probe R² predicts per-head control. corr=1.0 is a mirage; judge by spread."
     source: MASTER §5 / LATCH_RESULTS
 
+  # ── Reward steering / closed-loop (PROPOSED — untested) ───────────────────────
+  - id: fk-steering-cu
+    title: Feynman-Kac steering on Audiobox Content-Usefulness reward (PROPOSED)
+    kind: reward-steering
+    status: "PROPOSED — NOT yet tested on SA3 (GPU busy). Params taken from the FK paper, not validated by us."
+    tool: "(to build) avp_sa3/scripts/sa3_fk_steer.py — particle wrapper around the SA3 sampler"
+    venv: sa3                    # install `audiobox-aesthetics` into .venv to avoid the mir cross-venv hop
+    model: medium-base           # FK steers ANY model (uses the model's own transition kernel as proposal)
+    when: >
+      Steer generation toward a NON-DIFFERENTIABLE, off-the-shelf black-box reward
+      (Audiobox Aesthetics CU) that LatCH cannot use — LatCH needs a differentiable head.
+      Training-free; the paper beats DDPO/Flow-GRPO RL fine-tuning at k=2-4 particles with no
+      training and no mode collapse. Reach for it for any black-box audio reward (CU, CLAP, beat-corr).
+    params:
+      reward: audiobox_cu        # Content Usefulness (of PQ/PC/CE/CU). Consider CU + a PQ floor to resist hacking
+      k_particles: 4             # paper: k=2-4 already beats fine-tuning; wall-clock scales with k
+      lambda_tilt: 10            # exp(λ·r) tilt strength; keep moderate — high λ invites reward-hacking
+      potential: difference      # G_t = exp(λ(r_t − r_{t+1})), prefers INCREASING-reward paths (paper default)
+      resample_steps: [20, 40, 60, 80]   # interval resampling over T≈50-100; NOT every step (early x̂0 is blurry)
+      intermediate_reward: on_x0_hat     # score CU on x̂0 = x − t·v (decode via SAME-L), the predicted clean
+      steps: 50
+      cfg: 7.0
+    notes: >
+      Mechanism: run K latents in parallel; at each resample step decode x̂0 = x−t·v (chunked) → audio →
+      Audiobox CU → resample by the DIFFERENCE potential (kill low-CU, clone high-CU). Composes with CFG
+      and with LatCH gradient guidance (differentiable + black-box reward at once). COST is the constraint:
+      k × |resample_steps| decode+score calls per render; Audiobox is ~8 GB / single-file on 16 GB (no batch).
+      LADDER before building the full SMC: best-of-N on CU (trivial sanity check that CU-steering helps) →
+      FK steering (efficient, beats BoN at equal compute) → RL only if it must bake into weights. Euler/RF-
+      compatible (paper §3.3); guidance/decode fp32.
+    source: "FK Steering — Singhal et al. arXiv:2501.06848 (= CONTROL_FINDINGS 'DAS' / SMC cluster)"
+
   # ── Reference / evaluation ────────────────────────────────────────────────────
   - id: stem-score
     title: Ground-truth bracketing (score outputs vs reference stems)
