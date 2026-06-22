@@ -167,3 +167,9 @@ wandb/*
 .sa_small_stage2_patched/
 sa_small_stage1_unwrapped.ckpt
 wandb/
+
+# Local artifacts — never commit (added 2026-06-22)
+/renders/
+/models/checkpoints/
+latch_weights/*.pt
+*~

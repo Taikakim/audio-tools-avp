@@ -100,6 +100,20 @@ for feat, tag_prefix, fname_base in [
             "ckpt": REPO / "latch_weights" / "test" / f"{fname_base}_ep{ep}.pt",
         })
 
+# Sweep winners — 4 cells from /tmp/fusion_sweep/results.csv (sweep run 2026-05-30).
+SWEEP_WINNERS = [
+    ("sweep_b16_lr1e-3",    "sfn_b16_lr1e-3"),         # best quality (3.20 dB)
+    ("sweep_b32_lr1e-3",    "sfn_b32_lr1e-3"),         # balanced     (3.31 dB / 9 min)
+    ("sweep_b128_lr1e-3",   "sfn_b128_lr1e-3"),        # fast         (3.44 dB / 4 min)
+    ("sweep_ff_b64_lr3e-4", "fullfusion_b64_lr3e-4"),  # Full Fusion vs SFN at prod cell
+]
+for tag, ckpt_stem in SWEEP_WINNERS:
+    VARIANTS.append({
+        "name": tag,
+        "feature": "rms_energy_bass",
+        "ckpt": REPO / "latch_weights" / f"latch_rms_energy_bass_sweep_{ckpt_stem}_best.pt",
+    })
+
 # Default target value per feature (mid-range, sane for the prompt).
 # rms_energy_bass: dB scale [-60, 0]; flatness: [0, 1]; flux: feature units.
 TARGET_VALUES = {
