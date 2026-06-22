@@ -139,9 +139,21 @@ recipes:
 
   # ── Reward steering / closed-loop (PROPOSED — untested) ───────────────────────
   - id: fk-steering-cu
-    title: Feynman-Kac steering on Audiobox Content-Usefulness reward (PROPOSED)
+    title: Feynman-Kac steering on an Audiobox-aesthetics reward
     kind: reward-steering
-    status: "PROPOSED — NOT yet tested on SA3 (GPU busy). Params taken from the FK paper, not validated by us."
+    status: "BoN sanity (rung 1) DONE on medium-base 2026-06-22 (240 samples / 10 genres). FK particle loop NOT yet built; FK params below still from the paper."
+    findings: >
+      Validated on medium-base (240 samples, 10 genres; within-prompt = the steering-relevant correlation):
+      (1) CU ≈ PQ — CU<->PQ = +0.87 across EVERY genre (+0.66..+0.95). "Content Usefulness" is essentially
+      a production-quality signal, not a distinct reusability axis.
+      (2) NO quality/complexity tradeoff — PQ<->PC = +0.25 (genre-dependent, -0.36..+0.71); the -0.26 seen
+      on n=8 small-base did NOT replicate. Higher complexity does not generally cost quality.
+      (3) The robust ORTHOGONAL lever is complexity/enjoyment — CE<->PC = +0.62 (busier = more enjoyable,
+      within genre); PC is strongly genre-driven (ambient/piano ~2.5 vs lo-fi/house ~5.6) so it reads
+      arrangement density. All four axes are +correlated within-prompt, so a weighted hybrid won't fight itself.
+      (4) But the BoN argmax DIFFERS by reward (CU-winner != PQ-winner 8/10 prompts, != PC-winner 10/10):
+      correlated axes still pick different best samples, so the reward choice is NOT moot. Within-prompt
+      headroom: PC/CE ~1.4, PQ ~1.0, CU ~0.8 (CE/PC have the most room to steer).
     tool: "(to build) avp_sa3/scripts/sa3_fk_steer.py — particle wrapper around the SA3 sampler"
     venv: sa3                    # install `audiobox-aesthetics` into .venv to avoid the mir cross-venv hop
     model: medium-base           # FK steers ANY model (uses the model's own transition kernel as proposal)
@@ -151,7 +163,8 @@ recipes:
       Training-free; the paper beats DDPO/Flow-GRPO RL fine-tuning at k=2-4 particles with no
       training and no mode collapse. Reach for it for any black-box audio reward (CU, CLAP, beat-corr).
     params:
-      reward: audiobox_cu        # Content Usefulness (of PQ/PC/CE/CU). Consider CU + a PQ floor to resist hacking
+      reward: audiobox_ce        # see findings: CE(enjoyment)/PC(complexity) are the orthogonal levers with
+                                 #   headroom; CU<->PQ redundant. Hybrid is safe (all +corr within-prompt).
       k_particles: 4             # paper: k=2-4 already beats fine-tuning; wall-clock scales with k
       lambda_tilt: 10            # exp(λ·r) tilt strength; keep moderate — high λ invites reward-hacking
       potential: difference      # G_t = exp(λ(r_t − r_{t+1})), prefers INCREASING-reward paths (paper default)
@@ -164,9 +177,11 @@ recipes:
       Audiobox CU → resample by the DIFFERENCE potential (kill low-CU, clone high-CU). Composes with CFG
       and with LatCH gradient guidance (differentiable + black-box reward at once). COST is the constraint:
       k × |resample_steps| decode+score calls per render; Audiobox is ~8 GB / single-file on 16 GB (no batch).
-      LADDER before building the full SMC: best-of-N on CU (trivial sanity check that CU-steering helps) →
-      FK steering (efficient, beats BoN at equal compute) → RL only if it must bake into weights. Euler/RF-
-      compatible (paper §3.3); guidance/decode fp32.
+      LADDER: best-of-N DONE (rung 1 — see findings: CU varies but ≈PQ; PC/CE are the distinct levers) →
+      FK steering (rung 2, NOT yet built — efficient, beats BoN at equal compute) → RL only if it must bake
+      into weights. Euler/RF-compatible (paper §3.3); guidance/decode fp32. VRAM: medium-base ~9.7 GB loaded
+      can't coexist with Audiobox (~8 GB) → BoN scores sequentially; the FK inner loop needs the small model
+      or a persistent scorer service.
     source: "FK Steering — Singhal et al. arXiv:2501.06848 (= CONTROL_FINDINGS 'DAS' / SMC cluster)"
 
   # ── Reference / evaluation ────────────────────────────────────────────────────
