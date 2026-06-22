@@ -1,0 +1,11 @@
+# Findings
+
+*Companion to **[Hands Inside the Instrument](../README.md)** and the **[Control-Methods Sourcebook](../CONTROL_METHODS_SOURCEBOOK.md)**.*
+
+The book builds intuition and ends each chapter with an open question. The Sourcebook ranks the methods to reach for. **This folder is what happens after you reach** — dated notes from actually reading a paper closely, checking it against our code, or running a probe. A finding may *supersede* a Sourcebook line (e.g. "paper-only, reimplement it" → "we already have a near-faithful port; here are the three gaps").
+
+Each note keeps the house rule: where a closer look corrected an over-optimistic claim, the **corrected** version is kept, not the cheerful one. Each ends by opening the next question rather than closing one.
+
+## Notes
+
+- [2026-06-22 — AudEdit into our control stack](2026-06-22-audedit-into-our-control-stack.md) — the inversion-free SA3 editor read in full and mapped onto our trained heads. Verdict: **complement, not substitute**; `sa3_flowsep.py` is already a near-faithful Algorithm 1; the highest-leverage next move is a cheap **entanglement probe**, not the tempting data-engine. Advances Sourcebook §Ch9/10 entry #3 (FlowEdit + AudEdit).
