@@ -107,4 +107,9 @@ class TrainTelemetry:
             d["traj/path_efficiency"] = net / (self._path_len + 1e-9)   # low ⇒ wandering basin
             self._prev_flat = cur
 
-        self.wb.log(d, step=step)
+        try:
+            self.wb.log(d, step=step)
+        except Exception as e:               # telemetry must NEVER crash a multi-hour training run
+            if not getattr(self, "_logwarn", False):
+                print(f"[telemetry] wandb.log failed (continuing training): {e}", flush=True)
+                self._logwarn = True
