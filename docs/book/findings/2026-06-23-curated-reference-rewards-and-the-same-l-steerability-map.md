@@ -56,6 +56,21 @@ Three caveats that decide whether it's worth it:
 2. **The riffer prior: explicit beats opaque.** A scalar onset-density head steered at corr +0.90 where the opaque riffer embedding scored MERIT ≈ 0. MERT-bands are *between* — build them to **complement** the explicit heads (the ineffable "make it like *this*"), not replace them.
 3. **Disentanglement isn't free** — gating gives clean on/off, but bands may leak; a disentanglement objective may be needed.
 
-## 5. The open question (what gates the build)
+## 5. Answered (2026-06-23): MERT exposes rhythm where SAME-L hides it
 
-Does MERT actually **expose what SAME-L hides**? §3 says rhythm (downbeat 0.16) is the prime candidate, but a MERT-band only helps if the signal lives *somewhere* — so the next move is the **MERT-vs-SAME-L probe**: predict the same features from MERT layers and compare to the SAME-L R² above. If a MERT band predicts downbeat well past 0.16, a rhythm conditioner is justified; if MERT can't read it either, the adapter has nothing to grab and the honest answer is "rhythm isn't recoverable from a reference at all." That probe (decode + MERT-embed time-aligned audio — GPU) **scopes the whole adapter before a single training step**, and it's the cheapest next experiment that can say *no*.
+We ran the gating probe — 80 goa windows (30 s) decoded → MERT, each layer probed per-frame against the same targets as §3, split by track. The result is decisive, and *specifically about rhythm*:
+
+| feature | SAME-L latent | best MERT layer | Δ |
+|---|---|---|---|
+| **beat activation** | 0.36 | **0.83 (L6)** | **+0.47** |
+| **onset envelope** | 0.33 | **0.71 (L1)** | **+0.39** |
+| **downbeat activation** | 0.17 | **0.39 (L6)** | **+0.22** |
+| spectral flux | 0.86 | 0.85 (L3) | −0.01 (tie) |
+| chroma (hpcp) | 0.42 | 0.37 (L3) | −0.05 (SAME-L wins) |
+| relative_position (control) | <0 | <0.1 | — (correctly unpredictable) |
+
+The precondition holds **for rhythm**: beat/onset/downbeat are far more linearly accessible from MERT (concentrated in **layers ~1–6**) than from the bare SAME-L latent. The signal *is* in the SAME-L-decoded audio — SAME-L renders rhythm fine, it just doesn't expose it *linearly* in the 256-d latent, and MERT recovers it. **Spectral flux and chroma show no MERT advantage** (SAME-L is as good or better), so the conditioner should not bother with them.
+
+This **sharpens §4's design**: the multi-band conditioner's value is concentrated in a **single rhythm band (MERT layers ~1–6)**, not "all bands" — and it's the concrete fix for the riffer's rhythm-transfer failure (§3), giving the model the rhythmic handle the latent lacks.
+
+The new fork (the next decision, not a closed door): because rhythm is **present-but-nonlinear** in the latent (MERT reads it back out of the decoded audio), a **nonlinear MLP readout head on the SAME-L latent** might recover it too — cheaper than a MERT-conditioned finetune, and target-driven ("hit this onset curve") rather than reference-driven ("groove like this clip"). The §2 "explicit beats opaque" prior says: probably **both** — a nonlinear latent head for *measurable* rhythm, a MERT-rhythm band for the ineffable feel. The cheapest next test is the MLP head (CPU, on data we have); the adapter is the bigger commit.
