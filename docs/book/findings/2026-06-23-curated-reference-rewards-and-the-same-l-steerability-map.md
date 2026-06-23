@@ -73,4 +73,23 @@ The precondition holds **for rhythm**: beat/onset/downbeat are far more linearly
 
 This **sharpens §4's design**: the multi-band conditioner's value is concentrated in a **single rhythm band (MERT layers ~1–6)**, not "all bands" — and it's the concrete fix for the riffer's rhythm-transfer failure (§3), giving the model the rhythmic handle the latent lacks.
 
-The new fork (the next decision, not a closed door): because rhythm is **present-but-nonlinear** in the latent (MERT reads it back out of the decoded audio), a **nonlinear MLP readout head on the SAME-L latent** might recover it too — cheaper than a MERT-conditioned finetune, and target-driven ("hit this onset curve") rather than reference-driven ("groove like this clip"). The §2 "explicit beats opaque" prior says: probably **both** — a nonlinear latent head for *measurable* rhythm, a MERT-rhythm band for the ineffable feel. The cheapest next test is the MLP head (CPU, on data we have); the adapter is the bigger commit.
+The new fork (the next decision, not a closed door): because rhythm is **present-but-nonlinear** in the latent (MERT reads it back out of the decoded audio), a **nonlinear MLP readout head on the SAME-L latent** might recover it too — cheaper than a MERT-conditioned finetune, and target-driven ("hit this onset curve") rather than reference-driven ("groove like this clip"). The §2 "explicit beats opaque" prior says: probably **both** — a nonlinear latent head for *measurable* rhythm, a MERT-rhythm band for the ineffable feel. The cheapest next test is the MLP head (CPU, on data we have); the adapter is the bigger commit. *(→ §6 ran this and revises the conclusion.)*
+
+## 6. Corrected (2026-06-23, same day): you don't need MERT for rhythm — the latent just needs a *temporal* readout
+
+We built §5's cheap head — but as a **1D-CNN** (temporal, ~4 s receptive field), not only a per-frame MLP. It overturns §5's lean toward MERT:
+
+| feature | linear/frame | MLP/frame | **CNN (temporal)** | MERT (linear probe) |
+|---|---|---|---|---|
+| beat | 0.29 | 0.47 | **0.86** | 0.83 |
+| onset | 0.29 | 0.58 | **0.81** | 0.71 |
+| downbeat | 0.13 | 0.03 | **0.58** | 0.39 |
+
+A temporal head on the SAME-L latent **matches or beats MERT on all three** rhythm features. The ceiling §3/§5 hit was **missing temporal context — not nonlinearity, not absence**: the per-frame MLP barely moved beat/onset and *failed* on downbeat (0.03 — a single 256-d frame can't locate a downbeat); only ~4 s of context recovers it. So the earlier reading — "MERT exposes rhythm the latent hides" — was an **artifact of comparing a temporal model (MERT) against a per-frame *linear* latent probe**. The latent never hid rhythm; the readout was too local.
+
+Consequences:
+- **Rhythm control = a temporal (1D-CNN) LatCH head on the latent.** No MERT, no finetune; target-driven ("hit this onset/beat curve"), composes with the existing guidance. This is the recommended build — and the real fix for the riffer's rhythm failure (its readout was per-frame/opaque; not the latent's fault).
+- **MERT's niche narrows** to the *reference-style* reward (§2 — genuinely reference-driven and ineffable) and any feature truly absent from the latent (none found yet). The §4 multi-band conditioner **loses its rhythm justification**.
+- **The §3 steerability map is a per-frame *linear lower bound*** — it under-measures any temporally-structured feature. Re-read with a temporal head, rhythm's real steerability is high (downbeat 0.16→0.58, beat 0.36→0.86).
+
+Honesty note: the comparison gives MERT a *linear* probe but the latent a *CNN* — not perfectly matched (a CNN on MERT might score higher still). Moot for the decision: the latent **alone**, with a temporal head, already reaches MERT's level → MERT is **not necessary** for rhythm. What remains is engineering: fold the temporal-head architecture into the LatCH head family and train beat/onset/downbeat heads for inference-time guidance.
