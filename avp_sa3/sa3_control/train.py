@@ -118,6 +118,10 @@ def main():
     ap.add_argument("--n-tokens", type=int, default=256)
     ap.add_argument("--crop-frames", type=int, default=1024,
                     help="train on the first N latent frames (memory; full=4096)")
+    ap.add_argument("--random-crop", action="store_true",
+                    help="train on a RANDOM beat-aligned crop-frames window of each latent (vs always the "
+                         "first N) — more crop variety per track so the trainer stops seeing only the first "
+                         "~47s of each crop; snaps the offset to beat_activation_ts peaks.")
     ap.add_argument("--cfg-dropout", type=float, default=0.1,
                     help="per-item probability of dropping the control tokens")
     ap.add_argument("--save-dir", default="/run/media/kim/Lehto/sa3_control_runs/riffer")
@@ -272,7 +276,8 @@ def main():
     elif args.control_mode == "scalar":
         ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref=None,
                                   seed=args.seed, subset_tracks=args.subset_tracks,
-                                  scalar_field=args.scalar_field)
+                                  scalar_field=args.scalar_field,
+                                  random_crop_frames=(args.crop_frames if args.random_crop else None))
         vals = np.array([m[args.scalar_field] for m in ds.meta.values() if args.scalar_field in m], dtype=np.float32)
         ds.scalar_mean, ds.scalar_std = float(vals.mean()), float(vals.std())
         print(f"[control] {args.scalar_field}: mean {ds.scalar_mean:.3f} std {ds.scalar_std:.3f} "
@@ -296,6 +301,11 @@ def main():
         except Exception as e:
             print(f"[wandb] disabled ({e})", flush=True)
             wb = None
+
+    from sa3_control.telemetry import TrainTelemetry        # rich per-layer + trajectory + opt logging
+    _telem_mod = torch.nn.ModuleList([w.adapter for w in wrappers] + [cond_enc])
+    telem = TrainTelemetry(_telem_mod, wb, scalar_every=args.log_every,
+                           traj_every=args.save_every, optimizer=opt)
 
     if args.preencode_text:
         preencode_text(sam, [ds.meta[p].get("prompt", "") for p in ds.paths], crop_seconds, device)
@@ -364,6 +374,8 @@ def main():
             if args.warmup_steps > 0 and args.optimizer == "adamw":  # FusionOpt warms up internally
                 for pg in opt.param_groups:
                     pg["lr"] = args.lr * min(1.0, (step + 1) / args.warmup_steps)
+            if hasattr(opt, "_telem_on"):       # FusionOpt: instrument the step we're about to log
+                opt._telem_on = ((step + 1) % args.log_every == 0)
             opt.step()
             step += 1
             if args.profile:
@@ -383,9 +395,8 @@ def main():
                     print(f"    [profile] per-step avg: {brk}  | peak VRAM {peak:.1f} GB", flush=True)
                     for k in prof:
                         prof[k] = 0.0
-                if wb:
-                    wb.log({"loss": loss.item(), "gnorm": float(gnorm), "it_s": rate,
-                            "epoch": step / max(1, len(ds))}, step=step)
+                telem.log(step, loss=loss.item(), gnorm=float(gnorm), it_s=rate,
+                          lr=opt.param_groups[0]["lr"], epoch=step / max(1, len(ds)))
             if step % args.save_every == 0 and not args.smoke:
                 p = os.path.join(args.save_dir, f"riffer_step{step}.pt")
                 if _sf:

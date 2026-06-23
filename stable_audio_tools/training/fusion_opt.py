@@ -204,6 +204,9 @@ class FusionOpt(Optimizer):
         super().__init__(params, defaults)
 
         self._components = frozenset(components)
+        self._telem_on = False          # per-component telemetry gate; trainer sets it per step
+        self._comp_telem = {}           # last instrumented step's per-stage update-magnitude profile
+        self._comp_acc = None           # accumulator (reset each instrumented step)
         self._mode = "train"  # "train" or "eval"
         self._step_count = 0
         # Pending loss for Polyak (set by train loop before step)
@@ -302,11 +305,17 @@ class FusionOpt(Optimizer):
         # Polyak step size (global, on-device)
         gamma_ratio = self._update_polyak()
 
+        if self._telem_on:                      # per-component instrumentation (this step only)
+            self._comp_acc = {"sp_n": 0, "mom_sq": 0.0, "monaA_sq": 0.0, "mpre_sq": 0.0,
+                              "ns5_sq": 0.0, "final_sq": 0.0, "gamma_t": 0.0,
+                              "sc_n": 0, "sc_grad_sq": 0.0}
         for group in self.param_groups:
             if group["group_type"] == "spectral":
                 self._spectral_group_step(group, gamma_ratio)
             else:
                 self._scalar_group_step(group, gamma_ratio)
+        if self._telem_on:
+            self._comp_telem = self._finalize_comp_telem()
 
         # After updating z and x, write y back to p.data for next forward.
         # Skipped when SF averaging is disabled: live weights are already in p.
@@ -322,6 +331,32 @@ class FusionOpt(Optimizer):
         self._step_count += 1
         self._current_loss = None
         return loss
+
+    def _finalize_comp_telem(self):
+        """Turn the per-stage accumulators into a per-component update-magnitude profile.
+        Each *gain* is the ratio of update magnitude across one pipeline stage (≈1 when the
+        component is off), so you can read off what each enabled component actually does:
+        momentum -> [shampoo precondition] -> [ns5 orthonormalize] -> [normuon row-scale] -> step."""
+        a, d = self._comp_acc, {}
+        if a["sp_n"]:
+            mom = a["mom_sq"] ** 0.5
+            mpre = a["mpre_sq"] ** 0.5
+            ns5 = a["ns5_sq"] ** 0.5
+            fin = a["final_sq"] ** 0.5
+            d["comp/momentum_norm"] = mom
+            if "mona" in self._components:
+                d["comp/mona_curvature_norm"] = a["monaA_sq"] ** 0.5
+            if "shampoo" in self._components:
+                d["comp/shampoo_gain"] = mpre / (mom + 1e-12)      # preconditioner scaling
+            if "ns5" in self._components:
+                d["comp/ns5_gain"] = ns5 / (mpre + 1e-12)          # spectral orthonormalization
+            if "normuon" in self._components:
+                d["comp/normuon_gain"] = fin / (ns5 + 1e-12)       # per-neuron row scaling
+            d["comp/spectral_update_norm"] = a["gamma_t"] * fin    # actual spectral weight delta
+            d["comp/gamma_t"] = a["gamma_t"]                        # effective step = lr*polyak*warmup
+        if a["sc_n"]:
+            d["comp/scalar_grad_norm"] = a["sc_grad_sq"] ** 0.5
+        return d
 
     # ---- internals ------------------------------------------------------
 
@@ -397,6 +432,8 @@ class FusionOpt(Optimizer):
             warm = 1.0
 
         gamma_t = lr * gamma_ratio * warm
+        if self._telem_on:
+            self._comp_acc["gamma_t"] = float(gamma_t)
 
         # hot_dtype_name controls how the NS5 hot path runs:
         #   "fp32"     - safe, slowest. Standard NS5 in fp32.
@@ -472,6 +509,11 @@ class FusionOpt(Optimizer):
             else:
                 # Plain momentum
                 m.mul_(mu).add_(grad)
+            if self._telem_on:
+                self._comp_acc["sp_n"] += 1
+                self._comp_acc["mom_sq"] += float((m * m).sum())
+                if "mona" in self._components:
+                    self._comp_acc["monaA_sq"] += float((state["A"] * state["A"]).sum())
 
             # 4. Apply KL-Shampoo preconditioner (optional)
             if "shampoo" in self._components:
@@ -481,6 +523,8 @@ class FusionOpt(Optimizer):
                 m_pre = P_L_h @ m_h @ P_R_h
             else:
                 m_pre = m.to(hot_dtype)
+            if self._telem_on:
+                self._comp_acc["mpre_sq"] += float((m_pre.float() * m_pre.float()).sum())
 
             # 5. Muon NS5 spectral normalisation (optional)
             if "ns5" in self._components:
@@ -510,6 +554,8 @@ class FusionOpt(Optimizer):
                 U.mul_((max(1.0, out_dim / in_dim)) ** 0.5)  # aspect-ratio scale
             else:
                 U = m_pre.float()
+            if self._telem_on:
+                self._comp_acc["ns5_sq"] += float((U * U).sum())
 
             # 6. SF-NorMuon per-neuron row scaling (optional)
             if "normuon" in self._components:
@@ -517,6 +563,8 @@ class FusionOpt(Optimizer):
                 row_ss = (U * U).sum(dim=-1)  # (out_dim,)
                 r.mul_(beta_r).add_(row_ss, alpha=(1 - beta_r))
                 U = U / (r.clamp_min(1e-12).sqrt().unsqueeze(-1))
+            if self._telem_on:
+                self._comp_acc["final_sq"] += float((U * U).sum())
 
             # 7. Update — Schedule-Free averaging (with WD on z_t) OR direct on p
             t = state["step"] + 1
@@ -553,6 +601,9 @@ class FusionOpt(Optimizer):
             if p.grad is None:
                 continue
             grad = p.grad.detach().float()
+            if self._telem_on:
+                self._comp_acc["sc_n"] += 1
+                self._comp_acc["sc_grad_sq"] += float((grad * grad).sum())
             state = self.state[p]
             if "z" not in state:
                 state["z"] = p.detach().clone().float()

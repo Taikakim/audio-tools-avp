@@ -18,6 +18,12 @@ Guidance for Claude Code when working in the **audio-tools-AVP** fork of
   Package `__init__` applies the `inference` profile on import; `scripts/train_latch.py`
   loads `rocm_env.py` standalone and applies `training`. Shell exports override the YAML
   (`setdefault`). Tunings: `~/pytorch-tunings-7.2.3` (torch 2.10).
+- **Flash Attention (native CK) — always on.** `sat-venv` ships the CK-backend `flash_attn 2.8.4` for
+  RDNA4, but it's inactive until you `export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE` (before
+  `import torch`) → **30–100% faster** than the `aiter`/SDPA fallback; forgetting it logs
+  `No module named 'aiter'` + `flash_attn not installed`. Set it for every train/infer/eval run (the
+  `avp_sa3` train + eval drivers already export it). FA training is safe (13-grad backward patch
+  applied). Canonical note: `SAO/MASTER.md` §5 + `SAO/docs/flash-attn-ck-rdna4.md`.
 
 ## Key local docs (the durable record)
 

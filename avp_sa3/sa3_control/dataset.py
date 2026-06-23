@@ -52,12 +52,13 @@ class LatentControlDataset(Dataset):
 
     def __init__(self, root, controls=("dynamics", "rhythm", "melody"),
                  audio_ref="same_track", seed=0, subset_tracks=None,
-                 scalar_field=None, scalar_norm=(0.0, 1.0)):
+                 scalar_field=None, scalar_norm=(0.0, 1.0), random_crop_frames=None):
         self.root = root
         self.controls = [c for c in controls if c in CONTROL_FIELDS]
         self.audio_ref = audio_ref
         self.scalar_field = scalar_field            # e.g. "onset_density" — a per-crop .json scalar control
         self.scalar_mean, self.scalar_std = scalar_norm
+        self.random_crop_frames = random_crop_frames   # int N = return a RANDOM beat-aligned N-frame window
         self.paths = sorted(glob.glob(os.path.join(root, "*.npy")))
         self.meta = {}
         self.by_track = defaultdict(list)
@@ -107,6 +108,25 @@ class LatentControlDataset(Dataset):
         ref = cands[int(self._rng.integers(len(cands)))]
         return torch.from_numpy(np.load(ref).astype(np.float32))  # (256, 4096)
 
+    def _beat_aligned_start(self, stem: str, t_total: int) -> int:
+        """Random window start snapped to a beat (peak of beat_activation_ts); plain-random fallback.
+        Gives crop variety across epochs so training stops seeing only the first window of each track."""
+        tw = self.random_crop_frames
+        hi = t_total - tw
+        if hi <= 0:
+            return 0
+        try:
+            a = np.asarray(np.load(stem + ".TIMESERIES.npz")["beat_activation_ts"],
+                           dtype=np.float32).reshape(-1)[:t_total]
+            thr = a.mean() + a.std()
+            pk = np.where((a[1:-1] > a[:-2]) & (a[1:-1] >= a[2:]) & (a[1:-1] > thr))[0] + 1
+            pk = pk[pk <= hi]
+            if len(pk):
+                return int(pk[self._rng.integers(len(pk))])
+        except Exception:
+            pass
+        return int(self._rng.integers(hi + 1))
+
     def __getitem__(self, i: int) -> dict:
         p = self.paths[i]
         stem = p[:-4]
@@ -114,10 +134,15 @@ class LatentControlDataset(Dataset):
         lat = np.load(p).astype(np.float32)
         while lat.ndim > 2 and lat.shape[0] == 1:   # squeeze stray batch dims, e.g. (1,256,4096) -> (256,4096)
             lat = lat[0]
+        controls = self._load_controls(stem)
+        if self.random_crop_frames and lat.shape[-1] > self.random_crop_frames:  # beat-aligned random window
+            s = self._beat_aligned_start(stem, lat.shape[-1]); tw = self.random_crop_frames
+            lat = np.ascontiguousarray(lat[:, s:s + tw])
+            controls = {k: v[:, s:s + tw].contiguous() for k, v in controls.items()}
         item = {
-            "latent": torch.from_numpy(lat),                             # (256, 4096)
+            "latent": torch.from_numpy(lat),                             # (256, 4096) or (256, crop) if random
             "prompt": m.get("prompt", ""),
-            "controls": self._load_controls(stem),
+            "controls": controls,
             "stem": os.path.basename(stem),
             "seconds_total": float(m.get("seconds_total", 0.0)),
         }
