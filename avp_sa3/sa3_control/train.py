@@ -289,7 +289,10 @@ def main():
         ds = LatentControlDataset(args.encoded_dir, controls=(), audio_ref="same_track",
                                   seed=args.seed, subset_tracks=args.subset_tracks)
     dl = DataLoader(ds, batch_size=args.batch, shuffle=True, drop_last=True,
-                    num_workers=args.num_workers, collate_fn=collate)
+                    num_workers=args.num_workers, collate_fn=collate,
+                    # keep workers alive across epochs: respawning them every epoch
+                    # stalled ~9 min/epoch (worker teardown/join), ~90 min/run wasted.
+                    persistent_workers=(args.num_workers > 0))
     print(f"[data] {len(ds)} crops, {ds.track_stats()['tracks']} tracks; "
           f"crop {args.crop_frames}f ({crop_seconds:.1f}s)", flush=True)
 
