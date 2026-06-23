@@ -77,7 +77,10 @@ def apply_profile(profile: str = "inference", verbose: bool = False) -> None:
     with open(path) as f:
         cfg = yaml.safe_load(f) or {}
 
-    tunings_root = str(cfg.get("tunings_root", ""))
+    # SAT_TUNINGS_ROOT lets a non-default-venv run pick a ROCBLAS-matched cache
+    # (e.g. the torch-2.12/ROCm-7.14 venv needs ~/pytorch-tunings-7.14, not the
+    # yaml's 7.2.3 default which is for sat-venv/torch-2.10). Falls back to yaml.
+    tunings_root = os.environ.get("SAT_TUNINGS_ROOT") or str(cfg.get("tunings_root", ""))
     merged = dict(cfg.get("common", {}))
     merged.update(cfg.get("profiles", {}).get(profile, {}))
 
