@@ -93,3 +93,19 @@ Consequences:
 - **The §3 steerability map is a per-frame *linear lower bound*** — it under-measures any temporally-structured feature. Re-read with a temporal head, rhythm's real steerability is high (downbeat 0.16→0.58, beat 0.36→0.86).
 
 Honesty note: the comparison gives MERT a *linear* probe but the latent a *CNN* — not perfectly matched (a CNN on MERT might score higher still). Moot for the decision: the latent **alone**, with a temporal head, already reaches MERT's level → MERT is **not necessary** for rhythm. What remains is engineering: fold the temporal-head architecture into the LatCH head family and train beat/onset/downbeat heads for inference-time guidance.
+
+## 7. Built and verified (2026-06-23): the onset head *steers* generation (corr 0.986)
+
+§6 said a temporal latent head should work; we trained one and checked it end-to-end. **It turned out the existing LatCH head architecture is already temporal** (RoPE self-attention over the latent sequence) — so no new architecture was needed, just *training a head on a rhythm feature*. An **onset LatCH head** (`scripts/latch/train_latch.py`, production recipe: adaln_zero, depth 4, 4.9M params, standardized, smooth_l1) trained on `latents_sa3` + `onset_envelope_ts` (12 epochs, loss 0.29→0.17), then driven through the **production guidance path** (`model.generate(latch_configs=...)`, medium-base, gain 48, 5-level sweep):
+
+| requested onset | measured onset-strength of the output |
+|---|---|
+| 0.40 | 0.741 |
+| 0.90 | 0.752 |
+| 1.30 | 0.772 |
+| 1.80 | 0.807 |
+| 2.30 | 0.830 |
+
+**correlation(requested, measured) = 0.986, monotonic = True.** The head doesn't just *read* onset — it **steers** it: requesting denser onsets makes the generated audio measurably denser, reliably and in order. This realises §6 concretely — a temporal LatCH head on the SAME-L latent is a **working rhythm control**, no MERT, no MERT-conditioner, no base-model finetune, riding the existing guidance machinery.
+
+Honest read (MASTER §5 "judge by spread, not just corr"): the *direction* is rock-solid (0.986, monotonic), but *authority* at gain 48 is **moderate** — a 0.74→0.83 onset-strength swing across the full range. Gain 96 (top of the SA3-medium range) or a wider/later guidance window should widen it — knob-tuning, not redesign. **Next:** sweep gain, train beat + downbeat heads the same way, and compose them (rhythm + the existing chroma/RMS heads) — the multi-head endgame. The trained head + verifier are persisted alongside the render set.
