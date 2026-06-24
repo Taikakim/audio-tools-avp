@@ -126,6 +126,8 @@ def main():
                     help="per-item probability of dropping the control tokens")
     ap.add_argument("--save-dir", default="/run/media/kim/Lehto/sa3_control_runs/riffer")
     ap.add_argument("--save-every", type=int, default=1000)
+    ap.add_argument("--save-cooldown", type=float, default=60,
+                    help="seconds to idle the GPU after each checkpoint save (thermal relief; 0 disables)")
     ap.add_argument("--log-every", type=int, default=20)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-workers", type=int, default=4)
@@ -412,6 +414,9 @@ def main():
                 if _sf:
                     opt.train()
                 print(f"[save] {p}", flush=True)
+                if args.save_cooldown and not args.smoke:
+                    print(f"[cooldown] {args.save_cooldown:g}s GPU idle (thermal relief)", flush=True)
+                    time.sleep(args.save_cooldown)
             if args.max_hours and (time.time() - t0) >= args.max_hours * 3600:
                 print(f"[time] reached {args.max_hours}h limit at step {step}", flush=True)
                 step = args.steps   # force the outer while to exit -> final save runs
