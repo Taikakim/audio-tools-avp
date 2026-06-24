@@ -27,7 +27,7 @@ set -eo pipefail
 VENV=${SA3_VENV:-/home/kim/Projects/SAO/sa3-rocm7.13-test/.venv/bin/python}
 ENCODED_DIR=${ENCODED_DIR:-/home/kim/Projects/latents_sa3}    # NVMe mirror; Lehto copy is slow/contended
 SAVE_ROOT=${SAVE_ROOT:-/run/media/kim/Lehto/sa3_control_runs}
-STEPS=${STEPS:-54000}; SAVE_EVERY=${SAVE_EVERY:-5400}; SEED=${SEED:-42}; NUM_WORKERS=${NUM_WORKERS:-4}
+STEPS=${STEPS:-54000}; SAVE_EVERY=${SAVE_EVERY:-5400}; SEED=${SEED:-42}; NUM_WORKERS=${NUM_WORKERS:-4}; BATCH=${BATCH:-1}
 
 RUN_NAME=${1:?usage: run_control_train.sh <run-name> [lr] [optimizer] [extra train.py args...]}
 LR=${2:-7.5e-5}
@@ -51,7 +51,7 @@ echo "[run] NOTE: the FIRST step compiles kernels (~minutes, CPU+GPU busy, no lo
 
 setsid nohup "$VENV" sa3_control/train.py \
   --encoded_dir "$ENCODED_DIR" --model medium-base --precision bf16 \
-  --crop-frames 512 --batch 1 --lr "$LR" --steps "$STEPS" --optimizer "$OPT" \
+  --crop-frames 512 --batch "$BATCH" --lr "$LR" --steps "$STEPS" --optimizer "$OPT" \
   --wandb --wandb-project sa3-riffer --run-name "$RUN_NAME" \
   --no-checkpoint --warmup-steps 300 --no-preencode-text \
   --control-mode scalar --scalar-field onset_density --control-dim 768 --n-tokens 256 \
