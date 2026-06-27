@@ -13,6 +13,7 @@ Run with the SA3 .venv:
 
 import argparse
 import os
+import subprocess
 import sys
 import time
 
@@ -107,6 +108,26 @@ def build_train_cond(sam, prompts, seconds, latent_T, device, dtype, use_cache=T
     return {k: (v.type(dtype) if torch.is_tensor(v) else v) for k, v in ci.items()}
 
 
+def export_control_onnx_on_finish(ckpt_path, save_dir, frames, field):
+    """ADDITIVE, non-fatal: after the final checkpoint is saved, shell out to the SA3
+    control-DiT ONNX exporter (forward-only adapter bake-in). Runs under sys.executable
+    (the SA3 .venv the trainer already uses, which has the exporter's deps). Returns the
+    subprocess returncode; never raises (check=False). `field` is informational only."""
+    out_path = os.path.join(save_dir, f"dit_medium-base_L{frames}_ctrl.onnx")
+    cmd = [sys.executable,
+           "/home/kim/Projects/SAO/stable-audio-3/scripts/export_dit_control_onnx.py",
+           "--ckpt", ckpt_path, "--model", "medium-base", "--frames", str(frames),
+           "--text-seq", "128", "--fp16", "--out", out_path]
+    env = {**os.environ, "FLASH_ATTENTION_TRITON_AMD_ENABLE": "FALSE"}
+    print(f"[export] start: control-DiT ONNX -> {out_path} (field={field})", flush=True)
+    rc = subprocess.run(cmd, env=env, check=False).returncode
+    if rc == 0:
+        print(f"[export] done: {out_path}", flush=True)
+    else:
+        print(f"[export] failed (returncode {rc}); training already saved, continuing", flush=True)
+    return rc
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--encoded_dir", default="/run/media/kim/Lehto/latents_sa3")
@@ -184,6 +205,12 @@ def main():
                     help="bf16 = base+adapters in bfloat16 (the supported ROCm path, ~2x "
                          "less memory); fp32 for max numerical stability")
     ap.add_argument("--smoke", action="store_true", help="3 steps, tiny, sanity only")
+    ap.add_argument("--export-onnx-on-finish", action=argparse.BooleanOptionalAction, default=True,
+                    help="after the final checkpoint is saved, shell out to the SA3 control-DiT ONNX "
+                         "exporter to bake the trained adapter into a forward-only ONNX graph "
+                         "(additive, non-fatal; --no-export-onnx-on-finish to disable)")
+    ap.add_argument("--export-onnx-frames", type=int, default=256,
+                    help="latent frame length (rung) for the on-finish ONNX export")
     args = ap.parse_args()
 
     if args.smoke:
@@ -465,6 +492,13 @@ def main():
                             "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)],
                             **_resume_state},
                    os.path.join(args.save_dir, "riffer_final.pt"))
+        if getattr(args, "export_onnx_on_finish", True) and not getattr(args, "smoke", False):
+            try:
+                export_control_onnx_on_finish(os.path.join(args.save_dir, "riffer_final.pt"),
+                                              args.save_dir, args.export_onnx_frames,
+                                              getattr(args, "scalar_field", None))
+            except Exception as e:
+                print(f"[export] hook failed ({e}); training already saved, continuing", flush=True)
     if wb:
         wb.finish()
     print(f"done -> {args.save_dir}", flush=True)
