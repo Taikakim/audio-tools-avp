@@ -157,6 +157,9 @@ def main():
                          "(all 5 incl. Shampoo — heavy, may OOM on large adapters).")
     ap.add_argument("--resume", default="", help="warm-start: load adapter+conditioner weights from a "
                     "checkpoint .pt (optimizer restarts fresh; not an exact-state resume).")
+    ap.add_argument("--resume-exact", default="", help="EXACT-state resume: restore adapter weights + "
+                    "optimizer state + step counter from a checkpoint saved with the 'opt' key (continues "
+                    "the run as if never interrupted). Errors on pre-opt-state checkpoints.")
     ap.add_argument("--timestep-sampler",
                     choices=["logit_normal", "log_snr", "log_snr_uniform", "uniform"], default="logit_normal",
                     help="diffusion t sampler (underfit borrow). logit_normal = original; "
@@ -256,6 +259,21 @@ def main():
         opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=0.01)
         _sf = False
 
+    start_step = 0
+    if args.resume_exact:                                    # exact-state resume (weights + optimizer + step)
+        from sa3_control.generate import load_adapter_state
+        _ck = torch.load(args.resume_exact, map_location="cpu")
+        if "opt" not in _ck:
+            raise SystemExit(f"--resume-exact: {args.resume_exact} has no optimizer state "
+                             "(saved before opt-state support); use --resume for warm-start instead.")
+        load_adapter_state(_ck.get("model_train", _ck["state"]), wrappers, cond_enc)   # train-mode (y) iterate
+        opt.load_state_dict(_ck["opt"])
+        start_step = int(_ck.get("step", 0))
+        if "torch_rng" in _ck:
+            torch.set_rng_state(_ck["torch_rng"])            # main-process RNG (dataloader workers re-seed)
+        print(f"[resume-exact] restored weights+optimizer+step from {args.resume_exact} "
+              f"@ step {start_step} -> continues to {args.steps}", flush=True)
+
     if args.control_mode == "scalar" and args.scalar_from_timeseries:
         # scalar = window-mean of a timeseries feature over the trained crop [:T] (crop-correct).
         sf = args.scalar_from_timeseries
@@ -322,7 +340,7 @@ def main():
         if device == "cuda":
             torch.cuda.synchronize()
 
-    step = 0
+    step = start_step
     t0 = time.time()
     t_iter = time.time()
     cond_enc.train()
@@ -404,13 +422,17 @@ def main():
                           lr=opt.param_groups[0]["lr"], epoch=step / max(1, len(ds)))
             if step % args.save_every == 0 and not args.smoke:
                 p = os.path.join(args.save_dir, f"riffer_step{step}.pt")
+                # capture exact-resume state in TRAIN mode (y iterate + opt state) BEFORE the SF eval swap
+                _resume_state = {"model_train": adapter_state_dict(wrappers, cond_enc), "opt": opt.state_dict(),
+                                 "step": step, "torch_rng": torch.get_rng_state()}
                 if _sf:
                     opt.eval()                               # SF: save the averaged iterate
                 torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
                             "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
                             "control_feature": getattr(args, "control_feature", None),
                             "scalar_from_timeseries": getattr(args, "scalar_from_timeseries", ""),
-                            "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]}, p)
+                            "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)],
+                            **_resume_state}, p)
                 if _sf:
                     opt.train()
                 print(f"[save] {p}", flush=True)
@@ -432,13 +454,16 @@ def main():
         print(f"[smoke OK] {len(g)} adapter tensors got grads; mean grad-norm {np.mean(g):.4e}; "
               f"base cross-attn frozen={base_frozen} got_no_grad={base_no_grad}", flush=True)
     else:
+        _resume_state = {"model_train": adapter_state_dict(wrappers, cond_enc), "opt": opt.state_dict(),
+                         "step": step, "torch_rng": torch.get_rng_state()}
         if _sf:
             opt.eval()                                       # SF: final save = averaged iterate
         torch.save({"state": adapter_state_dict(wrappers, cond_enc), "args": vars(args),
                             "control_mode": args.control_mode, "scalar_field": getattr(args, "scalar_field", None),
                             "control_feature": getattr(args, "control_feature", None),
                             "scalar_from_timeseries": getattr(args, "scalar_from_timeseries", ""),
-                            "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)]},
+                            "scalar_norm": [getattr(ds, "scalar_mean", 0.0), getattr(ds, "scalar_std", 1.0)],
+                            **_resume_state},
                    os.path.join(args.save_dir, "riffer_final.pt"))
     if wb:
         wb.finish()
