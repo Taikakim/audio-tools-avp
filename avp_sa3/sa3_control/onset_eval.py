@@ -29,6 +29,8 @@ ap.add_argument("--steps", type=int, default=50)
 ap.add_argument("--cfg", type=float, default=7.0)
 ap.add_argument("--seed", type=int, default=1234)
 ap.add_argument("--out", default="/run/media/kim/Lehto/sa3_control_runs/onset_eval")
+ap.add_argument("--notes", default="", help="human description of the run's logic/purpose; "
+                "saved to run_meta.json so the eval GUI + inference UIs can show provenance")
 args = ap.parse_args()
 os.makedirs(args.out, exist_ok=True)
 
@@ -87,4 +89,21 @@ for g in gains:
 import json
 json.dump(rows, open(f"{args.out}/onset_eval.json", "w"), indent=2)
 print(f"\n[eval] wrote {args.out}/onset_eval.json")
+
+# run_meta.json — provenance the eval GUI + inference UIs read alongside the clips (spec: MASTER §4)
+_ta = ck.get("args", {}) or {}
+run_meta = {
+    "ckpt": os.path.abspath(args.ckpt),
+    "ckpt_name": os.path.basename(args.ckpt),
+    "scalar_field": ck.get("scalar_field"),
+    "scalar_norm": {"mean": float(mean), "std": float(std)},
+    "train": {k: _ta.get(k) for k in
+              ("lr", "optimizer", "steps", "scalar_field", "crop_frames",
+               "random_crop", "batch", "save_every", "warmup_steps", "encoded_dir")},
+    "eval": {"prompt": args.prompt, "gains": args.gains, "densities": args.densities,
+             "seed": args.seed, "cfg": args.cfg, "duration": args.duration, "steps": args.steps},
+    "notes": args.notes,
+}
+json.dump(run_meta, open(f"{args.out}/run_meta.json", "w"), indent=2)
+print(f"[eval] wrote {args.out}/run_meta.json")
 print("SUCCESS criterion: at gain>0, MEASURED density rises with requested (corr → +1)")
