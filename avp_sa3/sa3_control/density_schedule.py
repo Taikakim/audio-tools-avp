@@ -25,3 +25,12 @@ class ControlSchedule:
         else:  # sinewave: 3 smooth oscillations
             f = 0.5 * (1.0 - math.cos(6.0 * math.pi * u))
         return self.lo + (self.hi - self.lo) * f
+
+
+def ridge_gain(density):
+    """Inverse gain-per-density operating ridge (riffer-disentanglement-recipe memory):
+    low density needs more authority (~2.75 at d=2), high density needs almost none
+    (~1.0 at d=12). A FIXED gain over-steers the busy end and fries CE; the operating
+    recipe is a gain-PER-density curve. Linear, clamped to [0.7, 3.0]."""
+    g = 2.75 - 0.175 * (float(density) - 2.0)
+    return max(0.7, min(3.0, g))

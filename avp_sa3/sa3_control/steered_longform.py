@@ -2,30 +2,34 @@
 onset-density control schedule. Single-prompt sweeps only (no prompt transitions)."""
 import torch
 from sa3_control.adapters import ControlContext, use_control_context
+from sa3_control.density_schedule import ridge_gain
 
 
 class SteeredGenerator:
     """Tracks output time from its own frame accounting and applies the scheduled
     onset scalar via use_control_context around each window's inner generate."""
 
-    def __init__(self, inner, schedule, encoder, mean, std, gain, fps, cfg_scale, device, dtype):
+    def __init__(self, inner, schedule, encoder, mean, std, gain, fps, cfg_scale, device, dtype, ridge=False):
         self.inner = inner
         self.sched = schedule
         self.enc = encoder
         self.mean = float(mean); self.std = float(std); self.gain = float(gain)
         self.fps = float(fps); self.cfg = float(cfg_scale)
         self.device = device; self.dtype = dtype
+        self.ridge = bool(ridge)
         self._frames_before = 0
         self.applied = []  # (t_sec, raw_density) per window
+        self.gains = []    # applied gain per window (ridge curve, or constant)
 
     def generate(self, prompt, prefix_latents, prefix_frames, n_frames, seed):
         t = self._frames_before / self.fps
         raw = self.sched.resolve(t)
-        self.applied.append((t, raw))
+        g = ridge_gain(raw) if self.ridge else self.gain
+        self.applied.append((t, raw)); self.gains.append(g)
         s = torch.tensor([(raw - self.mean) / self.std], device=self.device, dtype=self.dtype)
         ctrl = self.enc(s)
         cc = torch.cat([ctrl, torch.zeros_like(ctrl)], 0) if self.cfg != 1.0 else ctrl
-        with use_control_context(ControlContext(cc, gain=self.gain)):
+        with use_control_context(ControlContext(cc, gain=g)):
             out = self.inner.generate(prompt, prefix_latents, prefix_frames, n_frames, seed)
         self._frames_before += (n_frames - prefix_frames)
         return out
@@ -52,6 +56,8 @@ def main():
     ap.add_argument("--overlap-sec", type=float, default=5.0)
     ap.add_argument("--lo", type=float, default=2.0); ap.add_argument("--hi", type=float, default=14.0)
     ap.add_argument("--gain", type=float, default=6.0)
+    ap.add_argument("--ridge", action="store_true",
+                    help="density-dependent ridge gain (low density ~2.75 -> high density ~1.0); overrides --gain")
     ap.add_argument("--steps", type=int, default=50); ap.add_argument("--cfg", type=float, default=6.0)
     ap.add_argument("--seed", type=int, default=777); ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -71,7 +77,7 @@ def main():
 
     inner = InpaintContinuationGenerator(sam, steps=args.steps, cfg_scale=args.cfg)
     sched = ControlSchedule(args.shape, args.duration, args.lo, args.hi)
-    steered = SteeredGenerator(inner, sched, enc, mean, std, args.gain, fps, args.cfg, "cuda", md)
+    steered = SteeredGenerator(inner, sched, enc, mean, std, args.gain, fps, args.cfg, "cuda", md, ridge=args.ridge)
     f = lambda s: int(round(s * fps))
     r = LongFormRenderer(steered, channels=sam.model.io_channels, fps=fps,
                          window_frames=f(args.window_sec), overlap_frames=f(args.overlap_sec))
@@ -81,12 +87,15 @@ def main():
         audio = sam.model.pretransform.decode(lat.to(pt_dtype), chunked=True).float().cpu()
     wav = audio[0] if audio.dim() == 3 else audio
     sf.write(args.out, wav.clamp(-1, 1).transpose(0, 1).numpy(), int(sam.model.sample_rate))
-    json.dump({"shape": args.shape, "duration": args.duration, "gain": args.gain,
+    json.dump({"shape": args.shape, "duration": args.duration,
+               "gain": ("ridge" if args.ridge else args.gain), "ridge": args.ridge,
                "scalar_field": ck.get("scalar_field"), "fps": fps,
-               "applied": steered.applied}, open(args.out + ".schedule.json", "w"), indent=1)
+               "applied": steered.applied, "gains": steered.gains},
+              open(args.out + ".schedule.json", "w"), indent=1)
+    dvals = [r[1] for r in steered.applied]
     print(f"[steered] wrote {args.out}  windows={len(steered.applied)}  "
-          f"density {steered.applied[0][1]:.1f}..{min(r[1] for r in steered.applied):.1f}.."
-          f"{steered.applied[-1][1]:.1f}")
+          f"density {min(dvals):.1f}..{max(dvals):.1f}  "
+          f"gain {min(steered.gains):.2f}..{max(steered.gains):.2f}")
 
 
 if __name__ == "__main__":
