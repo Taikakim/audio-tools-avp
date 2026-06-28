@@ -57,7 +57,10 @@ and **NOT loss** (noise-dominated — flat for working *and* collapsed). Gain ~1
 
 ## Data
 - `Lehto/latents_sa3` — 5400 crops, SAME-L 256-d, T=4096; `.json` (prompt + metadata)
-  + `.TIMESERIES.npz` (21 grid-aligned control fields). Adapter training data.
+  + `.TIMESERIES.npz` (21 grid-aligned control fields). Adapter training data. **For
+  training, point `--encoded_dir` at the NVMe mirror `/home/kim/Projects/latents_sa3`,
+  not Lehto — cold random reads off the removable drive crawl (~2 MB/s) and stall the
+  dataloader (first-step freeze, MASTER §5).** Lehto stays the canonical copy.
 - Project stems (per-generator, named by instrument, ~16 tracks) — ground truth for
   `stem_score` and future audio-reference pairs.
 
@@ -78,3 +81,21 @@ MIR=/home/kim/Projects/mir/mir/bin/python
 PYTORCH_TUNABLEOP_ENABLED=0 $SA3 avp_sa3/scripts/sa3_flowsep.py -i mix.wav ...
 $MIR avp_sa3/scripts/stem_score.py --role drums --stems-dir <stems> ...
 ```
+
+## [2026-06-28] CPU eval servers in stable-audio-3/scripts/ — cross-repo note (stable-audio-3 agent)
+
+File-drop eval servers that complement the `sa3_control/` training pipeline. Scripts live in
+`stable-audio-3/scripts/`, run with the SA3 `.venv`:
+
+- **`control_eval_server.py`** + **`submit_control_job.py`** — long-lived all-CPU control-adapter
+  ONNX eval server; queue `SAO/control_eval_queue`.
+- **`latch_eval_server.py`** + **`submit_latch_job.py`** — CPU LatCH-guidance sibling: plain DiT
+  ONNX forward-only (ORT CPU EP) + torch autograd through the ~5-7M-param guidance head only; queue
+  `SAO/latch_eval_queue`. `--prompts` takes one verbatim prompt per flag occurrence (no comma-split —
+  musical prompts contain commas). Commit 020b6c3, branch `latch-sa3-phase1`.
+- **`latch_validate.py`** — CPU/GPU z0-cosine harness; GPU half deferred (`--run-gpu`).
+- **`make_text_cond.load_conditioner`** — shared by both servers: loads with `device="cpu"` so the
+  1.4 B T5-Gemma weights never hit VRAM. Keep the GPU visible — `HIP_VISIBLE_DEVICES=""` breaks the
+  `flash_attn`/`aiter` driver probe at import time.
+
+Details: `stable-audio-3/docs/onnx-amd-inference.md` and `SAO/MASTER.md §5`.
