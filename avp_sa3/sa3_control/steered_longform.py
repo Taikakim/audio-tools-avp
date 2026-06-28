@@ -174,7 +174,6 @@ def main():
     import os, json, argparse
     os.environ.setdefault("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE")
     import torch
-    import soundfile as sf
     from stable_audio_3 import StableAudioModel
     from stable_audio_3.inference.longform import (
         InpaintContinuationGenerator, PromptSchedule)
@@ -287,7 +286,8 @@ def main():
         pt_dtype = next(sam.model.pretransform.parameters()).dtype
         audio = sam.model.pretransform.decode(lat.to(pt_dtype), chunked=True).float().cpu()
     wav = audio[0] if audio.dim() == 3 else audio
-    sf.write(args.out, wav.clamp(-1, 1).transpose(0, 1).numpy(), sr)
+    from sa3_control.audio_io import save_audio
+    save_audio(args.out, wav, sr)   # peak-normalize, never raw-clamp: SA3 output peaks >1.0 (MASTER §5)
     json.dump({"shape": args.shape, "duration": args.duration,
                "gain": ("ridge" if args.ridge else args.gain), "ridge": args.ridge,
                "scalar_field": ck.get("scalar_field"), "fps": fps,
