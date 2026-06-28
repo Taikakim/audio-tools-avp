@@ -20,7 +20,11 @@ training-free generative separation / riffer + scoring (`scripts/`). Full map in
 ## Venvs (invoke by absolute path)
 - Anything importing `stable_audio_3`: **SA3 `.venv` (3.13)**
   `/home/kim/Projects/SAO/stable-audio-3/.venv/bin/python`, with
-  `PYTORCH_TUNABLEOP_ENABLED=0`.
+  `PYTORCH_TUNABLEOP_ENABLED=0` and
+  `FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE` (set **before** `import torch` to
+  activate the CK flash-attn build — 30–100% faster; forgetting it →
+  `No module named 'aiter'` + FA disabled). `run_control_train.sh` already bakes
+  both in. See MASTER §5.
 - `stem_score.py` / librosa analysis: **mir venv**
   `/home/kim/Projects/mir/mir/bin/python`.
 
