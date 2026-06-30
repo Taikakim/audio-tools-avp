@@ -885,11 +885,12 @@ if __name__ == "__main__":
                              "See LATCH_RESULTS.txt §20A,D.")
     parser.add_argument("--components", type=str, default=None,
                         help="FusionOpt: comma-separated subset of "
-                             "{mona,shampoo,ns5,normuon,sf}. Default = all (full Fusion). "
+                             "{mona,shampoo,ns5,normuon,sf,cautious}. Default = all (full Fusion). "
                              "Use 'ns5' for plain Muon, 'mona,ns5' for MONA, "
                              "'shampoo' for KL-Shampoo only, 'sf' for ScheduleFree+, "
-                             "'ns5,normuon,sf' for SF-NorMuon. See LATCH_RESULTS.txt §20 "
-                             "for the per-component ablation results.")
+                             "'ns5,normuon,sf' for SF-NorMuon, append 'cautious' for "
+                             "C-Muon masking (drops update coords that fight the gradient). "
+                             "See LATCH_RESULTS.txt §20 for the per-component ablation results.")
     parser.add_argument("--fp32-audit-period", type=int, default=None,
                         help="FusionOpt: every N steps, recompute NS5 in FP32 alongside "
                              "the hot-dtype path and log relative-error stats (rel_mean, "

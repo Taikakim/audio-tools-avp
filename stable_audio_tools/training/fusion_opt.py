@@ -133,6 +133,26 @@ def _inv_quarter(M: torch.Tensor, delta: float = 1e-4) -> torch.Tensor:
     return eigvecs @ torch.diag_embed(inv_q) @ eigvecs.transpose(-1, -2)
 
 
+# ---------- Cautious masking (Liang et al., "Cautious Optimizers", 2024) ----------
+
+def apply_cautious(update: torch.Tensor, grad: torch.Tensor,
+                   eps: float = 1e-8) -> torch.Tensor:
+    """Mask out the update coordinates that fight the gradient, rescale survivors.
+
+    The weight moves by ``-gamma * update``; along a coordinate the first-order
+    loss change is ``grad * (-gamma * update)``, so the step only descends where
+    ``update * grad > 0``. Zero the rest (they would *increase* loss — the
+    constant-magnitude wandering an LMO update can't otherwise avoid in a flat /
+    under-determined landscape), then divide survivors by the keep-fraction so the
+    masked update keeps the same mean magnitude as the unmasked one.
+
+    All-agree -> identity. All-disagree -> ~0 (no blow-up). Pure, stateless;
+    `update` and `grad` must be the same shape (read in fp32 in the hot loop).
+    """
+    mask = (update * grad > 0).to(update.dtype)
+    return update * mask / (mask.mean() + eps)
+
+
 # ---------- FusionOpt ----------
 
 class FusionOpt(Optimizer):
@@ -183,7 +203,7 @@ class FusionOpt(Optimizer):
         #                applies to live weights p directly.
         components: "set[str] | None" = None,
     ):
-        all_components = {"mona", "shampoo", "ns5", "normuon", "sf"}
+        all_components = {"mona", "shampoo", "ns5", "normuon", "sf", "cautious"}
         if components is None:
             components = all_components
         components = set(components)
@@ -308,7 +328,8 @@ class FusionOpt(Optimizer):
         if self._telem_on:                      # per-component instrumentation (this step only)
             self._comp_acc = {"sp_n": 0, "mom_sq": 0.0, "monaA_sq": 0.0, "mpre_sq": 0.0,
                               "ns5_sq": 0.0, "final_sq": 0.0, "gamma_t": 0.0,
-                              "sc_n": 0, "sc_grad_sq": 0.0}
+                              "sc_n": 0, "sc_grad_sq": 0.0,
+                              "caut_kept": 0.0, "caut_n": 0.0}
         for group in self.param_groups:
             if group["group_type"] == "spectral":
                 self._spectral_group_step(group, gamma_ratio)
@@ -354,6 +375,10 @@ class FusionOpt(Optimizer):
                 d["comp/normuon_gain"] = fin / (ns5 + 1e-12)       # per-neuron row scaling
             d["comp/spectral_update_norm"] = a["gamma_t"] * fin    # actual spectral weight delta
             d["comp/gamma_t"] = a["gamma_t"]                        # effective step = lr*polyak*warmup
+        if a.get("caut_n", 0.0) > 0:
+            # Fraction of update coords kept by cautious masking. Falls toward 0.5
+            # = update fighting the gradient half the time = wandering (drift signal).
+            d["comp/cautious_keep_frac"] = a["caut_kept"] / a["caut_n"]
         if a["sc_n"]:
             d["comp/scalar_grad_norm"] = a["sc_grad_sq"] ** 0.5
         return d
@@ -566,6 +591,15 @@ class FusionOpt(Optimizer):
             if self._telem_on:
                 self._comp_acc["final_sq"] += float((U * U).sum())
 
+            # 6b. Cautious masking (optional) — drop update coords that fight the
+            # gradient, rescale survivors. Attacks the constant-magnitude wandering
+            # of the orthogonalised (LMO) update in the flat control landscape.
+            if "cautious" in self._components:
+                U = apply_cautious(U, grad)
+                if self._telem_on:
+                    self._comp_acc["caut_kept"] += float((U != 0).to(U.dtype).mean())
+                    self._comp_acc["caut_n"] += 1.0
+
             # 7. Update — Schedule-Free averaging (with WD on z_t) OR direct on p
             t = state["step"] + 1
             state["step"] = t
@@ -625,6 +659,11 @@ class FusionOpt(Optimizer):
             m_hat = m / bias1
             v_hat = v / bias2
             u = m_hat / (v_hat.sqrt() + eps)
+
+            # Cautious masking (optional) — same rule as the spectral path: the
+            # scalar group is plain ScheduleFree-AdamW, so this is literally C-AdamW.
+            if "cautious" in self._components:
+                u = apply_cautious(u, grad)
 
             if "sf" in self._components:
                 z = state["z"]
