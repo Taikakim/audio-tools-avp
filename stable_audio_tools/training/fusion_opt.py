@@ -137,20 +137,27 @@ def _inv_quarter(M: torch.Tensor, delta: float = 1e-4) -> torch.Tensor:
 
 def apply_cautious(update: torch.Tensor, grad: torch.Tensor,
                    eps: float = 1e-8) -> torch.Tensor:
-    """Mask out the update coordinates that fight the gradient, rescale survivors.
+    """Mask out the update coordinates that fight the gradient, rescale survivors
+    to preserve the UPDATE NORM (not the mean magnitude).
 
     The weight moves by ``-gamma * update``; along a coordinate the first-order
     loss change is ``grad * (-gamma * update)``, so the step only descends where
-    ``update * grad > 0``. Zero the rest (they would *increase* loss — the
-    constant-magnitude wandering an LMO update can't otherwise avoid in a flat /
-    under-determined landscape), then divide survivors by the keep-fraction so the
-    masked update keeps the same mean magnitude as the unmasked one.
+    ``update * grad > 0``. Zero the rest, then rescale the survivors by
+    ``||U|| / ||U*mask||`` so the masked step is exactly as large as the unmasked one.
+
+    WHY norm- and not mean-preserving (2026-07-02, the DoRA r128 divergence): the
+    C-AdamW-style ``1/keep_frac`` rescale inflates the norm by ``1/sqrt(keep)`` —
+    negligible at sign-consistent keeps (~0.9) but a hidden +37% effective LR at the
+    keep≈0.53 near-random masks NS5-orthogonalized updates produce (keep_frac telemetry,
+    wandb iu1bmlyj), which NaN'd the r128 DoRA full-fusion run between ep2 and ep3
+    while the identical-minus-cautious baseline trained clean.
 
     All-agree -> identity. All-disagree -> ~0 (no blow-up). Pure, stateless;
     `update` and `grad` must be the same shape (read in fp32 in the hot loop).
     """
     mask = (update * grad > 0).to(update.dtype)
-    return update * mask / (mask.mean() + eps)
+    masked = update * mask
+    return masked * (update.norm() / (masked.norm() + eps))
 
 
 # ---------- FusionOpt ----------
@@ -229,6 +236,9 @@ class FusionOpt(Optimizer):
         self._comp_acc = None           # accumulator (reset each instrumented step)
         self._mode = "train"  # "train" or "eval"
         self._step_count = 0
+        # External trust multiple on the effective step (written by training.sonar's
+        # radial probes; 1.0 = neutral). Multiplies gamma_t in BOTH paths.
+        self.gamma_scale = 1.0
         # Pending loss for Polyak (set by train loop before step)
         self._current_loss: torch.Tensor | None = None
         # On-device EMAs; lazily created on first step()
@@ -456,7 +466,7 @@ class FusionOpt(Optimizer):
         else:
             warm = 1.0
 
-        gamma_t = lr * gamma_ratio * warm
+        gamma_t = lr * gamma_ratio * warm * float(getattr(self, "gamma_scale", 1.0))
         if self._telem_on:
             self._comp_acc["gamma_t"] = float(gamma_t)
 
@@ -629,7 +639,7 @@ class FusionOpt(Optimizer):
         else:
             warm = 1.0
 
-        gamma_t = lr * gamma_ratio * warm
+        gamma_t = lr * gamma_ratio * warm * float(getattr(self, "gamma_scale", 1.0))
 
         for p in group["params"]:
             if p.grad is None:

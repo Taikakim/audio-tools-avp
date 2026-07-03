@@ -37,17 +37,23 @@ def test_apply_cautious_all_agree_is_identity():
     assert torch.allclose(out, U, atol=1e-6), out
 
 
-def test_apply_cautious_masks_disagreeing_and_preserves_mean():
-    """Disagreeing coords are zeroed; survivors rescaled to preserve mean magnitude."""
+def test_apply_cautious_masks_disagreeing_and_preserves_norm():
+    """Disagreeing coords are zeroed; survivors rescaled to preserve the UPDATE NORM.
+
+    Regression for the DoRA r128 divergence (2026-07-02): the original 1/keep_frac
+    rescale preserves mean magnitude but inflates ||U|| by 1/sqrt(keep) — a hidden
+    +37% effective LR at the keep≈0.53 near-random masks NS5 produces. Norm-preserving
+    rescale keeps the step size honest at ANY keep fraction."""
     U = torch.tensor([1.0, -2.0, 3.0, 4.0])
     g = torch.tensor([1.0,  1.0, 1.0, 1.0])          # coord 1 (-2) disagrees
     out = apply_cautious(U, g)
     # disagreeing coord zeroed
     assert out[1].abs() < 1e-6, out
-    # survivors scaled by 1/keep_frac = 1/0.75
-    assert torch.allclose(out[[0, 2, 3]], U[[0, 2, 3]] / 0.75, atol=1e-5), out
-    # mean magnitude preserved: sum(out) == sum(U over kept) / keep_frac == sum(U_kept)*4/3
-    assert abs(float(out.sum()) - float(U[[0, 2, 3]].sum()) / 0.75) < 1e-4
+    # norm preserved exactly (not inflated)
+    assert abs(float(out.norm()) - float(U.norm())) < 1e-5, (out.norm(), U.norm())
+    # direction of survivors unchanged (pure scaling)
+    kept = out[[0, 2, 3]] / U[[0, 2, 3]]
+    assert torch.allclose(kept, kept[0].expand_as(kept), atol=1e-6)
 
 
 def test_apply_cautious_all_disagree_is_zero():
