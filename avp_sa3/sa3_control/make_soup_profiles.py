@@ -47,7 +47,7 @@ def main():
     ap.add_argument("--start-ep", type=int, default=10)
     ap.add_argument("--end-ep", type=int, default=40)
     ap.add_argument("--epoch-steps", type=int, default=5400)
-    ap.add_argument("--out-dir", default="/run/media/kim/Lehto/sa3_control_runs/soups")
+    ap.add_argument("--out-dir", default="/run/media/kim/Mantu/sa3_control_runs/soups")
     ap.add_argument("--tag", default="")  # appended to filenames, e.g. _ep10-40
     args = ap.parse_args()
     os.makedirs(args.out_dir, exist_ok=True)

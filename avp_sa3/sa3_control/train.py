@@ -8,7 +8,7 @@ own DiT forward (cfg_scale=1.0 -> no CFG batch-doubling).
 
 Run with the SA3 .venv:
     PYTORCH_TUNABLEOP_ENABLED=0 /home/kim/Projects/SAO/stable-audio-3/.venv/bin/python \
-        -m sa3_control.train --encoded_dir /run/media/kim/Lehto/latents_sa3 --smoke
+        -m sa3_control.train --encoded_dir /home/kim/Projects/latents_sa3 --smoke
 """
 
 import argparse
@@ -130,7 +130,7 @@ def export_control_onnx_on_finish(ckpt_path, save_dir, frames, field):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    ap.add_argument("--encoded_dir", default="/run/media/kim/Lehto/latents_sa3")
+    ap.add_argument("--encoded_dir", default="/home/kim/Projects/latents_sa3")
     ap.add_argument("--model", default="medium-base")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--batch", type=int, default=1)
@@ -145,7 +145,7 @@ def main():
                          "~47s of each crop; snaps the offset to beat_activation_ts peaks.")
     ap.add_argument("--cfg-dropout", type=float, default=0.1,
                     help="per-item probability of dropping the control tokens")
-    ap.add_argument("--save-dir", default="/run/media/kim/Lehto/sa3_control_runs/riffer")
+    ap.add_argument("--save-dir", default="/run/media/kim/Mantu/sa3_control_runs/riffer")
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--save-cooldown", type=float, default=60,
                     help="seconds to idle the GPU after each checkpoint save (thermal relief; 0 disables)")

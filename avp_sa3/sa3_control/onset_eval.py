@@ -28,7 +28,7 @@ ap.add_argument("--duration", type=float, default=20.0)
 ap.add_argument("--steps", type=int, default=50)
 ap.add_argument("--cfg", type=float, default=7.0)
 ap.add_argument("--seed", type=int, default=1234)
-ap.add_argument("--out", default="/run/media/kim/Lehto/sa3_control_runs/onset_eval")
+ap.add_argument("--out", default="/run/media/kim/Mantu/sa3_control_runs/onset_eval")
 ap.add_argument("--notes", default="", help="human description of the run's logic/purpose; "
                 "saved to run_meta.json so the eval GUI + inference UIs can show provenance")
 args = ap.parse_args()

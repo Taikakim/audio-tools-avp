@@ -26,7 +26,7 @@ set -eo pipefail
 
 VENV=${SA3_VENV:-/home/kim/Projects/SAO/sa3-rocm7.13-test/.venv/bin/python}
 ENCODED_DIR=${ENCODED_DIR:-/home/kim/Projects/latents_sa3}    # NVMe mirror; Lehto copy is slow/contended
-SAVE_ROOT=${SAVE_ROOT:-/run/media/kim/Lehto/sa3_control_runs}
+SAVE_ROOT=${SAVE_ROOT:-/run/media/kim/Mantu/sa3_control_runs}
 STEPS=${STEPS:-54000}; SAVE_EVERY=${SAVE_EVERY:-5400}; SEED=${SEED:-42}; NUM_WORKERS=${NUM_WORKERS:-4}; BATCH=${BATCH:-1}
 
 RUN_NAME=${1:?usage: run_control_train.sh <run-name> [lr] [optimizer] [extra train.py args...]}

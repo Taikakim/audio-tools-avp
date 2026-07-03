@@ -3,7 +3,7 @@ import json
 import numpy as np
 from collections import defaultdict
 
-base_dir = "/run/media/kim/Lehto/sa3_control_runs/onset_eval_soups_multiprompt/"
+base_dir = "/run/media/kim/Mantu/sa3_control_runs/onset_eval_soups_multiprompt/"
 output_plan_path = "/home/kim/Projects/SAO/stable-audio-tools/docs/model_soups_analysis.md"
 output_non_disint_path = "/home/kim/Projects/SAO/stable-audio-tools/docs/non_disintegrated_soups_analysis.md"
 output_collapse_path = "/home/kim/Projects/SAO/stable-audio-tools/docs/collapse_dropout_analysis.md"
@@ -118,7 +118,7 @@ def main():
             else:
                 print(f"Skipping {d} (pq_scores.json does not exist)")
                 
-    ckpts_base_dir = "/run/media/kim/Lehto/sa3_control_runs/onset_eval_ckpts_multiprompt/"
+    ckpts_base_dir = "/run/media/kim/Mantu/sa3_control_runs/onset_eval_ckpts_multiprompt/"
     if os.path.exists(ckpts_base_dir):
         for d in sorted(os.listdir(ckpts_base_dir)):
             p = os.path.join(ckpts_base_dir, d)
@@ -139,7 +139,7 @@ def main():
     # 1. Output the main model soups analysis
     md_soups = []
     md_soups.append("# Model Soups Multiprompt Evaluation Analysis\n")
-    md_soups.append("This report analyzes the performance of the different checkpoint averaging weights (**Model Soups**) trained on the `lr 2e-5` run, based on evaluations from `/run/media/kim/Lehto/sa3_control_runs/onset_eval_soups_multiprompt/`.\n")
+    md_soups.append("This report analyzes the performance of the different checkpoint averaging weights (**Model Soups**) trained on the `lr 2e-5` run, based on evaluations from `/run/media/kim/Mantu/sa3_control_runs/onset_eval_soups_multiprompt/`.\n")
     md_soups.append("The evaluation consists of **54 generations per soup** (3 prompts $\\times$ 2 seeds $\\times$ 3 gains [1.0, 2.0, 3.0] $\\times$ 3 target densities [7.0, 8.0, 9.0]).\n")
     md_soups.append("---\n")
     

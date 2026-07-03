@@ -21,7 +21,7 @@ the "similarity riffer."** Status (2026-06-20): **riffer trained + validated** a
 **Metric lesson: judge by cross-reference AUDIO diff + MERIT, NOT chroma** (blind to collapse)
 and **NOT loss** (noise-dominated — flat for working *and* collapsed). Gain ~1–2 clean,
 >4 artifacts. **Next milestone → attribute branches** (`sa3_control/ATTRIBUTE_BRANCHES.md`).
-- `dataset.py` — `LatentControlDataset`: reads `Lehto/latents_sa3` (`.npy` + `.json`
+- `dataset.py` — `LatentControlDataset`: reads `latents_sa3` (`.npy` + `.json`
   + `.TIMESERIES.npz`) → `latent (256,4096)` + controls (dynamics 4 / rhythm 3 /
   melody 12, **already T=4096, no resampling**) + prompt + `ref_latent` (a different
   crop of the same track = the riffer pairing) + padding_mask. **No audio I/O.**
@@ -56,11 +56,11 @@ and **NOT loss** (noise-dominated — flat for working *and* collapsed). Gain ~1
   the mir venv** (librosa).
 
 ## Data
-- `Lehto/latents_sa3` — 5400 crops, SAME-L 256-d, T=4096; `.json` (prompt + metadata)
-  + `.TIMESERIES.npz` (21 grid-aligned control fields). Adapter training data. **For
-  training, point `--encoded_dir` at the NVMe mirror `/home/kim/Projects/latents_sa3`,
-  not Lehto — cold random reads off the removable drive crawl (~2 MB/s) and stall the
-  dataloader (first-step freeze, MASTER §5).** Lehto stays the canonical copy.
+- `latents_sa3` — 5400 crops, SAME-L 256-d, T=4096; `.json` (prompt + metadata)
+  + `.TIMESERIES.npz` (21 grid-aligned control fields). Adapter training data. Lives at
+  `/home/kim/Projects/latents_sa3` (NVMe) — **this is now the sole copy** (the Lehto
+  copy was removed 2026-07-04 to avoid mix-ups; Lehto is training-data-only, evals and
+  checkpoints moved to Mantu). Point `--encoded_dir` there.
 - Project stems (per-generator, named by instrument, ~16 tracks) — ground truth for
   `stem_score` and future audio-reference pairs.
 
