@@ -9,6 +9,11 @@ Guidance for Claude Code when working in the **audio-tools-AVP** fork of
 > Read it before cross-cutting work, and append to
 > `/home/kim/Projects/SAO/WORKLOG.md` when you finish something another repo's
 > agent would want to know.
+>
+> ⚠️ **`WORKLOG.md` and the `AGENT_DIALOGUE.md` cross-instance channel are PUBLIC** (the
+> dialogue log auto-mirrors to a public URL for remote review). **Never write secrets** —
+> passwords, API keys/tokens, SSH creds, `.netrc` contents, or credential-revealing paths —
+> into either; keep secrets in the shell/env. (See MASTER §4.)
 @/home/kim/Projects/SAO/MASTER.md
 
 ## This repo at a glance
