@@ -23,7 +23,8 @@ def save_audio(path, audio, sr, normalize=True):
         a = a.unsqueeze(0)                       # (T,) -> (1, T)
     peak = torch.max(torch.abs(a))
     if normalize and peak > 1e-6:
-        a = a / peak                             # loudest sample -> 1.0, no clipping
+        a = a / peak * 0.8913                    # loudest sample -> -1 dBFS (headroom; avoids
+                                                 # inter-sample clipping on lossy/DAC playback)
     a = a.clamp(-1.0, 1.0)
     arr = a.transpose(0, 1).contiguous().numpy()  # soundfile wants (frames, channels)
     sf.write(str(path), arr, int(sr), subtype="PCM_16")
