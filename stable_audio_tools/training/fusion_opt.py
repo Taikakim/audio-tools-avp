@@ -30,8 +30,14 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+import re
+
 import torch
 from torch.optim import Optimizer
+
+# Matches a DiT layer index in a param name (e.g. "…transformer.layers.6.attn…" -> 6) for the
+# optional per-layer update-weight schedule. Non-transformer params (no match) stay at 1.0.
+_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 # ---------- Newton-Schulz quintic (Muon) ----------
@@ -209,6 +215,11 @@ class FusionOpt(Optimizer):
         #                Polyak step, WD on z_t). When disabled, weight decay
         #                applies to live weights p directly.
         components: "set[str] | None" = None,
+        # Optional per-DiT-layer update-weight schedule: {dit_layer_index: multiplier}.
+        # Scales the finalized spectral step of params in transformer.layers.N by curve[N]
+        # (post-NS5/NorMuon/cautious — pure step-size modulation, orthogonalisation intact);
+        # non-transformer params and unlisted layers stay 1.0. None = no-op (default).
+        layer_update_weights: "dict | None" = None,
     ):
         all_components = {"mona", "shampoo", "ns5", "normuon", "sf", "cautious"}
         if components is None:
@@ -231,6 +242,11 @@ class FusionOpt(Optimizer):
         super().__init__(params, defaults)
 
         self._components = frozenset(components)
+        # per-DiT-layer update-weight schedule ({int layer: float mult}); cache name->mult
+        self._layer_update_weights = (
+            {int(k): float(v) for k, v in layer_update_weights.items()}
+            if layer_update_weights else None)
+        self._layer_mult_cache: "dict[str, float]" = {}
         self._telem_on = False          # per-component telemetry gate; trainer sets it per step
         self._comp_telem = {}           # last instrumented step's per-stage update-magnitude profile
         self._comp_acc = None           # accumulator (reset each instrumented step)
@@ -446,6 +462,19 @@ class FusionOpt(Optimizer):
 
     # ---- spectral path --------------------------------------------------
 
+    def _layer_mult(self, name):
+        """Per-layer step-size multiplier for a param name (cached). 1.0 when the schedule
+        is off, the name is None, it carries no `layers.N`, or that layer isn't listed."""
+        if self._layer_update_weights is None or not name:
+            return 1.0
+        c = self._layer_mult_cache
+        v = c.get(name)
+        if v is None:
+            m = _LAYER_RE.search(name)
+            v = self._layer_update_weights.get(int(m.group(1)), 1.0) if m else 1.0
+            c[name] = v
+        return v
+
     def _spectral_group_step(self, group, gamma_ratio):
         lr = group["lr"]
         beta = group["beta"]
@@ -488,8 +517,9 @@ class FusionOpt(Optimizer):
             "bf16": torch.bfloat16,
         }.get(hot_dtype_name, torch.float32)
         use_safe_ns5 = (hot_dtype_name == "fp16_safe")
+        _pnames = group.get("param_names") or [None] * len(group["params"])
 
-        for p in group["params"]:
+        for p, _pname in zip(group["params"], _pnames):
             if p.grad is None:
                 continue
 
@@ -609,6 +639,12 @@ class FusionOpt(Optimizer):
                 if self._telem_on:
                     self._comp_acc["caut_kept"] += float((U != 0).to(U.dtype).mean())
                     self._comp_acc["caut_n"] += 1.0
+
+            # 6c. Per-DiT-layer update-weight schedule (GOA TASK B): final per-layer step-size
+            # modulation on the fully-shaped spectral step. No-op unless the schedule is set.
+            _lm = self._layer_mult(_pname)
+            if _lm != 1.0:
+                U = U * _lm
 
             # 7. Update — Schedule-Free averaging (with WD on z_t) OR direct on p
             t = state["step"] + 1
