@@ -518,8 +518,9 @@ class FusionOpt(Optimizer):
         }.get(hot_dtype_name, torch.float32)
         use_safe_ns5 = (hot_dtype_name == "fp16_safe")
         _pnames = group.get("param_names") or [None] * len(group["params"])
+        _splits = group.get("spectral_split") or [1] * len(group["params"])
 
-        for p, _pname in zip(group["params"], _pnames):
+        for p, _pname, _nblk in zip(group["params"], _pnames, _splits):
             if p.grad is None:
                 continue
 
@@ -591,32 +592,44 @@ class FusionOpt(Optimizer):
             if self._telem_on:
                 self._comp_acc["mpre_sq"] += float((m_pre.float() * m_pre.float()).sum())
 
-            # 5. Muon NS5 spectral normalisation (optional)
+            # 5. Muon NS5 spectral normalisation (optional). --fusion-split-qkv: a fused
+            # attention up-projection (_nblk>1) is orthogonalised PER dim-row block, so q/k/v
+            # (+ the differential-attention diff blocks) each get their own spectral treatment
+            # and per-block aspect scale; blocks are written back stacked. _nblk==1 (default) is
+            # whole-matrix NS5, unchanged.
             if "ns5" in self._components:
-                if use_safe_ns5:
-                    U = newton_schulz_5_fp16_safe(m_pre).float()
+                _ns5 = newton_schulz_5_fp16_safe if use_safe_ns5 else newton_schulz_5
+                if _nblk > 1:
+                    _bh = m_pre.shape[0] // _nblk
+                    _blocks = []
+                    for _b in range(_nblk):
+                        _Ub = _ns5(m_pre[_b * _bh:(_b + 1) * _bh]).float()
+                        _od, _idim = _Ub.shape
+                        _blocks.append(_Ub * ((max(1.0, _od / _idim)) ** 0.5))
+                    U = torch.cat(_blocks, dim=0)
                 else:
-                    U = newton_schulz_5(m_pre).float()
-                # FP32 audit (optional): silently re-run in FP32 and record the
-                # relative error; doesn't affect the actual update.
-                audit_period = group.get("fp32_audit_period", 0)
-                if (audit_period > 0 and hot_dtype != torch.float32 and
-                        self._step_count > 0 and self._step_count % audit_period == 0):
-                    with torch.no_grad():
-                        m_pre_fp32 = m_pre.float()
-                        U_fp32 = newton_schulz_5(m_pre_fp32)
-                    diff = (U - U_fp32).abs()
-                    denom = U_fp32.abs().clamp_min(1e-12)
-                    rel = (diff / denom).flatten()
-                    self._audit_stats.append({
-                        "step":  self._step_count,
-                        "shape": tuple(U.shape),
-                        "rel_mean": float(rel.mean().detach()),
-                        "rel_max":  float(rel.max().detach()),
-                        "abs_max":  float(diff.max().detach()),
-                    })
-                out_dim, in_dim = U.shape
-                U.mul_((max(1.0, out_dim / in_dim)) ** 0.5)  # aspect-ratio scale
+                    U = _ns5(m_pre).float()
+                    # FP32 audit (optional; whole-matrix only — a whole-vs-block rel-error would
+                    # be misleading, so it's skipped for the split path): re-run in FP32, record
+                    # the relative error. Doesn't affect the actual update.
+                    audit_period = group.get("fp32_audit_period", 0)
+                    if (audit_period > 0 and hot_dtype != torch.float32 and
+                            self._step_count > 0 and self._step_count % audit_period == 0):
+                        with torch.no_grad():
+                            m_pre_fp32 = m_pre.float()
+                            U_fp32 = newton_schulz_5(m_pre_fp32)
+                        diff = (U - U_fp32).abs()
+                        denom = U_fp32.abs().clamp_min(1e-12)
+                        rel = (diff / denom).flatten()
+                        self._audit_stats.append({
+                            "step":  self._step_count,
+                            "shape": tuple(U.shape),
+                            "rel_mean": float(rel.mean().detach()),
+                            "rel_max":  float(rel.max().detach()),
+                            "abs_max":  float(diff.max().detach()),
+                        })
+                    out_dim, in_dim = U.shape
+                    U = U * ((max(1.0, out_dim / in_dim)) ** 0.5)  # aspect-ratio scale
             else:
                 U = m_pre.float()
             if self._telem_on:

@@ -23,6 +23,37 @@ import torch.nn as nn
 
 MIN_SPECTRAL_DIM = 128
 
+# Fused ATTENTION up-projections whose output rows stack multiple functional projections
+# (q,k,v,q_diff,k_diff / q,q_diff / k,v,k_diff — the SA3 differential-attention variant).
+# Restricted to attention names so MLP up-projections (also k*dim wide, but ONE projection)
+# are NOT split. Matches the OUTPUT-side param (lora_B / full weight); lora_A is input-side
+# (out=rank<dim) so it naturally gets block_count 1. See TASK C, C's 2026-07-30 ruling.
+_FUSED_ATTN_RE = re.compile(r"\.(to_qkv|to_kv|to_q)\.")
+_TO_OUT_RE = re.compile(r"\.to_out\.")
+
+
+def _infer_attn_dim(named_specs) -> int | None:
+    """Model attention dim, for the qkv row-block split. to_out maps (heads*head_dim)->dim,
+    so its OUTPUT-side param (lora_B (dim,rank) or full weight (dim,dim)) has shape[0]==dim.
+    Fallback: GCD of the fused up-projection out-dims (all exact multiples of dim)."""
+    import math
+    for n, p in named_specs:
+        if _TO_OUT_RE.search(n) and (n.endswith("lora_B") or n.endswith(".weight")):
+            return int(p.shape[0])
+    outs = [int(p.shape[0]) for n, p in named_specs
+            if _FUSED_ATTN_RE.search(n) and (n.endswith("lora_B") or n.endswith(".weight"))]
+    if outs:
+        return math.gcd(*outs) if len(outs) > 1 else outs[0]
+    return None
+
+
+def _block_count(name: str, p, dim: int | None) -> int:
+    """How many equal dim-row blocks to orthogonalise this spectral param in. >1 only for a
+    fused attention up-projection whose out rows are an exact multiple of dim; else 1 (whole)."""
+    if dim and _FUSED_ATTN_RE.search(name) and p.shape[0] % dim == 0 and p.shape[0] // dim > 1:
+        return p.shape[0] // dim
+    return 1
+
 
 def build_fusion_param_groups(
     model: nn.Module,
@@ -31,6 +62,7 @@ def build_fusion_param_groups(
     scalar_lr: float | None = None,
     spectral_wd: float = 0.01,
     scalar_wd: float = 0.0,
+    split_qkv: bool = False,
 ) -> list[dict]:
     """Return torch.optim-compatible param groups for FusionOpt.
 
@@ -64,6 +96,11 @@ def build_fusion_param_groups(
         "group_type": "spectral",
         "weight_decay": spectral_wd,
     }
+    if split_qkv:
+        # tag each spectral param with its NS5 block count (>1 = fused attention up-proj to
+        # orthogonalise per dim-row block; the optimiser reads this parallel list per param).
+        dim = _infer_attn_dim(spectral)
+        spectral_group["spectral_split"] = [_block_count(n, p, dim) for n, p in spectral]
     scalar_group = {
         "params": [p for _, p in scalar],
         "param_names": [n for n, _ in scalar],
