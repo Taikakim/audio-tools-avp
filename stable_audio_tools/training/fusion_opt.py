@@ -32,6 +32,7 @@ from typing import Any, Iterable
 
 import re
 
+import math
 import torch
 from torch.optim import Optimizer
 
@@ -168,6 +169,89 @@ def apply_cautious(update: torch.Tensor, grad: torch.Tensor,
 
 # ---------- FusionOpt ----------
 
+
+def decay_factor(schedule: str, step: int, total_steps: int, warmup: int, decay_min: float,
+                 decay_start_frac: float = 0.8) -> float:
+    """LR multiplier at optimizer step `step` (0-based) for the in-optimizer decay schedule.
+
+    WHY THIS EXISTS (C 2026-08-19, from the step-resolution trajectory data): the spectral path is
+    magnitude-blind by construction — NS5 sets every singular value of the update to 1 and NorMuon
+    then makes every output row unit-RMS — so once the gradient turns to noise (small effective
+    batch, fine-tune near a good base) the walk continues at full speed forever. Schedule-Free's
+    premise ("the x-average IS the decay") holds inside a basin, not on a flat landscape: the average
+    of a random walk is a random walk with 1/sqrt(3) the variance. And weight decay at our lr binds
+    with time constant 1/(lr*wd) ~ 3e5 steps, longer than any run. A decay schedule is the one
+    mechanism that stops the wandering by construction.
+        none    -> 1.0
+        cosine  -> after warmup, 1 -> decay_min along a half-cosine over the remaining steps
+        linear  -> after warmup, 1 -> decay_min linearly
+        wsd     -> 1.0 until decay_start_frac*total, then linear to decay_min at total
+    Past total_steps the factor stays at decay_min (never re-warms)."""
+    if schedule in (None, "none"):
+        return 1.0
+    if total_steps <= 0:
+        raise ValueError(f"decay_schedule={schedule!r} needs total_steps > 0 (got {total_steps})")
+    if step < warmup:
+        return 1.0
+    span = max(1, total_steps - warmup)
+    prog = min(1.0, max(0.0, (step - warmup) / span))
+    if schedule == "cosine":
+        f = 0.5 * (1.0 + math.cos(math.pi * prog))
+    elif schedule == "linear":
+        f = 1.0 - prog
+    elif schedule == "wsd":
+        # progress measured on the whole run (warmup counts toward the stable phase)
+        p_all = min(1.0, max(0.0, step / max(1, total_steps)))
+        if p_all < decay_start_frac:
+            f = 1.0
+        else:
+            f = 1.0 - (p_all - decay_start_frac) / max(1e-12, 1.0 - decay_start_frac)
+    else:
+        raise ValueError(f"unknown decay_schedule {schedule!r}")
+    return float(decay_min + (1.0 - decay_min) * max(0.0, f))
+
+
+def snr_gate(U: torch.Tensor, state: dict, mode: str = "row", beta: float = 0.9,
+             floor: float = 0.0, power: float = 1.0, step: int = 1):
+    """Scale the finalized spectral update by its own signal-to-noise ratio.
+
+    Keeps a bias-corrected EMA of U (first moment, m) and of U^2 (second moment, v) and gates
+        row : g_row = clamp(||m_row|| / sqrt(sum_j v_row_j), max 1)   (one gain per output neuron)
+        elem: g_ij  = clamp(|m_ij| / sqrt(v_ij), max 1)                (Adam-like, per weight)
+    then U <- U * max(g^power, floor).  On iid noise the ratio settles at sqrt((1-beta)/(1+beta))
+    (0.23 at beta 0.9 — exactly Adam's built-in brake on noise); on a consistent direction it is 1.
+    This re-introduces the one thing NS5+NorMuon strip: whether the step is repeatable. It is
+    "decay per weight" as a data-driven brake rather than a schedule. Extra state: m (full) and v
+    (row vector or full) — one to two update-sized buffers per matrix.
+    Returns (gated_U, gate)."""
+    if "snr_m" not in state:
+        state["snr_m"] = torch.zeros_like(U)
+        state["snr_v"] = (torch.zeros(U.shape[0], device=U.device, dtype=U.dtype) if mode == "row"
+                          else torch.zeros_like(U))
+    m, v = state["snr_m"], state["snr_v"]
+    m.mul_(beta).add_(U, alpha=(1.0 - beta))
+    if mode == "row":
+        v.mul_(beta).add_((U * U).sum(dim=-1), alpha=(1.0 - beta))
+    elif mode == "elem":
+        v.mul_(beta).add_(U * U, alpha=(1.0 - beta))
+    else:
+        raise ValueError(f"snr mode must be row|elem, got {mode!r}")
+    bc = 1.0 - beta ** max(1, int(step))
+    m_hat = m / bc
+    v_hat = v / bc
+    if mode == "row":
+        g = (m_hat.norm(dim=-1) / v_hat.clamp_min(1e-30).sqrt()).clamp(max=1.0)
+        if power != 1.0:
+            g = g.pow(power)
+        g = g.clamp_min(floor)
+        return U * g.unsqueeze(-1), g
+    g = (m_hat.abs() / v_hat.clamp_min(1e-30).sqrt()).clamp(max=1.0)
+    if power != 1.0:
+        g = g.pow(power)
+    g = g.clamp_min(floor)
+    return U * g, g
+
+
 class FusionOpt(Optimizer):
     """The fused optimiser. Takes param groups from build_fusion_param_groups."""
 
@@ -220,8 +304,30 @@ class FusionOpt(Optimizer):
         # (post-NS5/NorMuon/cautious — pure step-size modulation, orthogonalisation intact);
         # non-transformer params and unlisted layers stay 1.0. None = no-op (default).
         layer_update_weights: "dict | None" = None,
+        # HYPERBALL (arXiv 2606.16899, Alg. 1) — constrain each spectral 2D weight matrix to
+        # the hypersphere of radius R = ‖W0‖_F (captured ONCE, on the first step for that
+        # param). Replaces the DIRECT-to-p step with the Hyperball retraction:
+        #   u_hat   = U / ‖U‖         (normalized spectral update)
+        #   W_tilde = W - gamma_t * R * u_hat
+        #   W       = R * W_tilde / ‖W_tilde‖
+        # Hyperball is its OWN iterate → INCOMPATIBLE with Schedule-Free ('sf'); constructing
+        # with both raises ValueError. Weight decay is IGNORED under hyperball (the norm
+        # constraint replaces it). Applies ONLY in the spectral DIRECT-to-p path; the scalar
+        # path is untouched. Off by default => byte-identical to today.
+        hyperball: bool = False,
+        # DAMPING (C 2026-08-19; Kim's "muon damping tests"). Both off by default => byte-identical.
+        #   decay_schedule none|cosine|linear|wsd over total_steps (after warmup) -> multiplies gamma_t
+        #   'snr' component: gate the finalized spectral update by |EMA(U)|/RMS(U) per row|elem
+        decay_schedule: str = "none",
+        total_steps: int = 0,
+        decay_min: float = 0.0,
+        decay_start_frac: float = 0.8,
+        snr_mode: str = "row",
+        snr_beta: float = 0.9,
+        snr_floor: float = 0.0,
+        snr_power: float = 1.0,
     ):
-        all_components = {"mona", "shampoo", "ns5", "normuon", "sf", "cautious"}
+        all_components = {"mona", "shampoo", "ns5", "normuon", "sf", "cautious", "snr"}
         if components is None:
             components = all_components
         components = set(components)
@@ -238,10 +344,25 @@ class FusionOpt(Optimizer):
             weight_decay=weight_decay,
             hot_dtype=hot_dtype, warmup_steps=warmup_steps,
             fp32_audit_period=int(fp32_audit_period),
+            decay_schedule=decay_schedule, total_steps=int(total_steps), decay_min=float(decay_min),
+            decay_start_frac=float(decay_start_frac),
+            snr_mode=snr_mode, snr_beta=float(snr_beta), snr_floor=float(snr_floor),
+            snr_power=float(snr_power),
         )
         super().__init__(params, defaults)
+        if decay_schedule not in (None, "none") and int(total_steps) <= 0:
+            raise ValueError("FusionOpt: decay_schedule needs total_steps > 0")
 
         self._components = frozenset(components)
+        # HYPERBALL — norm-constrained iterate (arXiv 2606.16899). Its own iterate, so it
+        # cannot coexist with Schedule-Free averaging (both own the update of p/z).
+        self._hyperball = bool(hyperball)
+        if self._hyperball and "sf" in self._components:
+            raise ValueError(
+                "FusionOpt: hyperball=True is incompatible with the 'sf' (Schedule-Free) "
+                "component — Hyperball is its own norm-constrained iterate. Drop 'sf' from "
+                "components (e.g. use ['mona','ns5','normuon']) when enabling hyperball."
+            )
         # per-DiT-layer update-weight schedule ({int layer: float mult}); cache name->mult
         self._layer_update_weights = (
             {int(k): float(v) for k, v in layer_update_weights.items()}
@@ -355,7 +476,8 @@ class FusionOpt(Optimizer):
             self._comp_acc = {"sp_n": 0, "mom_sq": 0.0, "monaA_sq": 0.0, "mpre_sq": 0.0,
                               "ns5_sq": 0.0, "final_sq": 0.0, "gamma_t": 0.0,
                               "sc_n": 0, "sc_grad_sq": 0.0,
-                              "caut_kept": 0.0, "caut_n": 0.0}
+                              "caut_kept": 0.0, "caut_n": 0.0,
+                              "snr_gain": 0.0, "snr_n": 0.0, "decay": 1.0}
         for group in self.param_groups:
             if group["group_type"] == "spectral":
                 self._spectral_group_step(group, gamma_ratio)
@@ -405,6 +527,9 @@ class FusionOpt(Optimizer):
             # Fraction of update coords kept by cautious masking. Falls toward 0.5
             # = update fighting the gradient half the time = wandering (drift signal).
             d["comp/cautious_keep_frac"] = a["caut_kept"] / a["caut_n"]
+        if a.get("snr_n", 0) > 0:
+            d["comp/snr_gain"] = a["snr_gain"] / a["snr_n"]       # mean SNR gate (1 = signal, ~0.23 = noise)
+        d["comp/decay"] = a.get("decay", 1.0)
         if a["sc_n"]:
             d["comp/scalar_grad_norm"] = a["sc_grad_sq"] ** 0.5
         return d
@@ -495,9 +620,13 @@ class FusionOpt(Optimizer):
         else:
             warm = 1.0
 
-        gamma_t = lr * gamma_ratio * warm * float(getattr(self, "gamma_scale", 1.0))
+        decay = decay_factor(group.get("decay_schedule", "none"), self._step_count,
+                             group.get("total_steps", 0), warmup, group.get("decay_min", 0.0),
+                             group.get("decay_start_frac", 0.8))
+        gamma_t = lr * gamma_ratio * warm * decay * float(getattr(self, "gamma_scale", 1.0))
         if self._telem_on:
             self._comp_acc["gamma_t"] = float(gamma_t)
+            self._comp_acc["decay"] = float(decay)
 
         # hot_dtype_name controls how the NS5 hot path runs:
         #   "fp32"     - safe, slowest. Standard NS5 in fp32.
@@ -641,6 +770,15 @@ class FusionOpt(Optimizer):
                 row_ss = (U * U).sum(dim=-1)  # (out_dim,)
                 r.mul_(beta_r).add_(row_ss, alpha=(1 - beta_r))
                 U = U / (r.clamp_min(1e-12).sqrt().unsqueeze(-1))
+            # 6a. SNR gate (optional, 'snr'): scale by |EMA(U)|/RMS(U) per row|elem — the brake
+            # NS5+NorMuon lack (see snr_gate). Uses the optimizer's own step count for bias correction.
+            if "snr" in self._components:
+                U, _g = snr_gate(U, state, mode=group.get("snr_mode", "row"),
+                                 beta=group.get("snr_beta", 0.9), floor=group.get("snr_floor", 0.0),
+                                 power=group.get("snr_power", 1.0), step=state["step"] + 1)
+                if self._telem_on:
+                    self._comp_acc["snr_gain"] += float(_g.mean())
+                    self._comp_acc["snr_n"] += 1.0
             if self._telem_on:
                 self._comp_acc["final_sq"] += float((U * U).sum())
 
@@ -669,6 +807,20 @@ class FusionOpt(Optimizer):
                 z.mul_(1 - gamma_t * wd).add_(U, alpha=-gamma_t)
                 # x_{t+1} = (1 - 1/t) x_t + (1/t) z_{t+1}
                 x.mul_(1 - 1.0 / t).add_(z, alpha=1.0 / t)
+            elif self._hyperball:
+                # HYPERBALL (arXiv 2606.16899, Alg. 1): constrain W to the hypersphere of
+                # radius R = ‖W0‖_F, captured ONCE (norm of the LOADED weights on the first
+                # step for this param, before applying). Weight decay is IGNORED (the norm
+                # constraint replaces it). u_t == U (the finalized spectral update).
+                #   u_hat   = U / (‖U‖ + eps)
+                #   W_tilde = W - gamma_t * R * u_hat
+                #   W       = R * W_tilde / (‖W_tilde‖ + eps)
+                if "hyperball_R" not in state:
+                    state["hyperball_R"] = p.data.norm()
+                R = state["hyperball_R"]
+                u_hat = U / (U.norm() + 1e-12)
+                W_tilde = p.data - gamma_t * R * u_hat.to(p.dtype)
+                p.data.copy_(R * W_tilde / (W_tilde.norm() + 1e-12))
             else:
                 # No SF averaging: apply WD + step directly to live weights p
                 p.data.mul_(1 - gamma_t * wd).add_(U.to(p.dtype), alpha=-gamma_t)
@@ -688,7 +840,10 @@ class FusionOpt(Optimizer):
         else:
             warm = 1.0
 
-        gamma_t = lr * gamma_ratio * warm * float(getattr(self, "gamma_scale", 1.0))
+        decay = decay_factor(group.get("decay_schedule", "none"), self._step_count,
+                             group.get("total_steps", 0), warmup, group.get("decay_min", 0.0),
+                             group.get("decay_start_frac", 0.8))
+        gamma_t = lr * gamma_ratio * warm * decay * float(getattr(self, "gamma_scale", 1.0))
 
         for p in group["params"]:
             if p.grad is None:
