@@ -99,6 +99,20 @@ def test_snr_gate_shapes_floor_and_power():
     assert g2.shape == U.shape and float(g2.max()) <= 1.0 + 1e-6
 
 
+def test_snr_gate_measures_on_ref_when_given():
+    """Gate statistics come from `ref` (the raw gradient), not from U: a perfectly consistent U
+    with a pure-noise ref must brake to ~0.23; a noise U with a constant ref must pass at ~1."""
+    torch.manual_seed(3)
+    st = {}; U = torch.randn(32, 64); g = None
+    for t in range(1, 200):
+        _, g = snr_gate(U, st, mode="row", beta=0.9, floor=0.0, power=1.0, step=t, ref=torch.randn(32, 64))
+    assert abs(float(g.mean()) - math.sqrt(0.1 / 1.9)) < 0.06, float(g.mean())
+    st = {}; C = torch.randn(32, 64)
+    for t in range(1, 50):
+        _, g = snr_gate(torch.randn(32, 64), st, mode="row", beta=0.9, floor=0.0, power=1.0, step=t, ref=C)
+    assert float(g.min()) > 0.99
+
+
 def test_snr_is_a_valid_component_and_optimizer_steps():
     w = torch.nn.Parameter(torch.randn(8, 8))
     groups = [{"params": [w], "group_type": "spectral"}]

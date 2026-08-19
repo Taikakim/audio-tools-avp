@@ -212,28 +212,32 @@ def decay_factor(schedule: str, step: int, total_steps: int, warmup: int, decay_
 
 
 def snr_gate(U: torch.Tensor, state: dict, mode: str = "row", beta: float = 0.9,
-             floor: float = 0.0, power: float = 1.0, step: int = 1):
+             floor: float = 0.0, power: float = 1.0, step: int = 1, ref: "torch.Tensor | None" = None):
     """Scale the finalized spectral update by its own signal-to-noise ratio.
 
     Keeps a bias-corrected EMA of U (first moment, m) and of U^2 (second moment, v) and gates
         row : g_row = clamp(||m_row|| / sqrt(sum_j v_row_j), max 1)   (one gain per output neuron)
         elem: g_ij  = clamp(|m_ij| / sqrt(v_ij), max 1)                (Adam-like, per weight)
-    then U <- U * max(g^power, floor).  On iid noise the ratio settles at sqrt((1-beta)/(1+beta))
+    then U <- U * max(g^power, floor).  `ref` (default U) is the tensor the SNR is MEASURED on:
+    pass the raw gradient to gate on gradient consistency — measuring on the post-momentum update
+    reads momentum's own smoothing as "signal" and the gate never closes (bs1 arms, 2026-08-19).
+    On iid noise the ratio settles at sqrt((1-beta)/(1+beta))
     (0.23 at beta 0.9 — exactly Adam's built-in brake on noise); on a consistent direction it is 1.
     This re-introduces the one thing NS5+NorMuon strip: whether the step is repeatable. It is
     "decay per weight" as a data-driven brake rather than a schedule. Extra state: m (full) and v
     (row vector or full) — one to two update-sized buffers per matrix.
     Returns (gated_U, gate)."""
+    R = U if ref is None else ref
     if "snr_m" not in state:
-        state["snr_m"] = torch.zeros_like(U)
-        state["snr_v"] = (torch.zeros(U.shape[0], device=U.device, dtype=U.dtype) if mode == "row"
-                          else torch.zeros_like(U))
+        state["snr_m"] = torch.zeros_like(R)
+        state["snr_v"] = (torch.zeros(R.shape[0], device=R.device, dtype=R.dtype) if mode == "row"
+                          else torch.zeros_like(R))
     m, v = state["snr_m"], state["snr_v"]
-    m.mul_(beta).add_(U, alpha=(1.0 - beta))
+    m.mul_(beta).add_(R, alpha=(1.0 - beta))
     if mode == "row":
-        v.mul_(beta).add_((U * U).sum(dim=-1), alpha=(1.0 - beta))
+        v.mul_(beta).add_((R * R).sum(dim=-1), alpha=(1.0 - beta))
     elif mode == "elem":
-        v.mul_(beta).add_(U * U, alpha=(1.0 - beta))
+        v.mul_(beta).add_(R * R, alpha=(1.0 - beta))
     else:
         raise ValueError(f"snr mode must be row|elem, got {mode!r}")
     bc = 1.0 - beta ** max(1, int(step))
@@ -323,6 +327,12 @@ class FusionOpt(Optimizer):
         decay_min: float = 0.0,
         decay_start_frac: float = 0.8,
         snr_mode: str = "row",
+        # WHAT the gate measures (C 2026-08-19, from the bs1 damping arms): 'update' gates on the
+        # consistency of the finalized spectral update U — but U is post-MOMENTUM, so its row-
+        # consistency at beta 0.9 is ~1 by construction and the gate was inert (|update| 0.094 vs
+        # control 0.091, every trajectory statistic identical). 'grad' (default now) gates on the RAW
+        # gradient's row SNR — the quantity that is actually 1e-3 at bs1 — so the brake engages.
+        snr_source: str = "grad",
         snr_beta: float = 0.9,
         snr_floor: float = 0.0,
         snr_power: float = 1.0,
@@ -346,7 +356,7 @@ class FusionOpt(Optimizer):
             fp32_audit_period=int(fp32_audit_period),
             decay_schedule=decay_schedule, total_steps=int(total_steps), decay_min=float(decay_min),
             decay_start_frac=float(decay_start_frac),
-            snr_mode=snr_mode, snr_beta=float(snr_beta), snr_floor=float(snr_floor),
+            snr_mode=snr_mode, snr_source=snr_source, snr_beta=float(snr_beta), snr_floor=float(snr_floor),
             snr_power=float(snr_power),
         )
         super().__init__(params, defaults)
@@ -775,7 +785,8 @@ class FusionOpt(Optimizer):
             if "snr" in self._components:
                 U, _g = snr_gate(U, state, mode=group.get("snr_mode", "row"),
                                  beta=group.get("snr_beta", 0.9), floor=group.get("snr_floor", 0.0),
-                                 power=group.get("snr_power", 1.0), step=state["step"] + 1)
+                                 power=group.get("snr_power", 1.0), step=state["step"] + 1,
+                                 ref=(grad if group.get("snr_source", "grad") == "grad" else None))
                 if self._telem_on:
                     self._comp_acc["snr_gain"] += float(_g.mean())
                     self._comp_acc["snr_n"] += 1.0
