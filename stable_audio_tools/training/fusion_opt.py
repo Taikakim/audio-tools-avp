@@ -336,8 +336,18 @@ class FusionOpt(Optimizer):
         snr_beta: float = 0.9,
         snr_floor: float = 0.0,
         snr_power: float = 1.0,
+        # AUTOSCALE (Kim 2026-09-01, "snatch a principle from Prodigy for Fusion"): a
+        # global, model-wide D-Adaptation (Defazio & Mishchenko) step-size multiplier,
+        # folded into gamma_t alongside the Polyak ratio. Off by default. See
+        # _update_autoscale for the mechanism and the memory argument (why this is
+        # cheap where prodigyopt.Prodigy is not).
+        autoscale_d0: float = 1e-6,
+        autoscale_coef: float = 1.0,
+        autoscale_growth_rate: float = float("inf"),
+        autoscale_slice_p: int = 16,
+        autoscale_beta3: "float | None" = None,
     ):
-        all_components = {"mona", "shampoo", "ns5", "normuon", "sf", "cautious", "snr"}
+        all_components = {"mona", "shampoo", "ns5", "normuon", "sf", "cautious", "snr", "autoscale"}
         if components is None:
             components = all_components
         components = set(components)
@@ -394,6 +404,19 @@ class FusionOpt(Optimizer):
         # FP32 audit records; trimmed to recent N to bound memory
         self._audit_stats: list[dict] = []
         self._audit_keep = 200
+
+        # AUTOSCALE (D-Adaptation) global running state — see _update_autoscale.
+        # d only ever grows (bounded by autoscale_growth_rate); d/d0 is the multiplier
+        # folded into gamma_t. Inert (returns 1.0 every step) unless "autoscale" is
+        # in components, so absent => byte-identical to today.
+        self._auto_d0 = float(autoscale_d0)
+        self._auto_coef = float(autoscale_coef)
+        self._auto_growth_rate = float(autoscale_growth_rate)
+        self._auto_slice_p = max(1, int(autoscale_slice_p))
+        self._auto_beta3 = float(autoscale_beta3) if autoscale_beta3 is not None else math.sqrt(0.999)
+        self._auto_d = self._auto_d0
+        self._auto_d_max = self._auto_d0
+        self._auto_numerator = 0.0
 
         # Sanity: groups must declare group_type
         for g in self.param_groups:
@@ -481,6 +504,8 @@ class FusionOpt(Optimizer):
 
         # Polyak step size (global, on-device)
         gamma_ratio = self._update_polyak()
+        # D-Adaptation autoscale multiplier (global, python float; 1.0 when off)
+        auto_mult = self._update_autoscale()
 
         if self._telem_on:                      # per-component instrumentation (this step only)
             self._comp_acc = {"sp_n": 0, "mom_sq": 0.0, "monaA_sq": 0.0, "mpre_sq": 0.0,
@@ -490,9 +515,9 @@ class FusionOpt(Optimizer):
                               "snr_gain": 0.0, "snr_n": 0.0, "decay": 1.0}
         for group in self.param_groups:
             if group["group_type"] == "spectral":
-                self._spectral_group_step(group, gamma_ratio)
+                self._spectral_group_step(group, gamma_ratio, auto_mult)
             else:
-                self._scalar_group_step(group, gamma_ratio)
+                self._scalar_group_step(group, gamma_ratio, auto_mult)
         if self._telem_on:
             self._comp_telem = self._finalize_comp_telem()
 
@@ -540,6 +565,9 @@ class FusionOpt(Optimizer):
         if a.get("snr_n", 0) > 0:
             d["comp/snr_gain"] = a["snr_gain"] / a["snr_n"]       # mean SNR gate (1 = signal, ~0.23 = noise)
         d["comp/decay"] = a.get("decay", 1.0)
+        if "autoscale" in self._components:
+            d["comp/autoscale_mult"] = a.get("autoscale_mult", 1.0)
+            d["comp/autoscale_d"] = self._auto_d
         if a["sc_n"]:
             d["comp/scalar_grad_norm"] = a["sc_grad_sq"] ** 0.5
         return d
@@ -595,6 +623,86 @@ class FusionOpt(Optimizer):
         gmax = self.param_groups[0]["gamma_max"]
         return ratio.clamp(gmin, gmax)
 
+    def _update_autoscale(self) -> float:
+        """Global, model-wide Prodigy/D-Adaptation step-size multiplier (Kim
+        2026-09-01, "snatch a principle from Prodigy for Fusion"). Off unless
+        "autoscale" is in components (returns 1.0, no state touched -> free).
+
+        Mechanism (Defazio & Mishchenko's D-Adaptation, as implemented in
+        prodigyopt.Prodigy): `d` starts at d0 and only ever grows, driven by how
+        much the observed gradient correlates with the DISPLACEMENT FROM INIT
+        (dot(grad, p0 - p)) relative to an EMA of gradient magnitude (`s`) — a
+        provable lower bound on the true optimal step size under online-convex-
+        optimization theory. Returned as d/d0, a pure growth multiplier that starts
+        at 1.0 and rises as evidence accumulates, folded into gamma_t alongside the
+        existing Polyak ratio — Fusion's own update geometry (NS5/NorMuon/MONA/
+        Shampoo/SF) is untouched; this only modulates overall magnitude.
+
+        MEMORY, why this is cheap where prodigyopt.Prodigy is not: real Prodigy
+        keeps a FULL-SIZE clone of the initial weights (`p0`) plus a full-size
+        accumulator (`s`) per parameter — on top of Adam's own exp_avg/exp_avg_sq,
+        that's up to 4 full tensors per param, roughly 2x AdamW's state. Here both
+        `p0` and `s` are kept at every `autoscale_slice_p`-th coordinate only
+        (identical in spirit to Prodigy's own documented `slice_p` knob) — state
+        cost is O(numel / slice_p), and it rides in the SAME per-param `self.state`
+        dict Fusion already allocates rather than a second parallel one. The
+        reduction pass below also only touches the sliced elements, so the extra
+        compute is O(numel / slice_p) too, not a second full-size pass.
+
+        Simplifications vs. real Prodigy: this fork's own `lr`/weight-decay/bias-
+        correction already live in gamma_t and the group step functions, so here
+        "lr" is fixed at 1.0 and bias_correction/decoupled-WD are not reproduced —
+        this module ONLY computes and returns a scalar multiplier, it never writes
+        to `p.data` itself.
+        """
+        if "autoscale" not in self._components:
+            return 1.0
+
+        d = self._auto_d
+        d0 = self._auto_d0
+        beta3 = self._auto_beta3
+        slice_p = self._auto_slice_p
+        factor = (d / d0) * d  # == (d/d0)*dlr with our own "lr" fixed at 1.0
+
+        d_numerator = self._auto_numerator * beta3
+        delta_numerator = 0.0
+        d_denom = 0.0
+        any_grad = False
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                any_grad = True
+                state = self.state[p]
+                if "auto_p0" not in state:
+                    state["auto_p0"] = p.detach().flatten()[::slice_p].clone().float()
+                    state["auto_s"] = torch.zeros_like(state["auto_p0"])
+                p0 = state["auto_p0"]
+                s = state["auto_s"]
+
+                g_sliced = p.grad.detach().flatten()[::slice_p].float()
+                p_sliced = p.detach().flatten()[::slice_p].float()
+
+                delta_numerator += float(factor * torch.dot(g_sliced, p0 - p_sliced))
+                s.mul_(beta3).add_(g_sliced, alpha=factor)
+                d_denom += float(s.abs().sum())
+
+        if not any_grad or d_denom == 0.0:
+            return d / d0
+
+        d_numerator += delta_numerator
+        d_hat = self._auto_coef * d_numerator / d_denom
+        if d == d0:
+            d = max(d, d_hat)
+        d_max = max(self._auto_d_max, d_hat)
+        d = min(d_max, d * self._auto_growth_rate)
+
+        self._auto_numerator = d_numerator
+        self._auto_d = d
+        self._auto_d_max = d_max
+        return d / d0
+
     # ---- spectral path --------------------------------------------------
 
     def _layer_mult(self, name):
@@ -610,7 +718,7 @@ class FusionOpt(Optimizer):
             c[name] = v
         return v
 
-    def _spectral_group_step(self, group, gamma_ratio):
+    def _spectral_group_step(self, group, gamma_ratio, auto_mult=1.0):
         lr = group["lr"]
         beta = group["beta"]
         mu = group["mu"]
@@ -633,10 +741,11 @@ class FusionOpt(Optimizer):
         decay = decay_factor(group.get("decay_schedule", "none"), self._step_count,
                              group.get("total_steps", 0), warmup, group.get("decay_min", 0.0),
                              group.get("decay_start_frac", 0.8))
-        gamma_t = lr * gamma_ratio * warm * decay * float(getattr(self, "gamma_scale", 1.0))
+        gamma_t = lr * gamma_ratio * auto_mult * warm * decay * float(getattr(self, "gamma_scale", 1.0))
         if self._telem_on:
             self._comp_acc["gamma_t"] = float(gamma_t)
             self._comp_acc["decay"] = float(decay)
+            self._comp_acc["autoscale_mult"] = float(auto_mult)
 
         # hot_dtype_name controls how the NS5 hot path runs:
         #   "fp32"     - safe, slowest. Standard NS5 in fp32.
@@ -838,7 +947,7 @@ class FusionOpt(Optimizer):
 
     # ---- scalar path ----------------------------------------------------
 
-    def _scalar_group_step(self, group, gamma_ratio):
+    def _scalar_group_step(self, group, gamma_ratio, auto_mult=1.0):
         lr = group["lr"]
         beta1 = group["beta1"]
         beta2 = group["beta2"]
@@ -854,7 +963,7 @@ class FusionOpt(Optimizer):
         decay = decay_factor(group.get("decay_schedule", "none"), self._step_count,
                              group.get("total_steps", 0), warmup, group.get("decay_min", 0.0),
                              group.get("decay_start_frac", 0.8))
-        gamma_t = lr * gamma_ratio * warm * decay * float(getattr(self, "gamma_scale", 1.0))
+        gamma_t = lr * gamma_ratio * auto_mult * warm * decay * float(getattr(self, "gamma_scale", 1.0))
 
         for p in group["params"]:
             if p.grad is None:
