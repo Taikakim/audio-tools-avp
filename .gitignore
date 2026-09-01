@@ -173,3 +173,8 @@ wandb/
 /models/checkpoints/
 latch_weights/*.pt
 *~
+
+# `models/` is a symlink to the eval drive (sao_models/sat_models), created 2026-08-17.
+# The path is machine-specific and the drive is removable, so the LINK must never be
+# committed -- it would break every other checkout and this one when the drive is out.
+models
