@@ -579,6 +579,26 @@ class FusionOpt(Optimizer):
 
         Returned as a scalar tensor on the device of the first available grad,
         so downstream multiplications stay GPU-resident.
+
+        NOTE ON DIFFUSION FLOW MATCHING & MUON DYNAMICS (Kim & Antigravity, 2026-09-20):
+        In continuous flow matching diffusion models (e.g. SA3), this Polyak heuristic
+        exhibits hard ceiling saturation and does not function adaptively:
+        1. Irreducible Bayes Risk: Unlike classification where f* -> 0, continuous flow
+           matching has a non-zero residual loss floor (f* ~ 0.60-0.65). Because this
+           implementation assumes f* = 0, the numerator (loss ~ 0.75) never approaches 0.
+        2. Scale Mismatch: The denominator `gnorm_now` uses mean absolute gradient (|g| ~ 1e-4)
+           rather than a dimensionally matched operator norm. This produces a raw ratio
+           L/G ~ 0.75 / 1e-4 = 7,500, which is ~750x higher than gamma_max (10.0).
+           Consequently, gamma_ratio pegs at 10.0 on step 1 and stays pinned there for the
+           entire run, acting as a constant 10x step multiplier rather than an adaptive brake.
+        3. Double-Normalization with Muon: The Spectral/NS5 update direction is already
+           scale-invariant and normalized to operator norm 1. Multiplying this already-
+           normalized matrix update by a saturated 10.0 ratio forces excessive velocity
+           along leading singular vectors (the "volatile head" at the Edge of Stability,
+           arXiv:2608.25990), causing harsh acoustic timbres and high-frequency click/buzz
+           glitches near convergence (arXiv:2605.31371).
+        In ModularOptimizer, Polyak is omitted in favor of Schedule-Free + NorMuon (RowNorm),
+        calibrating velocity into the ~30-50 units/1k steps good-audio band.
         """
         # Find a reference device from gradients
         device = None
