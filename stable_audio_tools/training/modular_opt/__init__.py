@@ -11,6 +11,8 @@ Public API:
     - build_modular_param_groups, summarise_modular_groups: Parameter routing.
     - calculate_radius_scale: Geometric radius scaling.
     - NormConstraint, Preconditioner: Protocols for extensibility.
+
+Origin: Kim & Antigravity.Neuromancer
 """
 
 from .optimizer import ModularOptimizer
