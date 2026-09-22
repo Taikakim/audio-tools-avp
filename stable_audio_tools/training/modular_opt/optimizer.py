@@ -597,7 +597,7 @@ class ModularOptimizer(Optimizer):
             # per step. Mousse Algorithm 1 line 3 amortises it over T steps.
             freq = group.get("precond_update_freq", 100)
 
-            alpha = group.get("precond_alpha", 0.25)
+            alpha = group.get("precond_alpha", 0.125)
             bottleneck = group.get("precond_bottleneck", True)
             max_dim = group.get("precond_max_dim", 1024)
 

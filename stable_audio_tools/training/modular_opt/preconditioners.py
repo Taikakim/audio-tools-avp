@@ -57,6 +57,20 @@ class ShampooPreconditioner(Preconditioner):
     improves on. Note also that KL-Shampoo is inherently TWO-sided, so it cannot be
     used under the one-sided bottleneck below; adopting it means giving that up.
 
+    SIDE CHOICE, and an honest caveat. Mousse section 5.3 ablates single- vs double-sided
+    and finds single-sided "achieves comparable performance to the Mousse baseline, yielding
+    a negligible decline or even slight improvements" -- so one-sided is validated, not a
+    cost dodge. BUT it also finds the LEFT factor consistently slightly better than the
+    right, attributing this to the preceding LayerNorm standardising the activations whose
+    statistics L captures. We choose by SIZE, not by that preference, so on a (12288, 128)
+    factor we take the side the paper found slightly worse -- because the better one is the
+    unaffordable one.
+
+    KL-SHAMPOO, RESOLVED. arXiv:2509.03378 Claim 1: the KL-optimal one-sided preconditioner
+    is exactly S_a* = E[G G^T] -- the plain covariance computed below. So in ONE-SIDED mode
+    this estimator IS the KL-optimal one, and the distinction from KL-Shampoo disappears.
+    It only reappears if someone turns the bottleneck off.
+
     BOTTLENECK, and why it is on by default. Mousse assumes full weight matrices. Our
     shapes are LoRA/DoRA factors: one side is the rank (128), the other is up to 12288.
     Forming the covariance on the WIDE side is a 12288x12288 matrix, and one eigh of
@@ -66,7 +80,10 @@ class ShampooPreconditioner(Preconditioner):
 
     Mousse Algorithm 1, implemented here:
       line 4  Trace Normalization   Lbar <- dim(L)/(Tr(L)+eps) * L
-      line 6  Spectral Tempering    S <- Lambda^(-alpha), alpha tunable
+      line 6  Spectral Tempering    S <- Lambda^(-alpha), alpha tunable; DEFAULT 0.125,
+              not the classic Shampoo 0.25 -- the paper's own ablation (Figure 7a) finds
+              0.125 'consistently outperforms the aggressive curvature correction
+              (alpha = 0.25), yielding the lowest final loss'.
       line 7  Whitening             P @ G   (or G @ P)
       line 9  Unwhitening           P @ M   (or M @ P)  -- the SAME negative powers,
               not their inverses. This reads like a bug and is not one: confirmed at
@@ -87,7 +104,7 @@ class ShampooPreconditioner(Preconditioner):
         beta: float = 0.95,
         delta: float = 1e-4,
         update_freq: int = 100,
-        alpha: float = 0.25,
+        alpha: float = 0.125,
         bottleneck: bool = True,
         max_dim: int = 1024,
     ) -> None:
