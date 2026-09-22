@@ -6,7 +6,8 @@ Transform-Solve-Invert pipeline with role-based parameter routing.
 Public API:
     - ModularOptimizer: The main optimizer class (6-stage pipeline).
     - SignLMO, SpectralLMO, ColNormLMO: Linear Minimization Oracles.
-    - KLShampooPreconditioner, RotatedSOAPPreconditioner, IdentityPreconditioner.
+    - ShampooPreconditioner (alias KLShampooPreconditioner), RotatedSOAPPreconditioner,
+      IdentityPreconditioner.
     - LIFOTransformationStack: Whitening/unwhitening stack.
     - build_modular_param_groups, summarise_modular_groups: Parameter routing.
     - calculate_radius_scale: Geometric radius scaling.
@@ -29,6 +30,7 @@ from .lmo import (
 )
 from .preconditioners import (
     IdentityPreconditioner,
+    ShampooPreconditioner,
     KLShampooPreconditioner,
     RotatedSOAPPreconditioner,
     inv_quarter_spd,
@@ -58,6 +60,7 @@ __all__ = [
     "spectral_clip",
     # Preconditioners
     "IdentityPreconditioner",
+    "ShampooPreconditioner",
     "KLShampooPreconditioner",
     "RotatedSOAPPreconditioner",
     "inv_quarter_spd",

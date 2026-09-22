@@ -28,7 +28,7 @@ from torch.optim import Optimizer
 from .lmo import SignLMO, SpectralLMO, ColNormLMO
 from .preconditioners import (
     IdentityPreconditioner,
-    KLShampooPreconditioner,
+    ShampooPreconditioner,
     RotatedSOAPPreconditioner,
 )
 from .stack import LIFOTransformationStack
@@ -414,7 +414,15 @@ class ModularOptimizer(Optimizer):
 
             # ── Stage 4: Reverse Unwhitening (Pullback) ──────────────
             if not stack.is_empty():
+                # Mousse (arXiv:2603.09697) Algorithm 1 lines 8 and 10. The whitening is
+                # applied on the way in AND again on the way out (line 9 reuses the same
+                # negative powers, which is correct -- see preconditioners.py), so the
+                # magnitude the LMO produced is destroyed by the pullback. Save it and
+                # restore it, or the step size is whatever the curvature happens to be.
+                # Its absence is the likeliest reason naive whitening blows up.
+                gamma = M.norm()
                 M = stack.unwhiten(M)
+                M = M * (gamma / M.norm().clamp_min(eps))
 
             # ── Stage 5: Prodigy Escape Velocity + SNR Gate ──────────
             ev_mult = 1.0
@@ -585,16 +593,25 @@ class ModularOptimizer(Optimizer):
             shape = (p.shape[0], p.shape[1])
             beta_p = group.get("beta_precond", 0.95)
             delta = group.get("precond_delta", 1e-4)
-            freq = group.get("precond_update_freq", 1)
+            # Default 100, not 1: at freq 1 this is an eigendecomposition per tensor
+            # per step. Mousse Algorithm 1 line 3 amortises it over T steps.
+            freq = group.get("precond_update_freq", 100)
+
+            alpha = group.get("precond_alpha", 0.25)
+            bottleneck = group.get("precond_bottleneck", True)
+            max_dim = group.get("precond_max_dim", 1024)
 
             if whitening == "shampoo":
-                state["preconditioner"] = KLShampooPreconditioner(
+                state["preconditioner"] = ShampooPreconditioner(
                     shape=shape,
                     device=p.device,
                     dtype=p.dtype,
                     beta=beta_p,
                     delta=delta,
                     update_freq=freq,
+                    alpha=alpha,
+                    bottleneck=bottleneck,
+                    max_dim=max_dim,
                 )
             elif whitening == "soap":
                 state["preconditioner"] = RotatedSOAPPreconditioner(
