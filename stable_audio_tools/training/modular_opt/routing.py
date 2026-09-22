@@ -92,6 +92,7 @@ def build_modular_param_groups(
     split_qkv: bool = True,
     split_adaln: bool = True,
     force_sign: Iterable[str] = (),
+    lora_a_lr_mult: float = 1.0,
 ) -> list[dict]:
     """Group model parameters according to Role-Based Norm Assignment.
 
@@ -101,6 +102,11 @@ def build_modular_param_groups(
     - AdaLN Emitters & 1D Biases/Gains -> Sign
     - Hidden 2D Matrices -> Spectral with \rho_\ell = \max(1, \sqrt{d_{out}/d_{in}})
 
+    lora_a_lr_mult multiplies the final step size of every ``*.lora_A`` tensor (weight decay is
+    left on the base step, so the change is to how far A moves, nothing else). Added 2026-09-22:
+    on audition_160ep_2026-09-22-b A's row space was 99.2% unchanged from step 240 to 1440 --
+    the adapter reads a random 128-d slice of its input for the whole run.
+
     Returns a list of param group dicts suitable for ModularOptimizer.
     """
     named_trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
@@ -108,9 +114,9 @@ def build_modular_param_groups(
     force_sign_pats = [re.compile(pat) for pat in force_sign]
 
     groups_dict = {
-        "colnorm": {"params": [], "param_names": [], "radii": [], "blocks": []},
-        "spectral": {"params": [], "param_names": [], "radii": [], "blocks": []},
-        "sign": {"params": [], "param_names": [], "radii": [], "blocks": []},
+        "colnorm": {"params": [], "param_names": [], "radii": [], "blocks": [], "lr_mults": []},
+        "spectral": {"params": [], "param_names": [], "radii": [], "blocks": [], "lr_mults": []},
+        "sign": {"params": [], "param_names": [], "radii": [], "blocks": [], "lr_mults": []},
     }
 
     for name, p in named_trainable:
@@ -147,6 +153,7 @@ def build_modular_param_groups(
         groups_dict[role]["param_names"].append(name)
         groups_dict[role]["radii"].append(radius)
         groups_dict[role]["blocks"].append(blocks)
+        groups_dict[role]["lr_mults"].append(lora_a_lr_mult if name.endswith("lora_A") else 1.0)
 
     param_groups = []
 
@@ -158,6 +165,7 @@ def build_modular_param_groups(
             "param_names": groups_dict["spectral"]["param_names"],
             "radii": groups_dict["spectral"]["radii"],
             "blocks": groups_dict["spectral"]["blocks"],
+            "lr_mults": groups_dict["spectral"]["lr_mults"],
             "whitening": default_whitening,
             "weight_decay": spectral_wd,
         }
@@ -173,6 +181,7 @@ def build_modular_param_groups(
             "param_names": groups_dict["colnorm"]["param_names"],
             "radii": groups_dict["colnorm"]["radii"],
             "blocks": groups_dict["colnorm"]["blocks"],
+            "lr_mults": groups_dict["colnorm"]["lr_mults"],
             "whitening": "none",
             "weight_decay": colnorm_wd,
         }
@@ -188,6 +197,7 @@ def build_modular_param_groups(
             "param_names": groups_dict["sign"]["param_names"],
             "radii": groups_dict["sign"]["radii"],
             "blocks": groups_dict["sign"]["blocks"],
+            "lr_mults": groups_dict["sign"]["lr_mults"],
             "whitening": "none",
             "weight_decay": sign_wd,
         }

@@ -325,6 +325,9 @@ class ModularOptimizer(Optimizer):
         group_type: str = group["group_type"]
         param_names: list[str] = group.get("param_names", [])
         radii: list[float] = group.get("radii", [])
+        # Per-parameter step multipliers (routing.py lora_a_lr_mult). Applied to the final step
+        # only, AFTER NorMuon: NorMuon row-normalises M, so any scale applied before it cancels.
+        lr_mults: list[float] = group.get("lr_mults", [])
         blocks: list[int] = group.get("blocks", [])
         whitening: str = group.get("whitening", "none")
 
@@ -353,6 +356,7 @@ class ModularOptimizer(Optimizer):
             grad = p.grad
             name = param_names[i] if i < len(param_names) else f"param_{i}"
             radius = radii[i] if i < len(radii) else 1.0
+            lr_mult = lr_mults[i] if i < len(lr_mults) else 1.0
             n_blocks = blocks[i] if i < len(blocks) else 1
 
             state = self.state[p]
@@ -514,7 +518,7 @@ class ModularOptimizer(Optimizer):
                 radial_scale = 1.0
 
                 # Apply direction update to z
-                z.add_(M, alpha=-eta)
+                z.add_(M, alpha=-eta * lr_mult)
 
                 if r_brake < 1.0:
                     z_new_norm = z.norm()
@@ -548,7 +552,7 @@ class ModularOptimizer(Optimizer):
                 p_old_norm = p.data.norm() if r_brake < 1.0 else None
                 radial_scale = 1.0
 
-                p.data.add_(M, alpha=-eta)
+                p.data.add_(M, alpha=-eta * lr_mult)
 
                 if r_brake < 1.0:
                     p_new_norm = p.data.norm()
@@ -562,7 +566,7 @@ class ModularOptimizer(Optimizer):
                 telem["mom_sq"] += float((d_k * d_k).sum().item())
                 telem["lmo_sq"] += float((M_lmo * M_lmo).sum().item())
                 telem["normuon_sq"] += float((M * M).sum().item())
-                telem["update_sq"] += float((M * eta).pow(2).sum().item())
+                telem["update_sq"] += float((M * (eta * lr_mult)).pow(2).sum().item())
                 if sf_enabled:
                     telem["z_norm_sq"] += float((z * z).sum().item())
                     telem["x_norm_sq"] += float((x * x).sum().item())
