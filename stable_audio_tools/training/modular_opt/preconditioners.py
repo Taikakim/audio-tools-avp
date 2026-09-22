@@ -103,7 +103,7 @@ class ShampooPreconditioner(Preconditioner):
         dtype: torch.dtype = torch.float32,
         beta: float = 0.95,
         delta: float = 1e-4,
-        update_freq: int = 100,
+        update_freq: int = 10,
         alpha: float = 0.125,
         bottleneck: bool = True,
         max_dim: int = 1024,

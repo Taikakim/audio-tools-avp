@@ -91,7 +91,13 @@ class ModularOptimizer(Optimizer):
         # Preconditioner
         beta_precond: float = 0.95,
         precond_delta: float = 1e-4,
-        precond_update_freq: int = 1,
+        # Mousse reference (github.com/Anti-Entrophic/Mousse, dion/dion/mousse.py:80-81)
+        # ships shampoo_update_freq=10 and shampoo_alpha=0.125. With the bottleneck the
+        # eigh is 128x128, so there is no reason to refresh less often than the reference.
+        precond_update_freq: int = 10,
+        precond_alpha: float = 0.125,
+        precond_bottleneck: bool = True,
+        precond_max_dim: int = 1024,
         # Newton-Schulz polynomial for SpectralLMO
         ns_poly: str = "quintic",
         # Prodigy escape velocity
@@ -133,6 +139,9 @@ class ModularOptimizer(Optimizer):
             beta_precond=beta_precond,
             precond_delta=precond_delta,
             precond_update_freq=precond_update_freq,
+            precond_alpha=precond_alpha,
+            precond_bottleneck=precond_bottleneck,
+            precond_max_dim=precond_max_dim,
             ns_poly=ns_poly,
             escape_velocity=escape_velocity,
             ev_beta=ev_beta,
@@ -593,9 +602,9 @@ class ModularOptimizer(Optimizer):
             shape = (p.shape[0], p.shape[1])
             beta_p = group.get("beta_precond", 0.95)
             delta = group.get("precond_delta", 1e-4)
-            # Default 100, not 1: at freq 1 this is an eigendecomposition per tensor
-            # per step. Mousse Algorithm 1 line 3 amortises it over T steps.
-            freq = group.get("precond_update_freq", 100)
+            # Default 10, matching the Mousse reference implementation, not 1:
+            # at freq 1 this is an eigendecomposition per tensor per step.
+            freq = group.get("precond_update_freq", 10)
 
             alpha = group.get("precond_alpha", 0.125)
             bottleneck = group.get("precond_bottleneck", True)
