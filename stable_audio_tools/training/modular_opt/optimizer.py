@@ -67,6 +67,27 @@ def _get_lmo(group_type: str, ns_poly: str = "quintic") -> SignLMO | SpectralLMO
 # ---------------------------------------------------------------------------
 
 
+
+def _magnitude_step(t: Tensor, M: Tensor, step: float, group: dict, name: str) -> None:
+    """Apply the Stage-6 update  t <- t - step*M  in place, or its multiplicative form for DoRA
+    magnitudes.
+
+    WHY (C, 2026-09-24). A sign-group step moves every element by the same absolute amount. On
+    goa3_avp_r256_2026-09-23 (lr 6e-4, ~6900 steps) that walked the small global-conditioning
+    magnitudes (mean |m| 0.13) through zero -- 592 non-positive rows in to_global_embed.0 by step
+    6340 -- while the ~2.4 transformer-block magnitudes were unaffected; then the loss went NaN.
+    With magnitude_update="multiplicative", params named *.magnitude take the step in log space:
+        t <- t * exp(-step * M)
+    i.e. a relative change of about step*|M| per element, the same for a 0.13 and a 2.4 scalar,
+    and the sign of t can never change (exponentiated gradient / Madam, Bernstein et al. 2020).
+    A DoRA magnitude is a row norm, so it should never need to cross zero. For small steps this equals
+    the additive update scaled by |t|: t*exp(-sM) ~ t - s*t*M.
+    """
+    if group.get("magnitude_update", "additive") == "multiplicative" and name.endswith("magnitude"):
+        t.mul_(torch.exp(M.to(t.dtype) * (-step)))
+    else:
+        t.add_(M, alpha=-step)
+
 class ModularOptimizer(Optimizer):
     """Modular Stage-Based Optimizer implementing the 6-stage Transform-Solve-Invert pipeline.
 
@@ -130,6 +151,10 @@ class ModularOptimizer(Optimizer):
         var_wd_boost: float = 0.0,
         # Radial Brake (NVIDIA soft limiting on parameter norm growth)
         radial_brake: float = 1.0,
+        # DoRA magnitude update geometry: "additive" (m -= eta*M, the historical behaviour) or
+        # "multiplicative" (m *= exp(-eta*M): a step in log m -- scale-relative, and m can never
+        # cross zero). See _magnitude_step.
+        magnitude_update: str = "additive",
         # Global
         eps: float = 1e-12,
     ):
@@ -165,6 +190,7 @@ class ModularOptimizer(Optimizer):
             var_dampening_power=var_dampening_power,
             var_wd_boost=var_wd_boost,
             radial_brake=radial_brake,
+            magnitude_update=magnitude_update,
             eps=eps,
         )
         super().__init__(params, defaults)
@@ -518,7 +544,7 @@ class ModularOptimizer(Optimizer):
                 radial_scale = 1.0
 
                 # Apply direction update to z
-                z.add_(M, alpha=-eta * lr_mult)
+                _magnitude_step(z, M, eta * lr_mult, group, name)
 
                 if r_brake < 1.0:
                     z_new_norm = z.norm()
@@ -552,7 +578,7 @@ class ModularOptimizer(Optimizer):
                 p_old_norm = p.data.norm() if r_brake < 1.0 else None
                 radial_scale = 1.0
 
-                p.data.add_(M, alpha=-eta * lr_mult)
+                _magnitude_step(p.data, M, eta * lr_mult, group, name)
 
                 if r_brake < 1.0:
                     p_new_norm = p.data.norm()
