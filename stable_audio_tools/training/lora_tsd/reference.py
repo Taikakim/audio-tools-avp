@@ -353,5 +353,11 @@ class LoRATSDReference(Optimizer):
     def load_state_dict(self, state_dict):
         sd = dict(state_dict)
         step_count = sd.pop("step_count", 0)
+        # torch only deep-copies param_groups; same-device/dtype state tensors would be
+        # adopted by reference, and step()'s in-place momentum updates would then rewrite
+        # the caller's dict (cloud review, 2026-09-25; batched.py has the same fix).
+        import copy
+        sd["state"] = {k: {kk: (vv.clone() if torch.is_tensor(vv) else copy.deepcopy(vv))
+                           for kk, vv in v.items()} for k, v in sd["state"].items()}
         super().load_state_dict(sd)
         self._step_count = step_count

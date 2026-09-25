@@ -857,13 +857,14 @@ def test_batched_qr_fp32_moderately_ill_conditioned_no_fallback():
 #     (final critic 2026-09-25; torch only deep-copies param_groups).
 # ---------------------------------------------------------------------------
 
-@requires_batched
-def test_load_state_dict_does_not_alias_callers_tensors():
+@pytest.mark.parametrize("cls_name", ["reference", "batched"])
+def test_load_state_dict_does_not_alias_callers_tensors(cls_name):
+    cls = _resolve_cls(cls_name)
     named0, _ = build_named_params(dtype=torch.float64)
     kwargs = dict(lr=1e-3, momentum=0.9, ball_iters=1, ns_steps=5,
                   max_delta_norm=0.1, balance="norm", ridge_eps=1e-8)
     named_a = clone_named_params(named0)
-    opt_a = BatchedLoRATSD(named_a, **kwargs)
+    opt_a = cls(named_a, **kwargs)
     grad_seq = make_grad_sequence(named0, n_steps=3, dtype=torch.float64)
     for g in grad_seq[:2]:
         apply_grads(named_a, g)
@@ -871,10 +872,71 @@ def test_load_state_dict_does_not_alias_callers_tensors():
     sd = opt_a.state_dict()
     before = {k: {kk: vv.clone() for kk, vv in v.items() if torch.is_tensor(vv)} for k, v in sd["state"].items()}
     named_b = clone_named_params(named_a)
-    opt_b = BatchedLoRATSD(named_b, **kwargs)
+    opt_b = cls(named_b, **kwargs)
     opt_b.load_state_dict(sd)
     apply_grads(named_b, grad_seq[2])
     opt_b.step()
     for k, v in before.items():
         for kk, vv in v.items():
             assert torch.equal(sd["state"][k][kk], vv), f"state {k}/{kk} changed under the caller"
+
+
+# ---------------------------------------------------------------------------
+# (h) Cloud-review fixes (2026-09-25): hyperparameters come from param_groups (so a torch
+#     LR scheduler works), mixed ranks fail loudly at construction, mixed-dtype
+#     magnitudes don't break the flat magnitude step.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cls_name", ["reference", "batched"])
+def test_lr_scheduler_changes_the_step(cls_name):
+    cls = _resolve_cls(cls_name)
+    named0, _ = build_named_params(dtype=torch.float64)
+    grad_seq = make_grad_sequence(named0, n_steps=2, dtype=torch.float64)
+    kwargs = dict(lr=1e-3, momentum=0.0, ball_iters=1, ns_steps=5,
+                  max_delta_norm=10.0, balance="off", ridge_eps=1e-8)
+
+    def run(factor):
+        named = clone_named_params(named0)
+        opt = cls(named, **kwargs)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda e: 1.0 if e == 0 else factor)
+        apply_grads(named, grad_seq[0]); opt.step(); sched.step()
+        before = {n: p.detach().clone() for n, p in named}
+        apply_grads(named, grad_seq[1]); opt.step()
+        return {n: (p.detach() - before[n]) for n, p in named if n.endswith(("lora_A", "lora_B"))}
+
+    full, half = run(1.0), run(0.5)
+    for n in full:
+        # momentum 0 and no clip: the step is linear in lr, so half the lr = half the step
+        assert torch.allclose(half[n], 0.5 * full[n], rtol=1e-6, atol=1e-12), n
+    zero = run(0.0)
+    assert all(float(d.abs().max()) == 0.0 for d in zero.values())
+
+
+@requires_batched
+def test_batched_rejects_mixed_ranks():
+    named = [("a.lora_A", torch.nn.Parameter(torch.randn(4, 16))),
+             ("a.lora_B", torch.nn.Parameter(torch.randn(12, 4))),
+             ("b.lora_A", torch.nn.Parameter(torch.randn(8, 16))),
+             ("b.lora_B", torch.nn.Parameter(torch.randn(12, 8)))]
+    with pytest.raises(ValueError, match="one rank"):
+        BatchedLoRATSD(named)
+
+
+@requires_batched
+def test_batched_magnitude_buffer_follows_compute_dtype():
+    """A buffer made while only the fp32 magnitude had a grad must be promoted once an
+    fp64 one joins (compute goes fp64). torch's type promotion hid this -- no crash, just
+    an fp32 buffer in an fp64 step -- so check the dtype, not merely that it runs."""
+    import math
+    m32 = torch.nn.Parameter(torch.ones(5, dtype=torch.float32))
+    m64 = torch.nn.Parameter(torch.ones(3, dtype=torch.float64))
+    opt = BatchedLoRATSD([("x.magnitude", m32), ("y.magnitude", m64)], lr=1e-2, momentum=0.9)
+    m32.grad = torch.ones_like(m32)
+    opt.step()  # fp32-only step
+    assert opt.state[m32]["momentum_buffer"].dtype == torch.float32
+    m32.grad = torch.ones_like(m32)
+    m64.grad = -torch.ones_like(m64)
+    opt.step()  # mixed -> fp64 compute
+    assert opt.state[m32]["momentum_buffer"].dtype == torch.float64
+    assert torch.allclose(m32.detach().double(), torch.full((5,), math.exp(-2e-2), dtype=torch.float64), rtol=1e-5)
+    assert torch.allclose(m64.detach(), torch.full((3,), math.exp(1e-2), dtype=torch.float64), rtol=1e-9)

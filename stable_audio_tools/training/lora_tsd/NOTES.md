@@ -56,3 +56,16 @@ copy, the momentum buffers are updated **in place** during `step()`.
 - `qr_fallbacks` in `last_stats`: expect 3–4 per pair on step 1 (B = 0 makes U_B and L rank-deficient; measured 18 for 6 pairs at ball_iters=1, 24 at 5), then 0. A
   persistent non-zero count means conditioning is breaking down. Watch it as
   `train/tsd_qr_fallbacks`.
+
+## After the cloud review (2026-09-25)
+- **Hyperparameters come from `param_groups[0]` at every step**, the PyTorch convention. A torch LR
+  scheduler, or a `load_state_dict`, now actually changes the step; before, both were silently
+  ignored. A scheduler moves only `lr`. `lr_magnitude` is its own key, as in the reference's
+  magnitude groups. The `opt.lr` etc. attributes are mirrors, kept because the trainer's
+  `train/lr` reads them.
+- **Mixed LoRA ranks are refused at construction** (the cross-group r×r batching needs one rank);
+  use `LoRATSDReference` for a mixed-rank model.
+- **Momentum buffers follow the compute dtype** (converted, not reset). The review's "crash" on mixed
+  fp32/fp64 magnitudes didn't reproduce: torch's type promotion absorbed it. What really happened was
+  an fp32 buffer in an fp64 step.
+- `LoRATSDReference.load_state_dict` clones incoming state, like the batched class.

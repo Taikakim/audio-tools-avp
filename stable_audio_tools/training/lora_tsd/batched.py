@@ -277,6 +277,13 @@ class BatchedLoRATSD(Optimizer):
         if incomplete:
             raise ValueError(f"BatchedLoRATSD: lora_A/lora_B without a matching pair for: {incomplete}")
 
+        ranks = sorted({pr["A"].shape[0] for pr in pairs})
+        if len(ranks) > 1:
+            # The r x r / 2r x 2r work is concatenated across ALL pairs (module docstring
+            # point 2), which needs one rank. Mixed ranks would otherwise die inside step()
+            # with an opaque torch.cat shape error. (Use LoRATSDReference for mixed ranks.)
+            raise ValueError(f"BatchedLoRATSD: all LoRA pairs must share one rank, got ranks {ranks}")
+
         self.pairs = pairs
         self.magnitude_params = magnitude_params
 
@@ -323,6 +330,28 @@ class BatchedLoRATSD(Optimizer):
         )
         super().__init__(all_params, defaults)
 
+    # -- hyperparameters ---------------------------------------------------
+
+    def _sync_hparams(self) -> None:
+        """Take this step's hyperparameters from param_groups[0], the PyTorch convention.
+        A torch LR scheduler writes group["lr"] and load_state_dict restores the groups;
+        reading the constructor copies instead made both silently ineffective (cloud
+        review, 2026-09-25). The attributes stay as mirrors, because the trainer's
+        train/lr helper reads opt.lr. A scheduler moves only `lr`: `lr_magnitude` is its
+        own group key, the same as LoRATSDReference's magnitude groups."""
+        g = self.param_groups[0]
+        if g["balance"] not in ("off", "norm"):
+            raise ValueError(f"BatchedLoRATSD: balance must be 'off' or 'norm', got {g['balance']!r}")
+        self.lr = g["lr"]
+        self.momentum = g["momentum"]
+        self.ball_iters = g["ball_iters"]
+        self.ns_steps = g["ns_steps"]
+        self.max_delta_norm = g["max_delta_norm"]
+        self.balance = g["balance"]
+        self.ridge_eps = g["ridge_eps"]
+        self.lr_magnitude = g["lr_magnitude"]
+        self.warmup_steps = g["warmup_steps"]
+
     # -- lr schedule -----------------------------------------------------
 
     def _warmup_scale(self) -> float:
@@ -353,6 +382,10 @@ class BatchedLoRATSD(Optimizer):
                 buf = st.get("momentum_buffer")
                 if buf is None:
                     buf = torch.zeros_like(g)
+                elif buf.dtype != compute_dtype:
+                    # mixed fp32/fp64 magnitudes put every buffer in fp64 compute; a
+                    # buffer from another dtype would otherwise break the flat cat/sign
+                    buf = buf.to(compute_dtype)
                 buf = buf.mul(self.momentum).add_(g, alpha=(1.0 - self.momentum))
                 st["momentum_buffer"] = buf
                 bufs.append(buf)
@@ -380,8 +413,10 @@ class BatchedLoRATSD(Optimizer):
         for p in params:
             st = self.state[p]
             buf = st.get("momentum_buffer")
-            if buf is None or buf.dtype != compute_dtype:
+            if buf is None:
                 buf = torch.zeros(p.shape, dtype=compute_dtype, device=p.device)
+            elif buf.dtype != compute_dtype:
+                buf = buf.to(compute_dtype)  # keep the momentum, don't silently reset it
             buf.mul_(self.momentum).add_(p.grad.detach().to(compute_dtype), alpha=(1.0 - self.momentum))
             st["momentum_buffer"] = buf
             bufs.append(buf)
@@ -401,6 +436,7 @@ class BatchedLoRATSD(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        self._sync_hparams()
         self._step += 1
         scale = self._warmup_scale()
         lr_t = self.lr * scale
