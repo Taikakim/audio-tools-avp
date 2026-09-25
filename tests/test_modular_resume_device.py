@@ -59,3 +59,36 @@ def test_resume_moves_preconditioner_tensors_to_param_device(whitening):
             if torch.is_tensor(v):
                 assert v.device.type == "cuda", f"{whitening}: preconditioner.{k} left on {v.device}"
     _step(m2, opt2)  # raised "Expected all tensors to be on the same device" before the fix
+
+
+def test_step_count_survives_state_dict_roundtrip():
+    """_step_count drives LR warmup, the Schedule-Free c_warmup burn-in, and the momentum bias
+    corrections. It was a plain attribute, so a resume restarted it at 0: SF averaging went
+    INERT (ck=1, x overwritten by z every step), LR re-warmed from 0, and the restored momentum
+    was divided by 1-beta1 = 0.1 on the first step. Seen resuming the shampoo run at 6340."""
+    m = _model("cpu")
+    opt = ModularOptimizer(build_modular_param_groups(m), lr=1e-3, schedule_free=True, sf_c_warmup=2)
+    for _ in range(5):
+        _step(m, opt)
+    assert opt.get_step_count() == 5
+    sd = opt.state_dict()
+    m2 = _model("cpu")
+    opt2 = ModularOptimizer(build_modular_param_groups(m2), lr=1e-3, schedule_free=True, sf_c_warmup=2)
+    opt2.load_state_dict(sd)
+    assert opt2.get_step_count() == 5
+
+
+def test_old_checkpoint_without_step_count_loads_and_can_be_set():
+    """Checkpoints written before the fix carry no step count; loading one must not fail, and
+    the trainer then sets it from Lightning's restored global_step."""
+    m = _model("cpu")
+    opt = ModularOptimizer(build_modular_param_groups(m), lr=1e-3)
+    for _ in range(3):
+        _step(m, opt)
+    sd = opt.state_dict()
+    sd.pop("modular_step_count", None)  # what a pre-fix checkpoint looks like
+    opt2 = ModularOptimizer(build_modular_param_groups(_model("cpu")), lr=1e-3)
+    opt2.load_state_dict(sd)
+    assert opt2.get_step_count() == 0
+    opt2.set_step_count(6340)
+    assert opt2.get_step_count() == 6340

@@ -213,12 +213,23 @@ class ModularOptimizer(Optimizer):
                     f"got '{gtype}'"
                 )
 
+    def state_dict(self):
+        """Adds _step_count, which drives LR warmup, the Schedule-Free c_warmup burn-in and the
+        momentum bias corrections. Without it a resume restarts all three from step 0."""
+        sd = super().state_dict()
+        sd["modular_step_count"] = self._step_count
+        return sd
+
     def load_state_dict(self, state_dict) -> None:
         """torch moves the tensors it finds directly in each param's state to the param's
         device, but not tensors held as attributes of objects stored there (the Shampoo/SOAP
         preconditioners). A checkpoint loads onto the CPU first, so without this a resumed
         run kept C/P/L/R on the CPU and died on the first step (tests/test_modular_resume_device.py)."""
+        state_dict = dict(state_dict)
+        step_count = state_dict.pop("modular_step_count", None)
         super().load_state_dict(state_dict)
+        if step_count is not None:
+            self._step_count = int(step_count)
         for p, st in self.state.items():
             for v in st.values():
                 if torch.is_tensor(v) or not hasattr(v, "__dict__"):
@@ -787,6 +798,11 @@ class ModularOptimizer(Optimizer):
     def get_step_count(self) -> int:
         """Return the current global step count."""
         return self._step_count
+
+    def set_step_count(self, n: int) -> None:
+        """For checkpoints written before _step_count was saved: the trainer sets it from
+        Lightning's restored global_step (both count optimizer steps)."""
+        self._step_count = int(n)
 
     def summary(self) -> str:
         """Return a human-readable summary of the optimizer configuration."""
