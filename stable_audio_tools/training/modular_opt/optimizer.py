@@ -213,6 +213,20 @@ class ModularOptimizer(Optimizer):
                     f"got '{gtype}'"
                 )
 
+    def load_state_dict(self, state_dict) -> None:
+        """torch moves the tensors it finds directly in each param's state to the param's
+        device, but not tensors held as attributes of objects stored there (the Shampoo/SOAP
+        preconditioners). A checkpoint loads onto the CPU first, so without this a resumed
+        run kept C/P/L/R on the CPU and died on the first step (tests/test_modular_resume_device.py)."""
+        super().load_state_dict(state_dict)
+        for p, st in self.state.items():
+            for v in st.values():
+                if torch.is_tensor(v) or not hasattr(v, "__dict__"):
+                    continue
+                for k, t in vars(v).items():
+                    if torch.is_tensor(t) and t.device != p.device:
+                        setattr(v, k, t.to(p.device))
+
     @property
     def component_telemetry(self) -> dict[str, float]:
         """Return the current step's component telemetry dict."""
