@@ -37,19 +37,20 @@ def zeropower_via_newtonschulz(grad, ns_steps=5, eps=1e-7):
     return ortho_grad.to(grad.dtype)
 
 # ---------------------------------------------------------------------------
-# NorMuon with Radial Brake & Over-training Safeguards
+# NorMuon with Radial Brake & Step Telemetry
 # ---------------------------------------------------------------------------
 class NorMuon(torch.optim.Optimizer):
-    """Normalized Muon optimizer with Radial Brake and Muon-SW decay."""
     def __init__(self, params, lr=1e-2, momentum=0.95, weight_decay=0.01, ns_steps=5, radial_brake=0.85):
         defaults = dict(
             lr=lr, momentum=momentum, weight_decay=weight_decay,
             ns_steps=ns_steps, radial_brake=radial_brake
         )
         super().__init__(params, defaults)
+        self.last_update_norm = 0.0
 
     @torch.no_grad()
     def step(self):
+        up_sq = 0.0
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
@@ -70,7 +71,6 @@ class NorMuon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)
                 
-                # Apply Newton-Schulz orthogonalization on 2D matrices
                 if p.ndim == 2:
                     ortho_update = zeropower_via_newtonschulz(buf, ns_steps=ns_steps)
                     scale = math.sqrt(max(1.0, p.size(0) / p.size(1)))
@@ -78,16 +78,18 @@ class NorMuon(torch.optim.Optimizer):
                 else:
                     update = buf * lr
                 
+                up_sq += float(update.pow(2).sum().item())
                 p_old_norm = p.data.norm() if r_brake < 1.0 else None
                 p.data.sub_(update)
                 
-                # Radial Brake: soft-limiting parameter norm expansion
                 if r_brake < 1.0 and p_old_norm is not None:
                     p_new_norm = p.data.norm()
                     if p_new_norm > p_old_norm:
                         p_target = p_old_norm + r_brake * (p_new_norm - p_old_norm)
                         scale_factor = float((p_target / p_new_norm.clamp_min(1e-12)).item())
                         p.data.mul_(scale_factor)
+                        
+        self.last_update_norm = math.sqrt(up_sq)
 
 # ---------------------------------------------------------------------------
 # Dataset
@@ -117,7 +119,14 @@ class SurgeH5Dataset(Dataset):
         return mel, params
 
 # ---------------------------------------------------------------------------
-# Training Loop
+# Flat Weight Snapshot Helper for Velocity & Direction Tracking
+# ---------------------------------------------------------------------------
+def get_flat_weights(model):
+    """Flattens all trainable parameters into a single 1D tensor."""
+    return torch.cat([p.detach().flatten().double() for p in model.parameters() if p.requires_grad])
+
+# ---------------------------------------------------------------------------
+# Training Loop with Step-Level Velocity & Param Monitoring
 # ---------------------------------------------------------------------------
 def train(args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -133,6 +142,11 @@ def train(args):
         with open(leaderboard_path, "w") as f:
             f.write("run_id\tmodel\topt\tdim\tlayers\tlr_main\tlr_sec\tbsz\tepochs\tbest_val_loss\ttrain_time_s\n")
 
+    # Step telemetry file
+    telemetry_path = os.path.join(args.output_dir, f"{args.run_id}_step_telemetry.tsv")
+    with open(telemetry_path, "w") as f:
+        f.write("global_step\tepoch\tbatch\tloss\tvelocity\tdir_cosine\tgrad_norm\tweight_norm\tupdate_norm\tlr\n")
+
     train_ds = SurgeH5Dataset(args.h5_path, split="train")
     val_ds = SurgeH5Dataset(args.h5_path, split="val")
     
@@ -142,8 +156,7 @@ def train(args):
     param_dim = train_ds[0][1].shape[0]
     print(f"Dataset parameter dimension: {param_dim}")
     
-    # Domain-weighted loss tensor:
-    # High priority to shape (idx 2), cutoff (idx 9), resonance (idx 10), filter (idx 1)
+    # Domain-weighted loss: high priority to shape, cutoff, resonance, filter type
     weights = torch.ones(param_dim, device=device)
     weights[1] = 2.0  # filter circuit
     weights[2] = 3.5  # shape (Saw vs Pulse vs Morph)
@@ -152,7 +165,7 @@ def train(args):
     weights[12] = 1.8 # feg amount
     weights[15] = 1.5 # aeg decay
     weights[17] = 1.5 # aeg release
-    weights = weights / weights.mean() # normalize so mean weight = 1.0
+    weights = weights / weights.mean()
 
     if args.model_type == "resmlp":
         model = ResMLPInverter(param_dim=param_dim, hidden_dim=args.hidden_dim, num_layers=args.num_layers).to(device)
@@ -178,23 +191,25 @@ def train(args):
     use_sf = (args.opt_family == "normuon_sf")
     
     if args.opt_family == "adamw":
-        # Pure AdamW benchmark with Cosine Annealing LR
         print("Using standard decoupled AdamW for all parameters")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_adam, weight_decay=args.weight_decay)
         opt_muon = None
         opt_adam = optimizer
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
     else:
-        # NorMuon + AdamWScheduleFree with Radial Brake & c_warmup control
         print(f"Using NorMuon (lr={args.lr_muon}, radial_brake=0.85) + Schedule-Free AdamW (lr={args.lr_adam})")
         opt_muon = NorMuon(muon_params, lr=args.lr_muon, weight_decay=args.weight_decay, radial_brake=0.85) if muon_params else None
-        # sf_c_warmup: 2 * warmup steps (warmup_steps=100) -> 200 steps burn-in before averaging
         opt_adam = AdamWScheduleFree(adam_params, lr=args.lr_adam, weight_decay=args.weight_decay, warmup_steps=100) if adam_params else None
         scheduler = None
 
     best_val_loss = float("inf")
     t0 = time.time()
+    global_step = 0
     
+    # Velocity and direction tracking state
+    prev_weights = get_flat_weights(model)
+    prev_delta = None
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         if use_sf and opt_adam is not None:
@@ -203,7 +218,8 @@ def train(args):
         train_loss = 0.0
         n_batches = 0
         
-        for mel, params in train_loader:
+        for batch_idx, (mel, params) in enumerate(train_loader):
+            global_step += 1
             mel = mel.to(device)
             params = params.to(device)
             
@@ -230,16 +246,47 @@ def train(args):
                 
             loss.backward()
             
-            # Gradient clipping safeguard
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # Compute total gradient norm
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item())
             
             if opt_muon:
                 opt_muon.step()
             if opt_adam:
                 opt_adam.step()
                 
-            train_loss += loss.item()
+            loss_val = loss.item()
+            train_loss += loss_val
             n_batches += 1
+            
+            # -------------------------------------------------------------
+            # Step Velocity & Parameter Telemetry Monitoring (every 25 steps)
+            # -------------------------------------------------------------
+            if global_step % 25 == 0:
+                current_weights = get_flat_weights(model)
+                current_delta = current_weights - prev_weights
+                
+                # Weight velocity: Euclidean displacement per 1,000 steps
+                step_vel = float(current_delta.norm().item()) * (1000.0 / 25.0)
+                
+                # Step Direction: cosine similarity between consecutive step vectors
+                if prev_delta is not None and prev_delta.norm() > 1e-9 and current_delta.norm() > 1e-9:
+                    dir_cosine = float((torch.dot(current_delta, prev_delta) / (current_delta.norm() * prev_delta.norm())).item())
+                else:
+                    dir_cosine = 1.0
+                    
+                w_norm = float(current_weights.norm().item())
+                up_norm = opt_muon.last_update_norm if opt_muon else 0.0
+                curr_lr = opt_adam.param_groups[0]["lr"] if opt_adam else 0.0
+                
+                with open(telemetry_path, "a") as f:
+                    f.write(f"{global_step}\t{epoch}\t{batch_idx}\t{loss_val:.6f}\t{step_vel:.4f}\t{dir_cosine:.4f}\t{grad_norm:.4f}\t{w_norm:.4f}\t{up_norm:.4f}\t{curr_lr:.2e}\n")
+                
+                if global_step % 100 == 0:
+                    print(f"Step {global_step:6d} [Ep {epoch:2d}/{args.epochs}] | Loss: {loss_val:.5f} | Vel: {step_vel:6.2f} | CosDir: {dir_cosine:+.3f} | ||g||: {grad_norm:.3f} | ||w||: {w_norm:.2f}")
+                    sys.stdout.flush()
+                    
+                prev_delta = current_delta
+                prev_weights = current_weights
             
         train_loss /= n_batches
         
@@ -273,12 +320,13 @@ def train(args):
                 
         val_loss /= n_val
         
-        # Checkpoint every 25 epochs + best checkpoint
+        # Checkpoint handling
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             ckpt_path = os.path.join(args.output_dir, f"{args.run_id}_best.pt")
             torch.save({
                 "epoch": epoch,
+                "global_step": global_step,
                 "model_state": model.state_dict(),
                 "val_loss": best_val_loss,
                 "args": vars(args),
@@ -291,13 +339,14 @@ def train(args):
             periodic_path = os.path.join(args.output_dir, f"{args.run_id}_epoch_{epoch}.pt")
             torch.save({
                 "epoch": epoch,
+                "global_step": global_step,
                 "model_state": model.state_dict(),
                 "val_loss": val_loss,
                 "args": vars(args),
             }, periodic_path)
             
         lr_display = opt_adam.param_groups[0]["lr"] if opt_adam else 0.0
-        print(f"Epoch {epoch:3d}/{args.epochs:3d} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f} {star} | LR: {lr_display:.2e}")
+        print(f"=== Epoch {epoch:3d}/{args.epochs:3d} Complete === Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f} {star} | LR: {lr_display:.2e}")
         sys.stdout.flush()
         
     total_time = time.time() - t0
@@ -319,7 +368,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr_adam", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--run_id", type=str, default="G03_resmlp_200ep_sf")
+    parser.add_argument("--run_id", type=str, default="G03_resmlp_200ep_normuon_sf")
     parser.add_argument("--output_dir", type=str, default="/run/media/kim/Mantu/surge_200k_models/overtraining_suite")
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
