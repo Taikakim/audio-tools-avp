@@ -22,6 +22,7 @@ v2 changes (2026-10-01 review):
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -42,6 +43,24 @@ LEADERBOARD_COLS = [
     "best_epoch", "best_val_score", "val_cont_wmse", "val_cat_acc_mean",
     "flow_single_draw_score", "flow_best_of_k_score", "flow_k", "train_time_s",
 ]
+
+
+def get_scheduled_batch_size(epoch, total_epochs, schedule_type, b_init, b_final):
+    """Calculates batch size for current epoch under scheduled batch training."""
+    if schedule_type == "none":
+        return b_init
+    prog = (epoch - 1) / max(1, total_epochs - 1)
+    if schedule_type == "linear":
+        val = b_init - prog * (b_init - b_final)
+        return max(b_final, int(round(val)))
+    elif schedule_type == "power_of_two":
+        # Halving in log2 space snapped to powers of 2
+        log_init = math.log2(b_init)
+        log_final = math.log2(b_final)
+        log_cur = log_init - prog * (log_init - log_final)
+        p2 = 2 ** round(log_cur)
+        return max(b_final, int(p2))
+    return b_init
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +203,6 @@ def train(args):
 
     train_ds = SurgeH5Dataset(args.h5_path, split="train")
     val_ds = SurgeH5Dataset(args.h5_path, split="val")
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
     w23 = torch.tensor(domain_weights(), device=device)
     w_enc = codec.encoded_weights(w23)
@@ -262,6 +279,10 @@ def train(args):
     prev_weights = get_flat_weights(model)
     prev_delta = None
 
+    current_bsz = args.batch_size if args.batch_schedule == "none" else args.initial_batch_size
+    train_loader = DataLoader(train_ds, batch_size=current_bsz, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=min(args.batch_size, 64), shuffle=False, num_workers=2, pin_memory=True)
+
     for epoch in range(1, args.epochs + 1):
         stop_epoch_file = os.path.join(args.output_dir, f"{args.run_id}.stop_epoch")
         if os.path.exists(stop_epoch_file):
@@ -273,6 +294,15 @@ def train(args):
                     break
             except Exception:
                 pass
+
+        if args.batch_schedule != "none":
+            epoch_bsz = get_scheduled_batch_size(
+                epoch, args.epochs, args.batch_schedule, args.initial_batch_size, args.final_batch_size
+            )
+            if epoch_bsz != current_bsz:
+                current_bsz = epoch_bsz
+                print(f"[Epoch {epoch:2d}/{args.epochs:2d}] Scheduled batch resize -> batch_size={current_bsz}")
+                train_loader = DataLoader(train_ds, batch_size=current_bsz, shuffle=True, num_workers=4, pin_memory=True)
 
         model.train()
         if is_modular:
@@ -399,20 +429,24 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_schedule", type=str, default="none", choices=["none", "power_of_two", "linear"],
+                        help="Dynamic batch schedule across epochs: none (constant), power_of_two (halving down to final), linear (uniform decrease)")
+    parser.add_argument("--initial_batch_size", type=int, default=256, help="Initial batch size for scheduled batch training")
+    parser.add_argument("--final_batch_size", type=int, default=1, help="Final batch size for scheduled batch training")
     parser.add_argument("--lr_muon", type=float, default=0.01)
     parser.add_argument("--lr_adam", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--radial_brake", type=float, default=0.85)
     parser.add_argument("--adam_warmup_steps", type=int, default=100)
-    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--param_encoding", type=str, default=codec.ENCODING_V2,
                         choices=[codec.ENCODING_V2], help="v1 (ordinal) is load-only")
     parser.add_argument("--time_scale", type=float, default=1000.0, help="flow time-embedding scale (v1 used 1.0)")
     parser.add_argument("--val_batches", type=int, default=40)
     parser.add_argument("--flow_val_draws", type=int, default=8)
     parser.add_argument("--flow_val_steps", type=int, default=12)
-    parser.add_argument("--run_id", type=str, default="G03_resmlp_200ep_normuon_sf")
-    parser.add_argument("--output_dir", type=str, default="/run/media/kim/Mantu/surge_200k_models/overtraining_suite")
+    parser.add_argument("--run_id", type=str, default="G05_resmlp_200k_v2_20ep_modular_brakes")
+    parser.add_argument("--output_dir", type=str, default="/run/media/kim/Mantu/surge_200k_models/v2_suite")
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
     train(args)
