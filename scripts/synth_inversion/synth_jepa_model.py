@@ -1,14 +1,23 @@
 """Synth-JEPA: Joint Embedding Prediction Architecture for Synthesizer Parameter Search.
 
-Reference: Hayes et al. (arXiv:2609.31024, September 2026).
-Components:
-1. AudioEncoder (E_a): 1D Conv projecting log-mel frames -> 150 tokens + [CLS] token ->
-   8 Transformer Encoder blocks (d=512, 8 heads) -> z_a in R^512.
-2. ParameterEncoder (E_p): Parameter projection + learned bias -> Perceiver bottleneck
-   (32 learned queries) cross-attending to parameter tokens + 8 self-attention blocks -> z_p in R^512.
-3. Predictors (f_a->p, f_p->a): 3-block Residual MLPs with hidden width 1024 -> R^512.
-4. SIGRegLoss: Sliced Isotropic Gaussian Regularization via analytical Epps-Pulley test statistic
-   on random 1D projections (LeJEPA / LeVLJEPA), preventing representation collapse.
+Reference: Hayes, Tian, Lattner, "Synth-JEPA: Joint Embedding Prediction for Renderer-Free
+Synthesizer Parameter Search", arXiv:2609.31024 (Sept 2026). Section numbers below refer to it.
+Components (Sec. 3.2):
+1. AudioEncoder (E_a): transformer on log-mel frames, "projected via 1D convolution to 150
+   tokens" + a learned summary token whose output is z_a in R^512. The paper's 150 tokens come
+   from 3.0 s at a 10 ms hop (300 frames) with a stride-2 conv; our clips are 0.8 s (81 frames),
+   so the same stride-2 conv gives 41 tokens. (v1 of this file instead average-pooled 81 frames
+   UP to 150 tokens, i.e. duplicated frames.)
+2. ParameterEncoder (E_p): each parameter -> a linear projection plus a parameter-specific bias;
+   "a Perceiver bottleneck with 32 learned latents cross-attends to these tokens, followed by
+   eight self-attention blocks. Averaging the final outputs gives z_p." ONE cross-attention,
+   then 8 self-attention blocks (v1 had 8 blocks that each re-ran cross-attention).
+3. Predictors (f_a->p, f_p->a): three-block residual MLPs, hidden width 1024, linear output heads.
+4. SIGReg (LeJEPA, Sec. 2.1), applied to each encoder branch independently (LeVLJEPA).
+Not specified by the paper: encoder depth and FFN width (only d=512, 8 heads, 53M total). With
+8 layers per encoder, ff_dim=1024 gives 50.7M (the default, as the nearest to 53M) and
+ff_dim=2048 gives 68.6M. This is a guess at the paper's config, not a reading of it. The EMA-teacher
+variant (the paper's ablation, which SIGReg beats) is not implemented.
 """
 import math
 from typing import List, Tuple
@@ -26,8 +35,8 @@ from surge_spec import CAT_INDICES, CONT_INDICES, NUM_PARAMS
 class AudioTransformerEncoder(nn.Module):
     """Transformer operating on log-mel spectrograms (128 bands, T frames).
 
-    Projects via 1D convolution to 150 sequence tokens. A learned summary token
-    [CLS] is prepended to the sequence and its output is taken as z_a in R^512.
+    A stride-2 1D convolution turns the frames into tokens (81 frames -> 41 tokens). A learned
+    summary token [CLS] is prepended and its output is taken as z_a in R^512.
     """
     def __init__(
         self,
@@ -36,15 +45,17 @@ class AudioTransformerEncoder(nn.Module):
         num_layers: int = 8,
         num_heads: int = 8,
         ff_dim: int = 2048,
-        target_tokens: int = 150,
+        in_frames: int = 81,
+        token_stride: int = 2,
         dropout: float = 0.0,
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        self.conv1d = nn.Conv1d(in_mels, embed_dim, kernel_size=3, padding=1)
-        self.pool = nn.AdaptiveAvgPool1d(target_tokens)
+        self.conv1d = nn.Conv1d(in_mels, embed_dim, kernel_size=3, stride=token_stride, padding=1)
+        n_tokens = (in_frames + 2 - 3) // token_stride + 1  # conv output length
+        self.n_tokens = n_tokens
         self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
-        self.pos_embed = nn.Parameter(torch.randn(1, target_tokens + 1, embed_dim) * 0.02)
+        self.pos_embed = nn.Parameter(torch.randn(1, n_tokens + 1, embed_dim) * 0.02)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
@@ -55,7 +66,7 @@ class AudioTransformerEncoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, mel: torch.Tensor) -> torch.Tensor:
@@ -64,13 +75,14 @@ class AudioTransformerEncoder(nn.Module):
             mel = mel.squeeze(1)
         B = mel.shape[0]
 
-        # 1D conv over time dimension
-        x = self.conv1d(mel)              # [B, embed_dim, T]
-        x = self.pool(x).transpose(1, 2)  # [B, 150, embed_dim]
+        # 1D conv over time: [B, embed_dim, n_tokens] -> [B, n_tokens, embed_dim]
+        x = self.conv1d(mel).transpose(1, 2)
+        if x.shape[1] != self.n_tokens:
+            raise ValueError(f"expected {self.n_tokens} tokens from the mel, got {x.shape[1]} (wrong frame count?)")
 
         # Prepend learned [CLS] token and add positional embedding
         cls = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls, x], dim=1) + self.pos_embed  # [B, 151, embed_dim]
+        x = torch.cat([cls, x], dim=1) + self.pos_embed  # [B, n_tokens + 1, embed_dim]
 
         h = self.transformer(x)
         h = self.norm(h)
@@ -81,18 +93,14 @@ class AudioTransformerEncoder(nn.Module):
 # ==============================================================================
 # 2. Parameter Encoder (E_p) with Perceiver Bottleneck
 # ==============================================================================
-class PerceiverBlock(nn.Module):
-    """One Perceiver block: Latents cross-attend to context, then self-attend, then MLP."""
+class CrossAttentionBlock(nn.Module):
+    """Perceiver read-in: latents cross-attend to the parameter tokens, then an MLP."""
     def __init__(self, embed_dim: int = 512, num_heads: int = 8, ff_dim: int = 2048, dropout: float = 0.0):
         super().__init__()
-        self.norm_lat1 = nn.LayerNorm(embed_dim)
+        self.norm_lat = nn.LayerNorm(embed_dim)
         self.norm_ctx = nn.LayerNorm(embed_dim)
         self.cross_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-
-        self.norm_lat2 = nn.LayerNorm(embed_dim)
-        self.self_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
-
-        self.norm_lat3 = nn.LayerNorm(embed_dim)
+        self.norm_mlp = nn.LayerNorm(embed_dim)
         self.mlp = nn.Sequential(
             nn.Linear(embed_dim, ff_dim),
             nn.GELU(),
@@ -101,28 +109,16 @@ class PerceiverBlock(nn.Module):
         )
 
     def forward(self, latents: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        # Cross-attention: latents query the context tokens
-        q = self.norm_lat1(latents)
         kv = self.norm_ctx(context)
-        out, _ = self.cross_attn(q, kv, kv)
+        out, _ = self.cross_attn(self.norm_lat(latents), kv, kv)
         latents = latents + out
-
-        # Self-attention among latents
-        q2 = self.norm_lat2(latents)
-        out2, _ = self.self_attn(q2, q2, q2)
-        latents = latents + out2
-
-        # Feedforward MLP
-        latents = latents + self.mlp(self.norm_lat3(latents))
-        return latents
+        return latents + self.mlp(self.norm_mlp(latents))
 
 
 class PerceiverParameterEncoder(nn.Module):
-    """Represents each parameter with a linear projection plus a parameter-specific bias.
-
-    A Perceiver bottleneck with 32 learned latents cross-attends to these tokens,
-    followed by 8 self-attention blocks. Averaging the final outputs gives z_p in R^512.
-    """
+    """Each parameter -> linear projection + parameter-specific bias. 32 learned latents
+    cross-attend to these tokens once, followed by 8 self-attention blocks; averaging the
+    final latents gives z_p in R^512 (Sec. 3.2)."""
     def __init__(
         self,
         num_continuous: int = len(CONT_INDICES),
@@ -139,48 +135,31 @@ class PerceiverParameterEncoder(nn.Module):
         self.cat_sizes = cat_sizes
         total_tokens = num_continuous + len(cat_sizes)
 
-        # Projections for continuous params (mapped to [-1, 1])
-        self.cont_projs = nn.ModuleList([nn.Linear(1, embed_dim) for _ in range(num_continuous)])
-        # Projections for discrete/categorical params (one-hot vectors)
-        self.cat_projs = nn.ModuleList([nn.Linear(k, embed_dim) for k in cat_sizes])
-
-        # Parameter-specific learned biases
+        # Continuous params (in [-1, 1]): one linear projection per parameter
+        self.cont_projs = nn.ModuleList([nn.Linear(1, embed_dim, bias=False) for _ in range(num_continuous)])
+        # Categorical params (one-hot): one linear projection per parameter
+        self.cat_projs = nn.ModuleList([nn.Linear(k, embed_dim, bias=False) for k in cat_sizes])
+        # Parameter-specific learned biases (the only bias term per token)
         self.param_biases = nn.Parameter(torch.randn(total_tokens, embed_dim) * 0.02)
 
-        # 32 learned Perceiver latent queries
         self.latents = nn.Parameter(torch.randn(1, num_latents, embed_dim) * 0.02)
-
-        # 8 Perceiver blocks
-        self.blocks = nn.ModuleList([
-            PerceiverBlock(embed_dim=embed_dim, num_heads=num_heads, ff_dim=ff_dim)
-            for _ in range(num_blocks)
-        ])
+        self.read_in = CrossAttentionBlock(embed_dim=embed_dim, num_heads=num_heads, ff_dim=ff_dim)
+        layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dim_feedforward=ff_dim,
+                                           dropout=0.0, activation="gelu", batch_first=True, norm_first=True)
+        self.self_blocks = nn.TransformerEncoder(layer, num_layers=num_blocks, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, cont_params: torch.Tensor, cat_onehots: List[torch.Tensor]) -> torch.Tensor:
-        # cont_params: [B, num_continuous] in [-1, 1]
-        # cat_onehots: list of [B, k] one-hot tensors
+        # cont_params: [B, num_continuous] in [-1, 1]; cat_onehots: list of [B, k]
         B = cont_params.shape[0]
-        tokens = []
-
-        for i, proj in enumerate(self.cont_projs):
-            t = proj(cont_params[:, i:i+1]) + self.param_biases[i]
-            tokens.append(t)
-
+        tokens = [proj(cont_params[:, i:i + 1]) + self.param_biases[i] for i, proj in enumerate(self.cont_projs)]
         offset = self.num_continuous
-        for j, (proj, onehot) in enumerate(zip(self.cat_projs, cat_onehots)):
-            t = proj(onehot) + self.param_biases[offset + j]
-            tokens.append(t)
-
+        tokens += [proj(oh) + self.param_biases[offset + j] for j, (proj, oh) in enumerate(zip(self.cat_projs, cat_onehots))]
         context = torch.stack(tokens, dim=1)  # [B, total_tokens, embed_dim]
-        latents = self.latents.expand(B, -1, -1)
 
-        for block in self.blocks:
-            latents = block(latents, context)
-
-        latents = self.norm(latents)
-        zp = latents.mean(dim=1)  # [B, embed_dim]
-        return zp
+        latents = self.read_in(self.latents.expand(B, -1, -1), context)
+        latents = self.norm(self.self_blocks(latents))
+        return latents.mean(dim=1)  # [B, embed_dim]
 
 
 # ==============================================================================
@@ -228,10 +207,12 @@ class SIGRegLoss(nn.Module):
         self.num_slices = num_slices
         self.gamma = gamma
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: [B, D]
+    def forward(self, z: torch.Tensor, generator: torch.Generator = None) -> torch.Tensor:
+        # z: [B, D]. Closed-form Epps-Pulley (BHEP) statistic with bandwidth beta = 1/gamma:
+        #   T = mean_ij exp(-(si-sj)^2 / 2g^2) - 2 g/sqrt(1+g^2) mean_i exp(-si^2 / 2(1+g^2)) + g/sqrt(2+g^2)
+        # which is 0 in expectation-limit iff the slice is N(0, 1).
         B, D = z.shape
-        u = torch.randn(D, self.num_slices, device=z.device, dtype=z.dtype)
+        u = torch.randn(D, self.num_slices, device=z.device, dtype=z.dtype, generator=generator)
         u = F.normalize(u, p=2, dim=0)
 
         # 1D projections: [B, M]
@@ -262,11 +243,14 @@ class SynthJEPA(nn.Module):
         num_audio_layers: int = 8,
         num_param_layers: int = 8,
         num_slices_sigreg: int = 64,
+        ff_dim: int = 1024,
+        in_frames: int = 81,
     ):
         super().__init__()
         self.embed_dim = embed_dim
-        self.audio_encoder = AudioTransformerEncoder(embed_dim=embed_dim, num_layers=num_audio_layers)
-        self.param_encoder = PerceiverParameterEncoder(embed_dim=embed_dim, num_blocks=num_param_layers)
+        self.audio_encoder = AudioTransformerEncoder(embed_dim=embed_dim, num_layers=num_audio_layers,
+                                                     ff_dim=ff_dim, in_frames=in_frames)
+        self.param_encoder = PerceiverParameterEncoder(embed_dim=embed_dim, num_blocks=num_param_layers, ff_dim=ff_dim)
         self.f_a2p = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.f_p2a = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.sigreg = SIGRegLoss(num_slices=num_slices_sigreg)
@@ -288,6 +272,7 @@ class SynthJEPA(nn.Module):
         mel: torch.Tensor,
         cont_params: torch.Tensor,
         cat_onehots: List[torch.Tensor],
+        sigreg_generator: torch.Generator = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Encoders
         za = self.audio_encoder(mel)
@@ -302,7 +287,7 @@ class SynthJEPA(nn.Module):
         loss_pred_a = F.mse_loss(z_hat_a, za.detach())
 
         # SIGReg anti-collapse on both encoders independently
-        loss_sig_a = self.sigreg(za)
-        loss_sig_p = self.sigreg(zp)
+        loss_sig_a = self.sigreg(za, sigreg_generator)
+        loss_sig_p = self.sigreg(zp, sigreg_generator)
 
         return loss_pred_p, loss_pred_a, loss_sig_a, loss_sig_p, za, zp

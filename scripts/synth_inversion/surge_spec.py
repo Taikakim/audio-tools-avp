@@ -180,6 +180,33 @@ def draw_patch(seed: int, note_dur_range=NOTE_DUR_RANGE) -> dict:
     )
 
 
+# Support of the training distribution for each CONTINUOUS parameter, in the 23-d vector
+# space (what draw_patch can produce, including the 0 of spike-and-slab params). A model
+# trained on this data has never seen values outside these boxes, so searches over a learned
+# objective (Synth-JEPA, DE) must stay inside them. test_synth_inversion checks them
+# against draw_patch so they cannot drift.
+CONT_BOUNDS = {
+    "midi_note": (0.0, 1.0), "shape": (0.0, 1.0), "width": (0.0, 1.0), "sub_mix": (0.0, 0.85),
+    "sync": (0.0, 0.40), "fm_depth": (0.0, 0.45), "unison_detune": (0.0, 1.0), "cutoff": (0.08, 0.92),
+    "resonance": (0.0, 0.85), "keytrack": (0.0, 1.0), "feg_amount": (0.2, 0.95), "feg_decay": (0.03, 0.65),
+    "feg_sustain": (0.0, 0.60), "aeg_decay": (0.05, 0.65), "aeg_sustain": (0.0, 0.80), "aeg_release": (0.01, 0.40),
+    "drive": (0.0, 1.0), "chorus_mix": (0.0, 0.60), "delay_mix": (0.0, 0.45), "delay_fb": (0.0, 0.50),
+}
+
+
+def canonicalize_vector(p: np.ndarray) -> np.ndarray:
+    """Apply the training data's couplings to a [N, 23] (or [23]) vector: parameters that are
+    inactive are exactly 0 in every training sample (detune without unison, drive without a
+    waveshaper, delay feedback without delay), so a learned objective has only ever seen them
+    at 0 in that state."""
+    p = np.array(p, dtype=np.float32, copy=True)
+    q = p.reshape(-1, NUM_PARAMS)
+    q[q[:, PARAM_INDEX["unison"]] < 0.5, PARAM_INDEX["unison_detune"]] = 0.0
+    q[q[:, PARAM_INDEX["waveshaper_type"]] < 0.5 / (len(WAVESHAPER_TYPES) - 1), PARAM_INDEX["drive"]] = 0.0
+    q[q[:, PARAM_INDEX["delay_mix"]] <= 0.0, PARAM_INDEX["delay_fb"]] = 0.0
+    return q.reshape(p.shape)
+
+
 def patch_to_vector(patch: dict) -> np.ndarray:
     """Patch dict -> 23-d normalised vector (the h5 'params' layout)."""
     return np.array([

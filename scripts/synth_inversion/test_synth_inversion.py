@@ -301,15 +301,15 @@ def _tiny_h5(path, n=96, store_note_dur=False):
 
 @pytest.mark.parametrize("model_type,opt", [("resmlp", "normuon_sf"), ("flow", "normuon_sf"), ("flow", "adamw")])
 def test_train_end_to_end(tmp_path, model_type, opt):
-    import argparse
     import train_bracket
     h5p = tmp_path / "tiny.h5"
     _tiny_h5(h5p)
-    args = argparse.Namespace(
-        h5_path=str(h5p), model_type=model_type, opt_family=opt, hidden_dim=32, num_layers=2, batch_size=16,
-        lr_muon=0.01, lr_adam=0.001, weight_decay=0.01, radial_brake=0.85, adam_warmup_steps=5, epochs=2,
-        param_encoding=codec.ENCODING_V2, time_scale=1000.0, val_batches=2, flow_val_draws=3, flow_val_steps=3,
-        run_id=f"t_{model_type}_{opt}", output_dir=str(tmp_path / "out"), device="cpu")
+    # Defaults come from the script's own parser, so new flags never break this test.
+    args = train_bracket.build_parser().parse_args([
+        "--h5_path", str(h5p), "--model_type", model_type, "--opt_family", opt, "--hidden_dim", "32",
+        "--num_layers", "2", "--batch_size", "16", "--adam_warmup_steps", "5", "--epochs", "2",
+        "--val_batches", "2", "--flow_val_draws", "3", "--flow_val_steps", "3",
+        "--run_id", f"t_{model_type}_{opt}", "--output_dir", str(tmp_path / "out"), "--device", "cpu"])
     train_bracket.train(args)
     ckpt = tmp_path / "out" / f"{args.run_id}_best.pt"
     m = load_inverter(ckpt)
@@ -371,3 +371,98 @@ def test_match_and_stem_scripts_end_to_end(tmp_path, monkeypatch):
                                       "--flow_draws", "2", "--flow_steps", "2", "--out_dir", str(tmp_path / "s")])
     ev.main()
     assert (tmp_path / "s" / "stem_inversion_results.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Synth-JEPA (arXiv:2609.31024)
+# ---------------------------------------------------------------------------
+def test_cont_bounds_cover_training_draws_and_canonical():
+    vecs = np.stack([surge_spec.patch_to_vector(surge_spec.draw_patch(s)) for s in range(3000)])
+    for name, (lo, hi) in surge_spec.CONT_BOUNDS.items():
+        col = vecs[:, surge_spec.PARAM_INDEX[name]]
+        assert col.min() >= lo - 1e-6 and col.max() <= hi + 1e-6, name
+    assert set(surge_spec.CONT_BOUNDS) == {surge_spec.PARAM_NAMES[i] for i in surge_spec.CONT_INDICES}
+    np.testing.assert_array_equal(surge_spec.canonicalize_vector(vecs), vecs)  # training data is canonical
+
+
+def test_welford_is_channelwise_and_matches_numpy():
+    from synth_jepa_search import WelfordNormalizer
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(50, 128, 81)) * rng.uniform(0.5, 3, size=(1, 128, 1)) + rng.normal(size=(1, 128, 1))
+    norm = WelfordNormalizer()
+    for s in range(0, 50, 7):
+        norm.update(x[s:s + 7])
+    norm.freeze()
+    frames = x.transpose(1, 0, 2).reshape(128, -1)
+    np.testing.assert_allclose(norm.frozen_mean.numpy(), frames.mean(1), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(norm.frozen_std.numpy(), frames.std(1, ddof=1), rtol=1e-4)
+    with pytest.raises(RuntimeError):
+        WelfordNormalizer().normalize(torch.zeros(1, 128, 81))
+
+
+def _tiny_jepa():
+    from synth_jepa_model import SynthJEPA
+    return SynthJEPA(embed_dim=32, predictor_hidden=64, num_audio_layers=1, num_param_layers=2, ff_dim=64)
+
+
+def test_jepa_model_structure():
+    from synth_jepa_model import SynthJEPA
+    m = _tiny_jepa()
+    assert m.audio_encoder.n_tokens == 41  # stride-2 conv over 81 frames, no up-pooling
+    cross = [n for n, _ in m.param_encoder.named_modules() if n.endswith("cross_attn")]
+    assert cross == ["read_in.cross_attn"]  # ONE cross-attention, then self-attention blocks
+    assert len(m.param_encoder.self_blocks.layers) == 2
+    mel, p = _batch(4)
+    from train_synth_jepa import prepare_inputs
+    cont, cats = prepare_inputs(p)
+    assert float(cont.min()) >= -1 and float(cont.max()) <= 1
+    lp, la, sa, sp, za, zp = m(mel, cont, cats)
+    assert za.shape == zp.shape == (4, 32)
+    g1, g2 = torch.Generator().manual_seed(1), torch.Generator().manual_seed(1)
+    assert float(m.sigreg(za.detach(), g1)) == float(m.sigreg(za.detach(), g2))
+    full = SynthJEPA()
+    assert 45e6 < sum(q.numel() for q in full.parameters()) < 60e6  # paper: 53M
+
+
+def test_jepa_search_contract():
+    from synth_jepa_search import SynthJEPASearcher, WelfordNormalizer
+    norm = WelfordNormalizer()
+    norm.update(np.random.default_rng(0).normal(size=(8, 128, 81)))
+    norm.freeze()
+    s = SynthJEPASearcher(_tiny_jepa(), norm, device="cpu", seed=0)
+    res = s.search(torch.randn(128, 81), midi_note=40, total_eval_budget=512)
+    assert 0.9 * 512 <= res["n_evals"] <= 512
+    assert res["patch"]["midi_note"] == 40
+    v = res["vector"]
+    for name, (lo, hi) in surge_spec.CONT_BOUNDS.items():
+        if name != "midi_note":
+            assert lo - 1e-5 <= v[surge_spec.PARAM_INDEX[name]] <= hi + 1e-5, name
+    np.testing.assert_array_equal(surge_spec.canonicalize_vector(v), v)
+    again = SynthJEPASearcher(s.model, norm, device="cpu", seed=0)  # same seed -> same evaluation count
+    assert again.search(torch.randn(128, 81), midi_note=40, total_eval_budget=512)["n_evals"] == res["n_evals"]
+
+
+def test_train_synth_jepa_then_eval_end_to_end(tmp_path, monkeypatch):
+    import json
+    import evaluate_holdout_audio as eh
+    import train_synth_jepa
+    from synth_jepa_search import load_synth_jepa
+    h5p = tmp_path / "tiny.h5"
+    _tiny_h5(h5p, n=80)
+    monkeypatch.setattr(sys, "argv", ["x", "--h5_path", str(h5p), "--out_dir", str(tmp_path / "j"), "--run_id", "t",
+                                      "--epochs", "2", "--batch_size", "8", "--embed_dim", "32", "--num_layers", "1",
+                                      "--ff_dim", "64", "--norm_spectrograms", "40", "--val_batches", "2",
+                                      "--num_workers", "0", "--device", "cpu"])
+    train_synth_jepa.main()
+    ckpt = tmp_path / "j" / "t" / "checkpoint_latest.pt"
+    model, norm = load_synth_jepa(str(ckpt))
+    assert norm.frozen and norm.n_spectrograms == 40
+    lines = (tmp_path / "j" / "t" / "val.jsonl").read_text().strip().splitlines()
+    assert len(lines) == 2 and "r_a2p" in json.loads(lines[-1])["val"]
+    monkeypatch.setattr(eh, "init_synth", lambda *a, **k: FakeSurge())
+    out = tmp_path / "eval"
+    monkeypatch.setattr(sys, "argv", ["x", "--h5", str(h5p), "--jepa", f"j={ckpt}", "--jepa_budget", "128",
+                                      "--n", "3", "--out_dir", str(out)])
+    eh.main()
+    s = json.loads((out / "holdout_audio_summary.json").read_text())
+    assert "j/search" in s["methods"] and s["jepa_search"]["j"]["evals_per_target_max"] <= 128

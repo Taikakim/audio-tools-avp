@@ -49,6 +49,9 @@ scripts/synth_inversion/
 |-- evaluate_holdout_audio.py  # Audio-domain model comparison on held-out notes (+ oracle and trivial baselines)
 |-- evaluate_200k_inversion.py # Real-stem inversion, render, score, export
 |-- match_untitled_note.py     # Single-note match: neural inversion vs DE reference search
+|-- synth_jepa_model.py        # Synth-JEPA (arXiv:2609.31024): audio/param encoders, predictors, SIGReg
+|-- train_synth_jepa.py        # Synth-JEPA training (Welford pre-pass, WSD schedule, retrieval-accuracy validation)
+|-- synth_jepa_search.py       # Renderer-free JADE + Adam search over the training support; checkpoint loader
 |-- test_synth_inversion.py    # CPU tests with a fake Surge (no plugin or GPU needed)
 `-- run_overnight_suite.sh     # 200-epoch Muon+SF run, then 100-epoch AdamW baseline
 ```
@@ -71,7 +74,7 @@ confirming the differences are cosmetic.
 
 **Tests (no Surge, no GPU):**
 ```
-python -m pytest -q test_synth_inversion.py      # ~15 s; expect "20 passed"
+python -m pytest -q test_synth_inversion.py      # ~20 s; expect "25 passed"
 ```
 
 **Generate a dataset** (v2 also stores `note_dur` and generator attributes; params are identical to v1 for the same seeds):
@@ -110,3 +113,18 @@ makes the neural numbers a statement about generalisation, not about the method.
 
 Patch exports are `<name>.json` (readable values) plus `<name>.pedalboard_state` (restore with
 `plugin.raw_state = open(p, "rb").read()` in pedalboard). Neither is a Surge `.vstpreset` file.
+
+**Synth-JEPA** (Hayes, Tian, Lattner, arXiv:2609.31024; the PDF is the reference for every "Sec." in the code):
+```
+/home/kim/Projects/SAO/stable-audio-3/.venv/bin/python train_synth_jepa.py --run_id synth_jepa_v2_20ep --epochs 20
+$PY evaluate_holdout_audio.py --ckpt resmlp=/path/G01_best.pt --ckpt flow=/path/G02_best.pt \
+    --jepa jepa=/run/media/kim/Mantu/surge_200k_models/synth_jepa_runs/synth_jepa_v2_20ep/checkpoint_latest.pt --n 200
+```
+Training prints the model size (paper: 53M; ours 50.7M at the default `--ff_dim 1024`, a guess since the paper
+gives no depth/FFN width) and, per epoch, cross-modal retrieval accuracy with its chance level (1/batch); a
+retrieval figure near chance means the embeddings carry no pairing information whatever the losses say.
+Known gaps from the paper that code cannot close: it trains 1M steps on audio rendered online (always-new
+sounds) over 139 parameters at 3 s stereo; we have a fixed 200k set of 0.8 s mono notes over 23 parameters,
+so long runs revisit the same data (the script prints how many passes) and the train/val gap needs watching.
+The EMA-teacher ablation is not implemented. The search keeps to the training support (`surge_spec.CONT_BOUNDS`)
+and pins the MIDI note; see `synth_jepa_search.py`'s docstring for why both matter on this dataset.

@@ -10,18 +10,23 @@ Every run also renders two reference arms so the metric's dynamic range is visib
   mean_patch  the training-set mean patch for every target -> the trivial baseline
 A model that does not clearly beat mean_patch has learned nothing audible.
 
+Synth-JEPA (--jepa NAME=CKPT): renderer-free search (synth_jepa_search.py) with the MIDI note
+pinned to the target's, then ONE render of the returned patch, scored like everything else.
+
 Methods per checkpoint: ResMLP -> its point estimate; flow -> draw 0, and best-of-K
 (K draws rendered, the closest to the target kept — this peeks at the target, so it is a
 renderer-in-the-loop number, reported separately, never mixed with draw 0).
 All renders use the TRUE midi note and note length (pitch is not what is being tested).
 
 Usage:
-  python evaluate_holdout_audio.py --ckpt resmlp=/path/G01_best.pt --ckpt flow=/path/G02_best.pt --n 200
+  python evaluate_holdout_audio.py --ckpt resmlp=/path/G01_best.pt --ckpt flow=/path/G02_best.pt \
+      --jepa jepa=/path/synth_jepa_runs/<run>/checkpoint_latest.pt --n 200
 """
 import argparse
 import csv
 import json
 import os
+import time
 
 import h5py
 import numpy as np
@@ -56,7 +61,9 @@ def note_durations(h5, indices):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--h5", default="/run/media/kim/Mantu/surge_dataset/surge_bass_200k.h5")
-    ap.add_argument("--ckpt", action="append", required=True, help="NAME=PATH, repeatable")
+    ap.add_argument("--ckpt", action="append", default=[], help="NAME=PATH of a ResMLP/flow checkpoint, repeatable")
+    ap.add_argument("--jepa", action="append", default=[], help="NAME=PATH of a Synth-JEPA checkpoint, repeatable")
+    ap.add_argument("--jepa_budget", type=int, default=2048, help="objective evaluations per target (paper: 2048)")
     ap.add_argument("--n", type=int, default=200, help="held-out notes to render")
     ap.add_argument("--val_ratio", type=float, default=0.2, help="must match training's split")
     ap.add_argument("--flow_draws", type=int, default=8)
@@ -65,6 +72,8 @@ def main():
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--out_dir", default="/run/media/kim/Mantu/surge_200k_models/holdout_audio_eval")
     args = ap.parse_args()
+    if not args.ckpt and not args.jepa:
+        ap.error("give at least one --ckpt or --jepa")
 
     os.makedirs(args.out_dir, exist_ok=True)
     loss_fn = MultiScaleSTFTLoss()
@@ -110,6 +119,20 @@ def main():
                 else:
                     rows.append((int(indices[k]), f"{name}/point", losses[0]))
 
+    search_stats = {}
+    for name, path in parse_ckpt_specs(args.jepa):
+        from synth_jepa_search import SynthJEPASearcher, load_synth_jepa
+        model, normalizer = load_synth_jepa(path, device=args.device)
+        searcher = SynthJEPASearcher(model, normalizer, device=args.device, seed=0)
+        print(f"{name}: Synth-JEPA search ({args.jepa_budget} evals/target, note pinned) from {path}")
+        t0, evals = time.time(), []
+        for k, idx in enumerate(indices):
+            res = searcher.search(mels[k], midi_note=notes[k], total_eval_budget=args.jepa_budget)
+            evals.append(res["n_evals"])
+            rows.append((int(idx), f"{name}/search", score(res["patch"], k)))
+        search_stats[name] = {"seconds_per_target": (time.time() - t0) / len(indices),
+                              "evals_per_target_max": int(max(evals)), "budget": args.jepa_budget}
+
     with open(os.path.join(args.out_dir, "holdout_audio_scores.csv"), "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["h5_index", "method", "stft_loss"])
@@ -118,7 +141,7 @@ def main():
     methods = list(dict.fromkeys(m for _, m, _ in rows))
     by = {m: np.array([l for _, mm, l in rows if mm == m]) for m in methods}
     summary = {"n": int(len(indices)), "h5": args.h5, "metric": "audio_utils.MultiScaleSTFTLoss (lower = better)",
-               "methods": {}, "win_rate_vs_mean_patch": {}}
+               "methods": {}, "win_rate_vs_mean_patch": {}, "jepa_search": search_stats}
     print(f"\n{'method':28s} {'mean':>8s} {'median':>8s} {'sem':>7s} {'beats mean_patch':>17s}")
     for m in methods:
         v = by[m]

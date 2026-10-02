@@ -1,47 +1,78 @@
-"""Synth-JEPA Renderer-Free Parameter Search: JADE Evolution + Differentiable Adam Refinement.
+"""Synth-JEPA renderer-free parameter search (Sec. 2.2 of Hayes, Tian, Lattner, arXiv:2609.31024).
 
-Section 2.2 of Hayes et al. (arXiv:2609.31024):
 1. Given target audio y*, compute z_a* = E_a(y*) once.
-2. Candidate parameters are scored via:
-   D_JEPA(y*, x) = MSE(z_a*, f_p->a(E_p(x)))
-   (pure PyTorch forward pass, zero calls to Surge XT).
-3. Two-Stage Hybrid Optimization:
-   Stage 1: Evolve population of 32 candidates with JADE (Adaptive Differential Evolution).
-   Stage 2: 8 best candidates are refined by gradient descent on continuous parameters
-            using Adam (lr=0.1, cosine decay to zero), pruned 3 times (8 -> 4 -> 2 -> 1).
-4. The sole remaining candidate is returned and rendered through Surge XT once.
+2. Score candidates x with D_JEPA(y*, x) = MSE(z_a*, f_p->a(E_p(x)))  (Eq. 4; no synth calls).
+3. Two stages (paper): half the evaluation budget evolves a population of 32 with JADE
+   (mutation/crossover on continuous params; categoricals copied from another candidate or
+   resampled); then the 8 best are refined by Adam on their continuous params (lr 0.1, cosine
+   decay to zero), pruning the worse half three times at evenly spaced intervals; the sole
+   remaining candidate is returned and rendered once.
+
+v2 (2026-10-02 review, checked against the paper PDF):
+  * Search box = the TRAINING SUPPORT (surge_spec.CONT_BOUNDS), not all of [-1, 1]. The paper
+    samples a uniform prior over each parameter's full range, so its search box and its
+    training support coincide. Our dataset draws narrower ranges and spike-and-slab values, so
+    a full-range search spends budget where E_p never saw data — exactly where a learned
+    objective is least trustworthy and easiest to exploit.
+  * Couplings applied to every candidate before scoring (detune=0 without unison, drive=0
+    without a waveshaper, delay feedback=0 without delay), as in every training sample.
+  * The MIDI note can be pinned (search(midi_note=...)). Pitch is in the parameter vector
+    here; unpinned, the search can match timbre by moving the pitch, and the render (at the
+    true note) is then not what was scored.
+  * Budget counts every objective evaluation (initial population, pruning re-scores, final
+    score), and stage 2's step count is set so its evaluations fill its half of the budget
+    given the shrinking pool (v1 used ~60 % of it).
+  * Stage-2 pruning keeps the cosine schedule and each survivor's Adam moments (v1 rebuilt
+    the optimiser at each prune, which detached the scheduler: LR stayed constant afterwards).
+  * The returned candidate is the arg-min of a final re-score, not index 0.
+  * JADE adaptation follows Zhang & Sanderson: mu_F updated with the Lehmer mean, F redrawn
+    while <= 0 and truncated at 1, r1 != r2 != i, at least one crossed gene. (No external
+    archive — "optional" in JADE; the paper does not say it used one.)
+  * WelfordNormalizer is CHANNEL-wise (one mean/var per mel band) as in Sec. 3.1, not per
+    (band, frame) element, and refuses to normalise before its statistics are frozen.
 """
-import copy
 import math
-from typing import Dict, List, Tuple
+from typing import List, Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from surge_spec import CAT_INDICES, CONT_INDICES, NUM_PARAMS, LP_FILTERS, WAVESHAPER_TYPES, render_patch
+from surge_spec import (CAT_INDICES, CONT_BOUNDS, CONT_INDICES, NOTE_HIGH, NOTE_LOW, NUM_PARAMS, PARAM_NAMES,
+                        canonicalize_vector, vector_to_patch)
 
 
 class WelfordNormalizer:
-    """Online running mean and variance estimator (Welford 1962)."""
-    def __init__(self, shape=(128, 81), eps=1e-5):
+    """Channel-wise (per mel band) running mean/variance, Welford/Chan merge, then frozen.
+
+    Sec. 3.1: "we estimate channel-wise mean and variance over the first 8k training
+    spectrograms using Welford's online algorithm and freeze the resulting statistics".
+    """
+    def __init__(self, n_mels: int = 128, eps: float = 1e-5):
         self.count = 0
-        self.mean = np.zeros(shape, dtype=np.float64)
-        self.M2 = np.zeros(shape, dtype=np.float64)
+        self.mean = np.zeros(n_mels, dtype=np.float64)
+        self.M2 = np.zeros(n_mels, dtype=np.float64)
         self.eps = eps
         self.frozen = False
         self.frozen_mean = None
         self.frozen_std = None
+        self.n_spectrograms = 0
 
     def update(self, batch_mels: np.ndarray):
+        """batch_mels: [B, n_mels, T]. Merges all B*T frames per band (Chan et al. parallel update)."""
         if self.frozen:
             return
-        for mel in batch_mels:
-            self.count += 1
-            delta = mel - self.mean
-            self.mean += delta / self.count
-            delta2 = mel - self.mean
-            self.M2 += delta * delta2
+        x = np.asarray(batch_mels, dtype=np.float64)
+        frames = x.transpose(1, 0, 2).reshape(x.shape[1], -1)  # [n_mels, B*T]
+        n_b = frames.shape[1]
+        mean_b = frames.mean(axis=1)
+        m2_b = ((frames - mean_b[:, None]) ** 2).sum(axis=1)
+        n = self.count + n_b
+        delta = mean_b - self.mean
+        self.mean = self.mean + delta * n_b / n
+        self.M2 = self.M2 + m2_b + delta ** 2 * self.count * n_b / n
+        self.count = n
+        self.n_spectrograms += x.shape[0]
 
     def freeze(self):
         self.frozen = True
@@ -51,202 +82,197 @@ class WelfordNormalizer:
 
     def normalize(self, mel_tensor: torch.Tensor) -> torch.Tensor:
         if not self.frozen:
-            return mel_tensor
-        device = mel_tensor.device
-        mean = self.frozen_mean.to(device)
-        std = self.frozen_std.to(device)
+            raise RuntimeError("WelfordNormalizer used before freeze(); estimate the statistics first")
+        mean = self.frozen_mean.to(mel_tensor.device)[:, None]  # broadcast over time
+        std = self.frozen_std.to(mel_tensor.device)[:, None]
         return (mel_tensor - mean) / std
+
+    def state_dict(self) -> dict:
+        return {"mean": self.frozen_mean, "std": self.frozen_std, "n_spectrograms": self.n_spectrograms}
+
+    @classmethod
+    def from_state_dict(cls, state: dict) -> "WelfordNormalizer":
+        norm = cls(n_mels=int(state["mean"].shape[0]))
+        norm.frozen, norm.frozen_mean, norm.frozen_std = True, state["mean"], state["std"]
+        norm.n_spectrograms = int(state.get("n_spectrograms", 0))
+        return norm
+
+
+def load_synth_jepa(ckpt_path: str, device: str = "cpu"):
+    """-> (SynthJEPA model in eval mode, frozen WelfordNormalizer) from a train_synth_jepa.py checkpoint."""
+    from synth_jepa_model import SynthJEPA
+
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    if "normalizer" not in ckpt or "model_kwargs" not in ckpt:
+        raise ValueError(f"{ckpt_path}: no normalizer/model_kwargs in checkpoint (written by train_synth_jepa.py v1?)")
+    model = SynthJEPA(**ckpt["model_kwargs"])
+    model.load_state_dict(ckpt["model_state_dict"])
+    return model.to(device).eval(), WelfordNormalizer.from_state_dict(ckpt["normalizer"])
+
+
+def _to_pm1(v01):
+    return 2.0 * v01 - 1.0
 
 
 class SynthJEPASearcher:
-    """Renderer-free hybrid JADE + Adam searcher."""
-    def __init__(self, model, normalizer: WelfordNormalizer, device="cuda:0"):
-        self.model = model.to(device).eval()
-        self.normalizer = normalizer
+    """Renderer-free hybrid JADE + Adam searcher over the training support."""
+
+    def __init__(self, model, normalizer: WelfordNormalizer, device="cuda:0", seed: int = 0):
         self.device = torch.device(device)
+        self.model = model.to(self.device).eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.normalizer = normalizer
         self.num_cont = len(CONT_INDICES)
         self.cat_sizes = [k for _, k in CAT_INDICES]
+        self.gen = torch.Generator(device=self.device).manual_seed(seed)
+        cont_names = [PARAM_NAMES[i] for i in CONT_INDICES]
+        self.lo = torch.tensor([_to_pm1(CONT_BOUNDS[n][0]) for n in cont_names], device=self.device)
+        self.hi = torch.tensor([_to_pm1(CONT_BOUNDS[n][1]) for n in cont_names], device=self.device)
+        pos = {n: j for j, n in enumerate(cont_names)}
+        self._detune, self._drive = pos["unison_detune"], pos["drive"]
+        self._delay_mix, self._delay_fb = pos["delay_mix"], pos["delay_fb"]
+        self._note = pos["midi_note"]
+        self._cat_pos = {PARAM_NAMES[i]: j for j, (i, _k) in enumerate(CAT_INDICES)}
+        self._note_value = None
+        self.n_evals = 0
+
+    # ------------------------------------------------------------------ helpers
+    def _rand(self, *shape):
+        return torch.rand(*shape, device=self.device, generator=self.gen)
+
+    def _randint(self, high, shape):
+        return torch.randint(0, high, shape, device=self.device, generator=self.gen)
+
+    def _onehots(self, cats: List[torch.Tensor]):
+        return [F.one_hot(c, k).float() for c, k in zip(cats, self.cat_sizes)]
+
+    def _constrain(self, cont: torch.Tensor, cats: List[torch.Tensor]) -> torch.Tensor:
+        """Clamp to the training box, apply the training couplings, pin the note. Out-of-place."""
+        cont = torch.maximum(torch.minimum(cont, self.hi), self.lo).clone()
+        zero = torch.full_like(cont[:, 0], -1.0)  # vector value 0 is -1 in [-1, 1] space
+        cont[:, self._detune] = torch.where(cats[self._cat_pos["unison"]] == 1, cont[:, self._detune], zero)
+        cont[:, self._drive] = torch.where(cats[self._cat_pos["waveshaper_type"]] > 0, cont[:, self._drive], zero)
+        cont[:, self._delay_fb] = torch.where(cont[:, self._delay_mix] > -1.0, cont[:, self._delay_fb], zero)
+        if self._note_value is not None:
+            cont[:, self._note] = self._note_value
+        return cont
+
+    def score_candidates(self, za_target: torch.Tensor, cont: torch.Tensor, cats: List[torch.Tensor]) -> torch.Tensor:
+        """D_JEPA(y*, x) = MSE(z_a*, f_p->a(E_p(x))) per candidate (Eq. 4). Counts evaluations."""
+        self.n_evals += cont.shape[0]
+        z_hat_a = self.model.predict_audio_latent(self.model.encode_params(cont, self._onehots(cats)))
+        return F.mse_loss(z_hat_a, za_target.expand_as(z_hat_a), reduction="none").mean(dim=-1)
 
     @torch.no_grad()
     def encode_target(self, mel: torch.Tensor) -> torch.Tensor:
-        # mel: [1, 128, 81] or [128, 81]
         if mel.ndim == 2:
             mel = mel.unsqueeze(0)
-        norm_mel = self.normalizer.normalize(mel.to(self.device))
-        return self.model.encode_audio(norm_mel)  # [1, 512]
+        return self.model.encode_audio(self.normalizer.normalize(mel.to(self.device)))  # [1, 512]
 
-    def score_candidates(
-        self,
-        za_target: torch.Tensor,
-        cont_tensor: torch.Tensor,
-        cat_onehots: List[torch.Tensor],
-    ) -> torch.Tensor:
-        """Computes D_JEPA(y*, x) = MSE(z_a*, f_p->a(E_p(x))) for B candidates."""
-        # cont_tensor: [B, 20] in [-1, 1]
-        zp = self.model.encode_params(cont_tensor, cat_onehots)  # [B, 512]
-        z_hat_a = self.model.predict_audio_latent(zp)            # [B, 512]
-        # MSE per candidate
-        return F.mse_loss(z_hat_a, za_target.expand_as(z_hat_a), reduction="none").mean(dim=-1)  # [B]
-
-    def search(
-        self,
-        target_mel: torch.Tensor,
-        total_eval_budget: int = 2048,
-        pop_size: int = 32,
-    ) -> dict:
-        """Executes the two-stage search: JADE evolution then Adam gradient refinement."""
+    # ------------------------------------------------------------------ search
+    def search(self, target_mel: torch.Tensor, midi_note: Optional[int] = None,
+               total_eval_budget: int = 2048, pop_size: int = 32, n_refine: int = 8) -> dict:
+        """Returns {'patch', 'vector' (23-d), 'd_jepa' (final objective), 'n_evals'}."""
+        self.n_evals = 0
+        self._note_value = (None if midi_note is None else
+                            float(_to_pm1((midi_note - NOTE_LOW) / (NOTE_HIGH - NOTE_LOW))))
         za_target = self.encode_target(target_mel)
-
-        # -------------------------------------------------------------
-        # Stage 1: JADE Evolutionary Search (50% of budget)
-        # -------------------------------------------------------------
         stage1_budget = total_eval_budget // 2
-        num_generations = max(1, stage1_budget // pop_size)
 
-        # Initialize population uniformly in [-1, 1] for continuous params
-        cont_pop = torch.empty(pop_size, self.num_cont, device=self.device).uniform_(-1.0, 1.0)
-        cat_pop_indices = [
-            torch.randint(0, k, (pop_size,), device=self.device) for k in self.cat_sizes
-        ]
-
-        def get_cat_onehots(indices_list):
-            return [F.one_hot(idx, k).float() for idx, k in zip(indices_list, self.cat_sizes)]
-
+        # ---- Stage 1: JADE (current-to-pbest/1/bin), uniform init over the training box
+        cats_pop = [self._randint(k, (pop_size,)) for k in self.cat_sizes]
+        cont_pop = self._constrain(self.lo + (self.hi - self.lo) * self._rand(pop_size, self.num_cont), cats_pop)
         with torch.no_grad():
-            scores = self.score_candidates(za_target, cont_pop, get_cat_onehots(cat_pop_indices))
+            scores = self.score_candidates(za_target, cont_pop, cats_pop)
 
-        # JADE parameter adaptation memories
-        mu_cr = 0.5
-        mu_f = 0.5
-        c_rate = 0.1
+        mu_cr, mu_f, c = 0.5, 0.5, 0.1
+        p_best_count = max(2, int(round(0.05 * pop_size)))
+        idx = torch.arange(pop_size, device=self.device)
+        while self.n_evals + pop_size <= stage1_budget:
+            cr = (mu_cr + 0.1 * torch.randn(pop_size, device=self.device, generator=self.gen)).clamp(0.0, 1.0)
+            f_val = torch.zeros(pop_size, device=self.device)
+            todo = torch.ones(pop_size, dtype=torch.bool, device=self.device)
+            while todo.any():  # F ~ Cauchy(mu_f, 0.1): redraw while <= 0, truncate at 1
+                draw = mu_f + 0.1 * torch.tan(math.pi * (self._rand(pop_size) - 0.5))
+                f_val = torch.where(todo, draw, f_val)
+                todo = f_val <= 0
+            f_val = f_val.clamp(max=1.0)
 
-        for gen in range(num_generations):
-            # Sample CR_i ~ Normal(mu_cr, 0.1), F_i ~ Cauchy(mu_f, 0.1)
-            cr = torch.normal(mu_cr, 0.1, size=(pop_size,), device=self.device).clamp(0.0, 1.0)
-            f_val = mu_f + 0.1 * torch.tan(torch.pi * (torch.rand(pop_size, device=self.device) - 0.5))
-            f_val = f_val.clamp(0.1, 1.0)
+            pbest = torch.topk(scores, p_best_count, largest=False).indices[self._randint(p_best_count, (pop_size,))]
+            r1 = (idx + 1 + self._randint(pop_size - 1, (pop_size,))) % pop_size  # r1 != i
+            r2 = (idx + 1 + self._randint(pop_size - 1, (pop_size,))) % pop_size  # r2 != i
+            r2 = torch.where(r2 == r1, (r2 + 1) % pop_size, r2)                     # r2 != r1
+            r2 = torch.where(r2 == idx, (r2 + 1) % pop_size, r2)                    # (re-check i)
+            fv = f_val.unsqueeze(-1)
+            v = cont_pop + fv * (cont_pop[pbest] - cont_pop) + fv * (cont_pop[r1] - cont_pop[r2])
+            mask = self._rand(pop_size, self.num_cont) < cr.unsqueeze(-1)
+            mask[idx, self._randint(self.num_cont, (pop_size,))] = True  # binomial crossover: >= 1 gene
+            u_cont = torch.where(mask, v, cont_pop)
 
-            # JADE current-to-pbest mutation
-            p_best_count = max(2, int(0.05 * pop_size))
-            best_indices = torch.topk(scores, p_best_count, largest=False).indices
-
-            # Mutate continuous controls
-            r1 = torch.randint(0, pop_size, (pop_size,), device=self.device)
-            r2 = torch.randint(0, pop_size, (pop_size,), device=self.device)
-            pbest = best_indices[torch.randint(0, p_best_count, (pop_size,), device=self.device)]
-
-            v_cont = cont_pop + f_val.unsqueeze(-1) * (cont_pop[pbest] - cont_pop) + f_val.unsqueeze(-1) * (cont_pop[r1] - cont_pop[r2])
-            v_cont = v_cont.clamp(-1.0, 1.0)
-
-            # Crossover
-            mask = torch.rand_like(cont_pop) < cr.unsqueeze(-1)
-            u_cont = torch.where(mask, v_cont, cont_pop)
-
-            # Categorical variation: copy from random or resample
-            u_cat_indices = []
+            u_cats = []  # categoricals: copied from another candidate or resampled (Sec. 2.2)
             for j, k in enumerate(self.cat_sizes):
-                cat_copy = cat_pop_indices[j][torch.randint(0, pop_size, (pop_size,), device=self.device)]
-                resample_mask = torch.rand(pop_size, device=self.device) < 0.15
-                new_cat = torch.where(resample_mask, torch.randint(0, k, (pop_size,), device=self.device), cat_copy)
-                u_cat_indices.append(new_cat)
+                copied = cats_pop[j][self._randint(pop_size, (pop_size,))]
+                u_cats.append(torch.where(self._rand(pop_size) < 0.15, self._randint(k, (pop_size,)), copied))
+            u_cont = self._constrain(u_cont, u_cats)
 
             with torch.no_grad():
-                u_scores = self.score_candidates(za_target, u_cont, get_cat_onehots(u_cat_indices))
-
-            # Selection
+                u_scores = self.score_candidates(za_target, u_cont, u_cats)
             better = u_scores < scores
             cont_pop[better] = u_cont[better]
             for j in range(len(self.cat_sizes)):
-                cat_pop_indices[j][better] = u_cat_indices[j][better]
+                cats_pop[j][better] = u_cats[j][better]
             scores[better] = u_scores[better]
-
             if better.any():
-                mu_cr = (1 - c_rate) * mu_cr + c_rate * float(cr[better].mean().item())
-                mu_f = (1 - c_rate) * mu_f + c_rate * float(f_val[better].mean().item())
+                s_cr, s_f = cr[better], f_val[better]
+                mu_cr = (1 - c) * mu_cr + c * float(s_cr.mean())
+                mu_f = (1 - c) * mu_f + c * float((s_f ** 2).sum() / s_f.sum())  # Lehmer mean
 
-        # -------------------------------------------------------------
-        # Stage 2: Differentiable Adam Refinement (50% of budget)
-        # -------------------------------------------------------------
-        # Pick top 8 candidates
-        top8_indices = torch.topk(scores, 8, largest=False).indices
-        active_cont = cont_pop[top8_indices].clone().detach().requires_grad_(True)
-        active_cats = [cat_pop_indices[j][top8_indices].clone().detach() for j in range(len(self.cat_sizes))]
+        # ---- Stage 2: Adam on the best n_refine, pruning the worse half 3x at evenly spaced intervals
+        top = torch.topk(scores, min(n_refine, pop_size), largest=False).indices
+        active = cont_pop[top].clone().requires_grad_(True)
+        active_cats = [c_[top].clone() for c_ in cats_pop]
+        n0 = active.shape[0]
+        pools = [n0, max(1, n0 // 2), max(1, n0 // 4)]          # pool size in each third of the steps
+        overhead = sum(pools) + 1                                # pruning re-scores + final score
+        remaining = total_eval_budget - self.n_evals - overhead
+        total_steps = max(3, (3 * remaining) // sum(pools))
+        prune_at = {total_steps // 3 - 1, (2 * total_steps) // 3 - 1, total_steps - 1}
 
-        stage2_budget = total_eval_budget - stage1_budget
-        n_candidates = 8
-        total_steps = stage2_budget // n_candidates
-        prune_intervals = [total_steps // 3, (2 * total_steps) // 3, total_steps - 1]
-
-        optimizer = torch.optim.Adam([active_cont], lr=0.1)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=1e-5)
-
+        opt = torch.optim.Adam([active], lr=0.1)
         for step in range(total_steps):
-            optimizer.zero_grad()
-            cat_onehots = get_cat_onehots(active_cats)
-            loss_cands = self.score_candidates(za_target, active_cont, cat_onehots)
-            loss = loss_cands.sum()
-            loss.backward()
-
-            optimizer.step()
-            scheduler.step()
-
+            for g in opt.param_groups:  # cosine decay from 0.1 to zero
+                g["lr"] = 0.1 * 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
+            opt.zero_grad()
+            self.score_candidates(za_target, self._constrain(active, active_cats), active_cats).sum().backward()
+            opt.step()
             with torch.no_grad():
-                active_cont.clamp_(-1.0, 1.0)
+                active.copy_(self._constrain(active, active_cats))
 
-            # Prune worst half at 3 evenly spaced intervals
-            if step in prune_intervals and active_cont.shape[0] > 1:
+            if step in prune_at and active.shape[0] > 1:
                 with torch.no_grad():
-                    cur_scores = self.score_candidates(za_target, active_cont, get_cat_onehots(active_cats))
-                    keep_n = max(1, active_cont.shape[0] // 2)
-                    best_sub = torch.topk(cur_scores, keep_n, largest=False).indices
+                    cur = self.score_candidates(za_target, active, active_cats)
+                keep = torch.topk(cur, max(1, active.shape[0] // 2), largest=False).indices
+                state = opt.state[active]
+                new_active = active.detach()[keep].clone().requires_grad_(True)
+                new_opt = torch.optim.Adam([new_active], lr=opt.param_groups[0]["lr"])
+                if state:  # carry each survivor's Adam moments and the step count
+                    step_count = state["step"]
+                    new_opt.state[new_active] = {
+                        "step": step_count.clone() if torch.is_tensor(step_count) else step_count,
+                        "exp_avg": state["exp_avg"][keep].clone(),
+                        "exp_avg_sq": state["exp_avg_sq"][keep].clone(),
+                    }
+                active, opt = new_active, new_opt
+                active_cats = [c_[keep] for c_ in active_cats]
 
-                    active_cont = active_cont[best_sub].clone().detach().requires_grad_(True)
-                    active_cats = [active_cats[j][best_sub].clone().detach() for j in range(len(self.cat_sizes))]
-                    optimizer = torch.optim.Adam([active_cont], lr=optimizer.param_groups[0]["lr"])
-
-        # Best candidate
-        final_cont = active_cont[0].detach().cpu().numpy()  # [-1, 1] mapped
-        # Unscale from [-1, 1] to [0, 1]
-        final_cont_01 = (final_cont + 1.0) / 2.0
-        final_cats = [int(active_cats[j][0].item()) for j in range(len(self.cat_sizes))]
-
-        # Assemble full 23-d patch dictionary
-        patch = self.assemble_patch(final_cont_01, final_cats)
-        return patch
-
-    def assemble_patch(self, cont_01: np.ndarray, cat_classes: List[int]) -> dict:
-        """Transforms continuous [0, 1] and categorical class indices into a Surge patch dict."""
-        from surge_spec import NOTE_LOW, NOTE_HIGH, LP_FILTERS, WAVESHAPER_TYPES
-
-        p = np.zeros(NUM_PARAMS, dtype=np.float32)
-        p[CONT_INDICES] = cont_01
-
-        filter_idx = cat_classes[0]
-        unison = bool(cat_classes[1] == 1)
-        ws_idx = cat_classes[2]
-
-        return dict(
-            midi_note=int(round(NOTE_LOW + p[0] * (NOTE_HIGH - NOTE_LOW))),
-            filter_idx=filter_idx,
-            shape=float(p[2]),
-            width=float(p[3]),
-            sub_mix=float(p[4]),
-            sync=float(p[5]),
-            fm_depth=float(p[6]),
-            unison=unison,
-            unison_detune=float(p[8] * 0.35) if unison else 0.0,
-            cutoff=float(p[9]),
-            resonance=float(p[10]),
-            keytrack_raw=float(0.5 + p[11] * 0.5),
-            feg_amount=float(p[12]),
-            feg_decay=float(p[13]),
-            feg_sustain=float(p[14]),
-            aeg_decay=float(p[15]),
-            aeg_sustain=float(p[16]),
-            aeg_release=float(p[17]),
-            ws_idx=ws_idx,
-            drive_raw=float(0.50 + p[19] * 0.32),
-            chorus_mix=float(p[20]),
-            delay_mix=float(p[21]),
-            delay_fb=float(p[22]),
-        )
+        with torch.no_grad():
+            final_scores = self.score_candidates(za_target, active, active_cats)
+        b = int(torch.argmin(final_scores))
+        vec = np.zeros(NUM_PARAMS, dtype=np.float32)
+        vec[CONT_INDICES] = (active[b].detach().cpu().numpy() + 1.0) / 2.0
+        for (i, k), c_ in zip(CAT_INDICES, active_cats):
+            vec[i] = float(c_[b]) / (k - 1)
+        vec = canonicalize_vector(np.clip(vec, 0.0, 1.0))
+        return {"patch": vector_to_patch(vec), "vector": vec, "d_jepa": float(final_scores[b]),
+                "n_evals": int(self.n_evals)}

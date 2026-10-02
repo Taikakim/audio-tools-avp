@@ -231,8 +231,9 @@ def train(args):
         print("  - Stage 4: Reverse Unwhitening (Pullback with LIFO stack)")
         print("  - Stage 5: Prodigy Escape Velocity (dual-norm coupled, snr_gate=False)")
         print("  - Stage 6: Schedule-Free (c_warmup=200, power r=1), Radial Brake (0.85), Muon-SW & AdamC quadratic decays")
-        import sys
-        sat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        # (no local `import sys` here: it made `sys` function-local and crashed every
+        # non-modular run at the first sys.stdout.flush())
+        sat_path =os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         if sat_path not in sys.path:
             sys.path.insert(0, sat_path)
         from stable_audio_tools.training.modular_opt import ModularOptimizer, build_modular_param_groups
@@ -429,7 +430,7 @@ def train(args):
         f.write("\t".join(str(x) for x in row) + "\n")
 
 
-if __name__ == "__main__":
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--h5_path", type=str, default="/run/media/kim/Mantu/surge_dataset/surge_bass_200k.h5")
     parser.add_argument("--model_type", type=str, default="resmlp", choices=["resmlp", "flow"])
@@ -461,5 +462,9 @@ if __name__ == "__main__":
     parser.add_argument("--run_id", type=str, default="G05_resmlp_200k_v2_20ep_modular_brakes")
     parser.add_argument("--output_dir", type=str, default="/run/media/kim/Mantu/surge_200k_models/v2_suite")
     parser.add_argument("--device", type=str, default="cuda:0")
-    args = parser.parse_args()
+    return parser
+
+
+if __name__ == "__main__":
+    args = build_parser().parse_args()
     train(args)

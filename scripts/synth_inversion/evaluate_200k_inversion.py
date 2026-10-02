@@ -17,6 +17,7 @@ v2 (2026-10-01 review):
 import argparse
 import json
 import os
+import time
 
 import matplotlib
 matplotlib.use("Agg")
@@ -53,19 +54,27 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", action="append", help="NAME=PATH, repeatable (default: G01 + G02)")
     ap.add_argument("--stem", action="append", help="NAME:PATH:MIDI_NOTE:NOTE_DUR_S, repeatable")
+    ap.add_argument("--jepa", action="append", default=[], help="NAME=PATH of a Synth-JEPA checkpoint, repeatable")
+    ap.add_argument("--jepa_budget", type=int, default=2048, help="objective evaluations per target (paper: 2048)")
     ap.add_argument("--flow_draws", type=int, default=1, help=">1 adds a best-of-K (target-peeking) number")
     ap.add_argument("--flow_steps", type=int, default=20)
     ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
     ap.add_argument("--out_dir", default="/run/media/kim/Mantu/surge_200k_models/stem_inversion_results")
     args = ap.parse_args()
 
-    ckpts = parse_ckpt_specs(args.ckpt or DEFAULT_CKPTS)
+    ckpts = parse_ckpt_specs(args.ckpt if (args.ckpt or args.jepa) else DEFAULT_CKPTS)
     stems = [parse_stem(s) for s in (args.stem or DEFAULT_STEMS)]
     os.makedirs(args.out_dir, exist_ok=True)
 
     models = [(name, load_inverter(path)) for name, path in ckpts]
     for name, m in models:
         print(f"Loaded {name}: {type(m).__name__} ({m.encoding})")
+    searchers = []
+    for name, path in parse_ckpt_specs(args.jepa):
+        from synth_jepa_search import SynthJEPASearcher, load_synth_jepa
+        jm, jn = load_synth_jepa(path)
+        searchers.append((name, SynthJEPASearcher(jm, jn, device="cpu", seed=0)))
+        print(f"Loaded {name}: Synth-JEPA ({args.jepa_budget} evals/target)")
     synth = init_synth(args.plugin)
     loss_fn = MultiScaleSTFTLoss()
     results = []
@@ -101,6 +110,25 @@ def main():
                 r = rendered[key]
                 print(f"{key:28s} | Filter: {r['filter']:18s} | Shaper: {r['waveshaper']:10s} | STFT Loss: {r['stft_loss']:.3f} "
                       f"| Centroid: {r['centroid']:6.1f} Hz | Latency: {lat_ms:.1f} ms")
+        for j_name, searcher in searchers:
+            t0 = time.time()
+            res = searcher.search(mel_t[0], midi_note=midi_note, total_eval_budget=args.jepa_budget)
+            lat_ms = (time.time() - t0) * 1000.0
+            patch = res["patch"]
+            audio = render_patch(synth, patch, midi_note, note_dur)  # the single render; leaves synth in this state
+            L = info["score_len"]
+            key = f"{j_name}/search"
+            stem_path = os.path.join(args.out_dir, f"{stem_name}_{j_name}_search")
+            sf.write(f"{stem_path}.wav", audio, SAMPLE_RATE)
+            loss = loss_fn(audio[:L], y[:L])
+            save_patch(synth, patch, stem_path, extra={"stem": stem_name, "model": key, "latency_ms": lat_ms,
+                                                        "stft_loss": loss, "d_jepa": res["d_jepa"],
+                                                        "n_evals": res["n_evals"], "target": info})
+            rendered[key] = {"audio": audio, "filter": LP_FILTERS[patch["filter_idx"]][0],
+                             "waveshaper": WAVESHAPER_TYPES[patch["ws_idx"]][0], "stft_loss": loss,
+                             "centroid": spectral_centroid(audio), "latency_ms": lat_ms}
+            print(f"{key:28s} | Filter: {rendered[key]['filter']:18s} | Shaper: {rendered[key]['waveshaper']:10s} "
+                  f"| STFT Loss: {loss:.3f} | {res['n_evals']} evals, {lat_ms:.0f} ms, 1 render")
         print(f"Target centroid: {sc_target:.1f} Hz | OOD flags: {info['out_of_distribution'] or 'none'}")
 
         results.append({"stem": stem_name, "target": info, "target_centroid": sc_target,
