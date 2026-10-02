@@ -112,6 +112,22 @@ def spectral_centroid(y: np.ndarray, sr: int = SAMPLE_RATE) -> float:
     return float(np.mean(librosa.feature.spectral_centroid(y=np.asarray(y, dtype=np.float32), sr=sr)))
 
 
+def compute_wmfcc(ref_audio: np.ndarray, syn_audio: np.ndarray, sr: int = SAMPLE_RATE, n_mfcc: int = 20) -> float:
+    """Warped MFCC distance (wMFCC) using Dynamic Time Warping (DTW).
+    
+    Standard metric used in synth matching benchmarks (Synth-JEPA, Barkan et al.).
+    Computes MFCC sequences and finds the cost along the optimal time-warping path.
+    """
+    import librosa
+
+    r = np.asarray(ref_audio, dtype=np.float32)
+    s = np.asarray(syn_audio, dtype=np.float32)
+    mfcc_r = librosa.feature.mfcc(y=r, sr=sr, n_mfcc=n_mfcc)
+    mfcc_s = librosa.feature.mfcc(y=s, sr=sr, n_mfcc=n_mfcc)
+    cost_matrix, wp = librosa.sequence.dtw(mfcc_r, mfcc_s, metric="euclidean")
+    return float(cost_matrix[-1, -1] / max(1, len(wp)))
+
+
 def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None) -> None:
     """Export a matched patch.
 
