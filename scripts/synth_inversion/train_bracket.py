@@ -263,6 +263,17 @@ def train(args):
     prev_delta = None
 
     for epoch in range(1, args.epochs + 1):
+        stop_epoch_file = os.path.join(args.output_dir, f"{args.run_id}.stop_epoch")
+        if os.path.exists(stop_epoch_file):
+            try:
+                with open(stop_epoch_file, "r") as sf:
+                    target_stop = int(sf.read().strip())
+                if epoch > target_stop:
+                    print(f"[{args.run_id}] Stop signal reached target epoch {target_stop} (current {epoch}). Exiting epoch loop gracefully.")
+                    break
+            except Exception:
+                pass
+
         model.train()
         if is_modular:
             opt_modular.train()
@@ -352,7 +363,7 @@ def train(args):
             star = "*"
         else:
             star = " "
-        if epoch % 25 == 0 or epoch == args.epochs:
+        if epoch % 10 == 0 or epoch == args.epochs:
             save_ckpt(os.path.join(args.output_dir, f"{args.run_id}_epoch_{epoch}.pt"), model, epoch, global_step, val, args)
 
         cat_acc = " ".join(f"{k}={v:.3f}" for k, v in val["val_cat_acc"].items())
