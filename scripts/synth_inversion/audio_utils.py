@@ -128,19 +128,44 @@ def compute_wmfcc(ref_audio: np.ndarray, syn_audio: np.ndarray, sr: int = SAMPLE
     return float(cost_matrix[-1, -1] / max(1, len(wp)))
 
 
-def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None) -> None:
-    """Export a matched patch.
+def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_user_dir: bool = True) -> None:
+    """Export a matched patch for DAW workflows.
 
-    Writes <stem>.json (every Surge raw value we set, human-readable) and
-    <stem>.pedalboard_state (the plugin's full state blob from pedalboard's raw_state).
-    The state blob restores exactly via `plugin.raw_state = open(p, 'rb').read()` in
-    pedalboard. It is NOT a .vstpreset file (that format wraps the component state in a
-    VST3 chunk container); earlier versions mislabelled it as one.
+    Writes:
+      1. <stem>.json: human-readable configuration parameters.
+      2. <stem>.pedalboard_state: pedalboard raw_state blob.
+      3. <stem>.vstpreset: native Steinberg VST3 preset container directly loadable
+         in Bitwig, Ableton, FL Studio, Reaper, Cubase, etc.
+      4. Optionally installs <stem>.vstpreset directly into
+         ~/Documents/Surge XT/Patches/AI Inversions/ for instant access in Surge's patch browser.
     """
+    import os
+
     record = {"patch": describe_patch(patch)}
     if extra:
         record.update(extra)
     with open(f"{path_stem}.json", "w") as f:
         json.dump(record, f, indent=2)
+
+    # 1. Pedalboard raw state
     with open(f"{path_stem}.pedalboard_state", "wb") as f:
         f.write(plugin.raw_state)
+
+    # 2. Native .vstpreset container
+    vstpreset_path = f"{path_stem}.vstpreset"
+    preset_bytes = getattr(plugin, "preset_data", None)
+    if preset_bytes:
+        with open(vstpreset_path, "wb") as f:
+            f.write(preset_bytes)
+
+        # 3. Copy to Surge XT DAW user directory
+        if copy_to_user_dir:
+            user_patches_dir = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
+            try:
+                os.makedirs(user_patches_dir, exist_ok=True)
+                preset_name = os.path.basename(vstpreset_path)
+                target_dest = os.path.join(user_patches_dir, preset_name)
+                with open(target_dest, "wb") as f:
+                    f.write(preset_bytes)
+            except Exception as e:
+                warnings.warn(f"Could not copy {vstpreset_path} to Surge XT user directory: {e}")
