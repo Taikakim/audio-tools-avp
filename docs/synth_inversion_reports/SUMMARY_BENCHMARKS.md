@@ -1,5 +1,18 @@
 # Comprehensive Benchmark & Ground-Truth Analysis Summary
 
+> **⚠ Status (2026-10-02 code review): several results below are NOT valid evidence. Re-measure before relying on them.**
+> The code is fixed in v2 (`scripts/synth_inversion/`, see its README §3 for the re-run commands); the numbers here are unchanged from v1.
+> 1. **ResMLP vs flow "Best Val Loss" (0.0327 vs 0.0542) is not a model comparison.** ResMLP was scored on its point estimate (the MSE-optimal conditional mean), the flow on one fresh random draw per epoch (~2x the posterior variance by construction), with different Muon LRs (0.01 vs 0.03). Re-measure with `evaluate_holdout_audio.py` (audio-domain, with oracle and trivial baselines).
+> 2. **The DE "ground truth" on `untitled.wav` inherited six parameters it never searched** (width, sync, FM depth, unison, filter-EG sustain, amp sustain) from the ResMLP render that ran just before it, including the pulse width behind the "narrow pulse (shape = 0.919)" conclusion. It was also a small search (8 iterations) optimising the very metric it is scored on: a reference, not ground truth.
+> 3. **The neural numbers on `untitled.wav` are out of distribution**: a 99 ms clip with an 80 ms note, against training notes of 180-450 ms in 0.8 s windows.
+> 4. **STFT losses are not comparable across sections**: `evaluate_200k_inversion.py` and `match_untitled_note.py` each used their own loss with different FFT sizes.
+> 5. **Real-stem inputs were not resampled to 44.1 kHz or onset-aligned** in v1, so a non-44.1 kHz stem was fed to the model mis-scaled.
+> 6. **v1 filter-circuit and waveshaper predictions were ordinal regressions rounded to the nearest index**, so uncertain predictions landed on whatever sat mid-list. The reported circuits partly reflect list order.
+> 7. **The `.vstpreset` files are pedalboard raw-state blobs**, not VST3 preset files.
+> 8. **The 544.9 Hz centroid is listed for both the 99 ms note and the 30 s stem**, which looks like a copy error.
+> 9. **The "FEG_release >= AMP_release" coupling is not implemented** in the dataset generator (the filter-EG release is never set).
+> 10. **The overnight suite ran `train_bracket.py` from an agent scratch directory**, so the committed code may not be the code that produced these numbers.
+
 This report aggregates the sound matching experiments, 200k scaling benchmarks, and the single-note ground truth results on classic Goa/Psytrance basslines inverted into Surge XT 1.3.4.
 
 ---

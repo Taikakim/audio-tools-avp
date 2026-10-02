@@ -5,10 +5,13 @@ TRAIN_PY="/home/kim/Projects/SAO/stable-audio-3/.venv/bin/python"
 DATA_PY="/home/kim/Projects/synth_env/bin/python"
 H5_PATH="/run/media/kim/Mantu/surge_dataset/surge_bass_200k.h5"
 OUT_DIR="/run/media/kim/Mantu/surge_200k_models/overtraining_suite"
-SCRATCH_DIR="/home/kim/.gemini/antigravity/brain/62fc5213-e94b-4c13-86bf-69147f02f03c/scratch"
 
 mkdir -p "$OUT_DIR"
-cd "$SCRATCH_DIR"
+# Run the COMMITTED scripts next to this file. v1 cd'd into an agent scratch directory
+# (~/.gemini/antigravity/.../scratch), so the code that produced the reported numbers was
+# not necessarily the code in the repo.
+cd "$(dirname "$(readlink -f "$0")")"
+echo "Code: $(pwd) @ $(git rev-parse --short HEAD 2>/dev/null || echo 'not a git checkout')"
 
 export HIP_VISIBLE_DEVICES=0
 export PYTHONUNBUFFERED=1
@@ -57,5 +60,5 @@ $TRAIN_PY train_bracket.py \
 
 echo -e "\n=========================================================================="
 echo "=== Training Complete! Output Leaderboard: ==="
-cat "$OUT_DIR/leaderboard.tsv"
+cat "$OUT_DIR/leaderboard_v2.tsv"
 echo "Finished at: $(date)"
