@@ -480,3 +480,35 @@ def test_exact_gpu_mel_equivalence():
 
     max_diff = float(np.max(np.abs(cpu_mel - mel_out)))
     assert max_diff <= 1e-4, f"ExactGpuMel drifted from librosa make_mel_spec: max_diff={max_diff:.2e}"
+
+
+def test_envelope_extractor_profiling_and_decoupling():
+    from envelope_extractor import (butter_bandpass_filter, compute_envelope_loss_np,
+                                    detect_gate_off_changepoint, profile_note_envelope,
+                                    zolzer_envelope_follower)
+
+    fs = 44100
+    t = np.linspace(0, 0.4, int(0.4 * fs), endpoint=False)
+    # Synthesize a note: 100ms gate, fast attack, 60ms decay, 15ms release after gate
+    # Sub-band 65 Hz (C2 fundamental), harmonic band 1300 Hz
+    gate_s = 0.080
+    amp_env = np.where(t < gate_s, np.exp(-t / 0.050), np.exp(-gate_s / 0.050) * np.exp(-(t - gate_s) / 0.010))
+    filt_env = np.exp(-t / 0.020)  # filter decays faster than amp
+
+    sub = np.sin(2 * np.pi * 65.4 * t) * amp_env
+    harm = np.sin(2 * np.pi * 1308.0 * t) * amp_env * filt_env
+    audio = (sub + 0.5 * harm).astype(np.float32)
+
+    profile = profile_note_envelope(audio, fs=fs, bpm=143.0)
+    assert 0.050 <= profile.gate_off_s <= 0.095, f"Gate off detection failed: {profile.gate_off_s}"
+    assert profile.feg_decay_half_ms < profile.aeg_decay_half_ms, "FEG should decay faster than AEG"
+    assert "a_amp_eg_decay" in profile.suggested_params
+
+    # Test loss function
+    loss_same = compute_envelope_loss_np(audio, audio, fs=fs)
+    assert loss_same["loss_env_total"] == 0.0
+
+    audio_diff = (sub * 0.5).astype(np.float32)
+    loss_diff = compute_envelope_loss_np(audio, audio_diff, fs=fs)
+    assert loss_diff["loss_env_total"] > 0.0
+

@@ -178,3 +178,4 @@ latch_weights/*.pt
 # The path is machine-specific and the drive is removable, so the LINK must never be
 # committed -- it would break every other checkout and this one when the drive is out.
 models
+upstream_fresh/

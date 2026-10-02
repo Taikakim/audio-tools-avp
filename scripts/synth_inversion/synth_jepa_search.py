@@ -130,6 +130,8 @@ class SynthJEPASearcher:
         self.lo = torch.tensor([_to_pm1(CONT_BOUNDS[n][0]) for n in cont_names], device=self.device)
         self.hi = torch.tensor([_to_pm1(CONT_BOUNDS[n][1]) for n in cont_names], device=self.device)
         pos = {n: j for j, n in enumerate(cont_names)}
+        self.pos = pos
+        self.cont_names = cont_names
         self._detune, self._drive = pos["unison_detune"], pos["drive"]
         self._delay_mix, self._delay_fb = pos["delay_mix"], pos["delay_fb"]
         self._note = pos["midi_note"]
@@ -158,11 +160,17 @@ class SynthJEPASearcher:
             cont[:, self._note] = self._note_value
         return cont
 
-    def score_candidates(self, za_target: torch.Tensor, cont: torch.Tensor, cats: List[torch.Tensor]) -> torch.Tensor:
+    def score_candidates(self, za_target: torch.Tensor, cont: torch.Tensor, cats: List[torch.Tensor],
+                         env_vals: Optional[torch.Tensor] = None, env_mask: Optional[torch.Tensor] = None,
+                         envelope_weight: float = 0.0) -> torch.Tensor:
         """D_JEPA(y*, x) = MSE(z_a*, f_p->a(E_p(x))) per candidate (Eq. 4). Counts evaluations."""
         self.n_evals += cont.shape[0]
         z_hat_a = self.model.predict_audio_latent(self.model.encode_params(cont, self._onehots(cats)))
-        return F.mse_loss(z_hat_a, za_target.expand_as(z_hat_a), reduction="none").mean(dim=-1)
+        d_jepa = F.mse_loss(z_hat_a, za_target.expand_as(z_hat_a), reduction="none").mean(dim=-1)
+        if envelope_weight > 0.0 and env_mask is not None and env_mask.any():
+            env_loss = torch.sum(env_mask * (cont - env_vals.expand_as(cont)) ** 2, dim=-1)
+            return d_jepa + envelope_weight * env_loss
+        return d_jepa
 
     @torch.no_grad()
     def encode_target(self, mel: torch.Tensor) -> torch.Tensor:
@@ -172,7 +180,8 @@ class SynthJEPASearcher:
 
     # ------------------------------------------------------------------ search
     def search(self, target_mel: torch.Tensor, midi_note: Optional[int] = None,
-               total_eval_budget: int = 2048, pop_size: int = 32, n_refine: int = 8) -> dict:
+               total_eval_budget: int = 2048, pop_size: int = 32, n_refine: int = 8,
+               envelope_target: Optional[dict] = None, envelope_weight: float = 0.0) -> dict:
         """Returns {'patch', 'vector' (23-d), 'd_jepa' (final objective), 'n_evals'}."""
         self.n_evals = 0
         self._note_value = (None if midi_note is None else
@@ -180,11 +189,38 @@ class SynthJEPASearcher:
         za_target = self.encode_target(target_mel)
         stage1_budget = total_eval_budget // 2
 
+        # Optional envelope prior vector
+        env_mask = torch.zeros(self.num_cont, device=self.device)
+        env_vals = torch.zeros(self.num_cont, device=self.device)
+        if envelope_target is not None:
+            alias_map = {
+                "a_amp_eg_decay": "aeg_decay",
+                "a_amp_eg_sustain": "aeg_sustain",
+                "a_amp_eg_release": "aeg_release",
+                "a_filter1_cutoff": "cutoff",
+                "a_filter1_eg_amount": "feg_amount",
+                "a_filter1_eg_decay": "feg_decay",
+                "a_filter1_resonance": "resonance",
+            }
+            for k, v in envelope_target.items():
+                canonical_k = alias_map.get(k, k)
+                if canonical_k in self.pos:
+                    idx_c = self.pos[canonical_k]
+                    val_pm1 = float(np.clip(2.0 * v - 1.0, float(self.lo[idx_c].cpu()), float(self.hi[idx_c].cpu())))
+                    env_vals[idx_c] = val_pm1
+                    env_mask[idx_c] = 1.0
+
         # ---- Stage 1: JADE (current-to-pbest/1/bin), uniform init over the training box
         cats_pop = [self._randint(k, (pop_size,)) for k in self.cat_sizes]
-        cont_pop = self._constrain(self.lo + (self.hi - self.lo) * self._rand(pop_size, self.num_cont), cats_pop)
+        cont_pop = self.lo + (self.hi - self.lo) * self._rand(pop_size, self.num_cont)
+        if envelope_target is not None and env_mask.any():
+            n_env = max(1, pop_size // 4)
+            noise = 0.15 * torch.randn(n_env, self.num_cont, device=self.device, generator=self.gen)
+            env_seeded = torch.where(env_mask.bool().unsqueeze(0), env_vals.unsqueeze(0) + noise, cont_pop[:n_env])
+            cont_pop[:n_env] = env_seeded
+        cont_pop = self._constrain(cont_pop, cats_pop)
         with torch.no_grad():
-            scores = self.score_candidates(za_target, cont_pop, cats_pop)
+            scores = self.score_candidates(za_target, cont_pop, cats_pop, env_vals, env_mask, envelope_weight)
 
         mu_cr, mu_f, c = 0.5, 0.5, 0.1
         p_best_count = max(2, int(round(0.05 * pop_size)))
@@ -217,7 +253,7 @@ class SynthJEPASearcher:
             u_cont = self._constrain(u_cont, u_cats)
 
             with torch.no_grad():
-                u_scores = self.score_candidates(za_target, u_cont, u_cats)
+                u_scores = self.score_candidates(za_target, u_cont, u_cats, env_vals, env_mask, envelope_weight)
             better = u_scores < scores
             cont_pop[better] = u_cont[better]
             for j in range(len(self.cat_sizes)):
@@ -244,14 +280,15 @@ class SynthJEPASearcher:
             for g in opt.param_groups:  # cosine decay from 0.1 to zero
                 g["lr"] = 0.1 * 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
             opt.zero_grad()
-            self.score_candidates(za_target, self._constrain(active, active_cats), active_cats).sum().backward()
+            self.score_candidates(za_target, self._constrain(active, active_cats), active_cats,
+                                  env_vals, env_mask, envelope_weight).sum().backward()
             opt.step()
             with torch.no_grad():
                 active.copy_(self._constrain(active, active_cats))
 
             if step in prune_at and active.shape[0] > 1:
                 with torch.no_grad():
-                    cur = self.score_candidates(za_target, active, active_cats)
+                    cur = self.score_candidates(za_target, active, active_cats, env_vals, env_mask, envelope_weight)
                 keep = torch.topk(cur, max(1, active.shape[0] // 2), largest=False).indices
                 state = opt.state[active]
                 new_active = active.detach()[keep].clone().requires_grad_(True)
@@ -267,7 +304,7 @@ class SynthJEPASearcher:
                 active_cats = [c_[keep] for c_ in active_cats]
 
         with torch.no_grad():
-            final_scores = self.score_candidates(za_target, active, active_cats)
+            final_scores = self.score_candidates(za_target, active, active_cats, env_vals, env_mask, envelope_weight)
         b = int(torch.argmin(final_scores))
         vec = np.zeros(NUM_PARAMS, dtype=np.float32)
         vec[CONT_INDICES] = (active[b].detach().cpu().numpy() + 1.0) / 2.0
