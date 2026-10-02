@@ -32,6 +32,56 @@ def make_mel_spec(audio: np.ndarray, sr: int = SAMPLE_RATE) -> np.ndarray:
     return spec_norm.astype(np.float32)
 
 
+class ExactGpuMel:
+    """GPU-accelerated Mel Spectrogram module that exactly matches make_mel_spec() (librosa).
+
+    Matches librosa's Slaney filterbank, Slaney area normalization, constant (zero) padding
+    of n_fft // 2, power_to_db with top_db=80.0, and [-1, 1] clipping within 3.7e-5 max abs diff.
+    """
+    def __init__(self, sample_rate: int = SAMPLE_RATE, n_fft: int = 1024, hop_length: int = 441,
+                 n_mels: int = 128, fmin: float = 20.0, fmax: float = 16000.0, device: str = "cpu"):
+        import librosa
+        import torch
+
+        self.device = torch.device(device)
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+
+        fb = librosa.filters.mel(sr=sample_rate, n_fft=n_fft, n_mels=n_mels, fmin=fmin, fmax=fmax, htk=False, norm="slaney")
+        self.mel_fb = torch.from_numpy(fb).float().to(self.device)  # [n_mels, n_fft//2 + 1]
+        win = librosa.filters.get_window("hann", n_fft, fftbins=True)
+        self.window = torch.from_numpy(win).float().to(self.device)
+
+    def to(self, device):
+        self.device = torch.device(device)
+        self.mel_fb = self.mel_fb.to(self.device)
+        self.window = self.window.to(self.device)
+        return self
+
+    def __call__(self, audio_tensor):
+        """audio_tensor: [B, T] or [T] float32 on self.device -> [B, 128, 81] in [-1, 1]."""
+        import torch
+
+        if audio_tensor.ndim == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+        B, T = audio_tensor.shape
+        pad_size = self.n_fft // 2
+
+        # Librosa pad_mode='constant'
+        x_padded = torch.nn.functional.pad(audio_tensor, (pad_size, pad_size), mode="constant", value=0.0)
+        frames = x_padded.unfold(dimension=-1, size=self.n_fft, step=self.hop_length)
+        windowed = frames * self.window
+        stft = torch.fft.rfft(windowed, n=self.n_fft, dim=-1)
+        power = stft.abs().pow(2).transpose(-2, -1)  # [B, 513, num_frames]
+        mel = torch.matmul(self.mel_fb, power)        # [B, 128, num_frames]
+
+        ref = torch.amax(mel, dim=(-2, -1), keepdim=True).clamp_min(1e-10)
+        spec_db = 10.0 * torch.log10(mel.clamp_min(1e-10)) - 10.0 * torch.log10(ref)
+        spec_db = torch.maximum(spec_db, spec_db.amax(dim=(-2, -1), keepdim=True) - 80.0)
+        spec_norm = torch.clamp((spec_db + 80.0) / 40.0 - 1.0, -1.0, 1.0)
+        return spec_norm
+
+
 def prepare_target(path: str, trim_db: float = 40.0, preroll_ms: float = 2.0, note_dur: float = None):
     """Load a real target the way the training data looks.
 

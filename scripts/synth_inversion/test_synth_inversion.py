@@ -466,3 +466,17 @@ def test_train_synth_jepa_then_eval_end_to_end(tmp_path, monkeypatch):
     eh.main()
     s = json.loads((out / "holdout_audio_summary.json").read_text())
     assert "j/search" in s["methods"] and s["jepa_search"]["j"]["evals_per_target_max"] <= 128
+
+
+def test_exact_gpu_mel_equivalence():
+    from audio_utils import ExactGpuMel, make_mel_spec
+    t = np.linspace(0, 0.8, 35280, endpoint=False)
+    audio = (0.6 * np.sin(2 * np.pi * 130.81 * t) + 0.3 * np.sin(2 * np.pi * 261.63 * t)).astype(np.float32)
+    cpu_mel = make_mel_spec(audio)
+
+    gpu_mel = ExactGpuMel(device="cpu")
+    t_audio = torch.from_numpy(audio).unsqueeze(0)
+    mel_out = gpu_mel(t_audio).squeeze(0).numpy()
+
+    max_diff = float(np.max(np.abs(cpu_mel - mel_out)))
+    assert max_diff <= 1e-4, f"ExactGpuMel drifted from librosa make_mel_spec: max_diff={max_diff:.2e}"

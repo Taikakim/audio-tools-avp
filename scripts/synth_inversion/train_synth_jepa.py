@@ -65,6 +65,44 @@ class SurgeH5Dataset(Dataset):
         return mel, params
 
 
+class SurgeOnlineDataset(Dataset):
+    """Procedurally renders Surge XT audio online per sample using persistent worker synths.
+
+    Seeds are drawn strictly from [min_seed, ...) to guarantee ZERO overlap with the
+    validation set (which occupies seeds 5000 + 160000 .. 5000 + 200000 in the H5).
+    Workers generate raw audio waveforms on CPU; the GPU calculates ExactGpuMel in batches.
+    """
+    def __init__(self, length=160000, min_seed=1_000_000, plugin_path=None):
+        from surge_spec import DEFAULT_PLUGIN_PATH, SEED_OFFSET
+
+        self.length = length
+        self.min_seed = min_seed
+        self.plugin_path = plugin_path or DEFAULT_PLUGIN_PATH
+        # Assert strict seed disjointness from validation set
+        h5_val_max = SEED_OFFSET + 200_000
+        assert min_seed > h5_val_max, f"min_seed {min_seed} intersects H5 val range [..., {h5_val_max}]"
+        self._synth = None
+
+    def __len__(self):
+        return self.length
+
+    def _get_synth(self):
+        if self._synth is None:
+            from surge_spec import init_synth
+            self._synth = init_synth(self.plugin_path, verify=False)
+        return self._synth
+
+    def __getitem__(self, idx):
+        from surge_spec import draw_patch, patch_to_vector, render_patch
+
+        seed = self.min_seed + idx
+        patch = draw_patch(seed)
+        synth = self._get_synth()
+        audio = render_patch(synth, patch, patch["midi_note"], patch["note_dur"])
+        p_vec = patch_to_vector(patch)
+        return torch.from_numpy(audio), torch.from_numpy(p_vec)
+
+
 def prepare_inputs(params: torch.Tensor):
     """[B, 23] stored params -> (continuous in [-1, 1] [B, 20], list of one-hot [B, k]) (Sec. 2)."""
     cont = params[:, CONT_INDICES] * 2.0 - 1.0
@@ -142,6 +180,8 @@ def main():
     parser.add_argument("--val_batches", type=int, default=50)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--online", action="store_true", help="Render Surge audio online per sample using CPU workers")
+    parser.add_argument("--online_samples_per_epoch", type=int, default=160000, help="Epoch length for online training")
     args = parser.parse_args()
 
     save_dir = os.path.join(args.out_dir, args.run_id)
@@ -150,17 +190,25 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     device = torch.device(args.device)
-    print(f"=== Synth-JEPA Training on {device} ===\nDataset: {args.h5_path}\nCheckpoints: {save_dir}")
+    mode_str = "Online procedural synthesis" if args.online else f"Cached H5 ({args.h5_path})"
+    print(f"=== Synth-JEPA Training on {device} ===\nMode: {mode_str}\nCheckpoints: {save_dir}")
 
-    train_ds = SurgeH5Dataset(args.h5_path, split="train")
+    from audio_utils import ExactGpuMel
+    gpu_mel_extractor = ExactGpuMel(device=device) if args.online else None
+
+    if args.online:
+        train_ds = SurgeOnlineDataset(length=args.online_samples_per_epoch, min_seed=1_000_000)
+    else:
+        train_ds = SurgeH5Dataset(args.h5_path, split="train")
+
     val_ds = SurgeH5Dataset(args.h5_path, split="val")
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=not args.online,
+                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, drop_last=True)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
     print(f"Estimating channel-wise log-mel statistics over {args.norm_spectrograms} training spectrograms...")
-    normalizer = estimate_normalizer(train_ds, args.norm_spectrograms)
+    normalizer = estimate_normalizer(SurgeH5Dataset(args.h5_path, split="train"), args.norm_spectrograms)
     torch.save(normalizer.state_dict(), os.path.join(save_dir, "welford_stats.pt"))
 
     model_kwargs = dict(embed_dim=args.embed_dim, predictor_hidden=1024, num_audio_layers=args.num_layers,
@@ -181,11 +229,18 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
         sums, n_b, t0 = dict(loss=0.0, lp=0.0, la=0.0, sa=0.0, sp=0.0), 0, time.time()
-        for mel, p in train_loader:
+        for batch_item1, batch_item2 in train_loader:
             if step >= total_steps:
                 break
             step += 1
-            mel, p = mel.to(device), p.to(device)
+            if args.online:
+                audio_batch = batch_item1.to(device, non_blocking=True)
+                p = batch_item2.to(device, non_blocking=True)
+                mel = gpu_mel_extractor(audio_batch)
+            else:
+                mel = batch_item1.to(device, non_blocking=True)
+                p = batch_item2.to(device, non_blocking=True)
+
             cont, cats = prepare_inputs(p)
             lp, la, sa, sp, _za, _zp = model(normalizer.normalize(mel), cont, cats)
             loss = (lp + la) + args.lambda_sig * (sa + sp)

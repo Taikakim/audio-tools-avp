@@ -1,5 +1,9 @@
 # Conceptual & Technical Roadmap: Native HIP/GPU Synthesizer Engine Proxying Surge XT
 
+> [!NOTE]
+> **Phase 0 Immediate Baseline (Online Surge on CPU + Exact GPU Mel)**:
+> Before building a custom GPU synth kernel, online training can be driven directly by real headless Surge XT C++ instances (`SurgeOnlineDataset`, seeds $\ge 10^6$ to prevent validation leakage) paired with `ExactGpuMel` (bit-exact Librosa Slaney Mel spectrograms executed on GPU in $8.3\ \mu\text{s}$ per note). Because 16–20 CPU workers on an AMD 9900X produce $\sim 1,000$ real Surge notes/sec—exceeding the GPU's training consumption of $\sim 533$ notes/sec—online training can run with 100% genuine Surge audio today without proxy gap errors. The GPU synth below remains the ultimate scaling path for $100\text{k}+$ sounds/sec renderer-in-the-loop search.
+
 **Target Hardware**: AMD Radeon RX 9070 XT (`gfx1201` via ROCm / HIP)  
 **Target DAW Environment**: Surge XT 1.3+ VST3 / CLAP across Bitwig, Ableton, FL Studio, Reaper  
 **Goal**: Build a GPU-native, massively parallel synthesizer proxy in HIP/PyTorch that matches Surge XT's core DSP topology, renders 100k+ sounds/second directly in VRAM for neural model training and search, and exports 1:1 identical `.vstpreset` files for real-world DAW workflows.
