@@ -195,7 +195,7 @@ def main():
             optimizer.step()
             scheduler.step()
             for k, v in dict(loss=loss, lp=lp, la=la, sa=sa, sp=sp).items():
-                sums[k] += float(v)
+                sums[k] += float(v.detach())
             n_b += 1
             if step % 200 == 0:
                 print(f"Ep {epoch:02d} | Step {step:06d} | Loss {loss.item():.4f} (Pred_P {lp.item():.4f}, Pred_A {la.item():.4f}, "
