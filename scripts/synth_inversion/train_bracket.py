@@ -247,13 +247,14 @@ def train(args):
             sign_wd=args.weight_decay,
             colnorm_wd=args.weight_decay,
         )
+        use_sf = not args.disable_sf
         opt_modular = ModularOptimizer(
             groups,
             lr=args.lr_adam,
             radial_brake=args.radial_brake,
             normuon=True,
             normuon_beta=0.95,
-            schedule_free=True,
+            schedule_free=use_sf,
             sf_beta=0.9,
             sf_c_warmup=200,
             muon_sw_decay=True,
@@ -264,7 +265,15 @@ def train(args):
         )
         opt_muon = None
         opt_adam = None
-        scheduler = None
+        if not use_sf and args.lr_schedule == "cosine":
+            print(f"Applying CosineAnnealingLR across {args.epochs} epochs to ModularOptimizer (eta_min=1e-5)")
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt_modular, T_max=args.epochs, eta_min=1e-5)
+        elif not use_sf and args.lr_schedule == "exp":
+            gamma = (1e-3 / max(args.lr_muon, 1e-4)) ** (1.0 / max(1, args.epochs - 1))
+            print(f"Applying ExponentialLR with gamma={gamma:.4f} across {args.epochs} epochs to ModularOptimizer")
+            scheduler = torch.optim.lr_scheduler.ExponentialLR(opt_modular, gamma=gamma)
+        else:
+            scheduler = None
         print(opt_modular.summary())
     else:
         opt_muon, opt_adam = build_optimizers(model, lr_muon=args.lr_muon, lr_adam=args.lr_adam,
@@ -437,6 +446,10 @@ if __name__ == "__main__":
     parser.add_argument("--lr_adam", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--radial_brake", type=float, default=0.85)
+    parser.add_argument("--lr_schedule", type=str, default="none", choices=["none", "cosine", "exp"],
+                        help="Learning rate schedule (cosine or exponential down to ep 20 when schedule-free is disabled)")
+    parser.add_argument("--disable_sf", action="store_true",
+                        help="Disable Schedule-Free iterate averaging, using standard weights with explicit LR scheduling")
     parser.add_argument("--adam_warmup_steps", type=int, default=100)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--param_encoding", type=str, default=codec.ENCODING_V2,
