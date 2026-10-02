@@ -195,17 +195,65 @@ def train(args):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {num_params:,}")
 
-    use_sf = (args.opt_family == "normuon_sf")
+    use_sf = (args.opt_family in ("normuon_sf", "modular"))
+    is_modular = (args.opt_family == "modular")
+
     if args.opt_family == "adamw":
         print("Using standard decoupled AdamW for all parameters")
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr_adam, weight_decay=args.weight_decay)
         opt_muon = None
         opt_adam = optimizer
+        opt_modular = None
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-5)
+    elif args.opt_family == "modular":
+        print("Using ModularOptimizer: 6-stage pipeline with all modular brakes active except SNR gate:")
+        print("  - Stage 1: Momentum Accumulation (beta1=0.9)")
+        print("  - Stage 2: Forward Whitening")
+        print("  - Stage 3: Core LMO Solver (Spectral with radius scale \\rho_\\ell)")
+        print("  - Stage 3b: NorMuon Per-Neuron Row Scaling (unit variance EMA)")
+        print("  - Stage 4: Reverse Unwhitening (Pullback with LIFO stack)")
+        print("  - Stage 5: Prodigy Escape Velocity (dual-norm coupled, snr_gate=False)")
+        print("  - Stage 6: Schedule-Free (c_warmup=200, power r=1), Radial Brake (0.85), Muon-SW & AdamC quadratic decays")
+        import sys
+        sat_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        if sat_path not in sys.path:
+            sys.path.insert(0, sat_path)
+        from stable_audio_tools.training.modular_opt import ModularOptimizer, build_modular_param_groups
+
+        groups = build_modular_param_groups(
+            model,
+            default_whitening="none",
+            spectral_lr=args.lr_muon,
+            sign_lr=args.lr_adam,
+            colnorm_lr=args.lr_adam,
+            spectral_wd=args.weight_decay,
+            sign_wd=args.weight_decay,
+            colnorm_wd=args.weight_decay,
+        )
+        opt_modular = ModularOptimizer(
+            groups,
+            lr=args.lr_adam,
+            radial_brake=args.radial_brake,
+            normuon=True,
+            normuon_beta=0.95,
+            schedule_free=True,
+            sf_beta=0.9,
+            sf_c_warmup=200,
+            muon_sw_decay=True,
+            adamc_decay=True,
+            warmup_steps=args.adam_warmup_steps,
+            snr_gate=False,
+            escape_velocity=True,
+        )
+        opt_muon = None
+        opt_adam = None
+        scheduler = None
+        print(opt_modular.summary())
     else:
         opt_muon, opt_adam = build_optimizers(model, lr_muon=args.lr_muon, lr_adam=args.lr_adam,
                                               weight_decay=args.weight_decay, radial_brake=args.radial_brake,
                                               adam_warmup_steps=args.adam_warmup_steps)
+        opt_modular = None
         scheduler = None
 
     best = None
@@ -216,7 +264,9 @@ def train(args):
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        if use_sf and opt_adam is not None:
+        if is_modular:
+            opt_modular.train()
+        elif use_sf and opt_adam is not None:
             opt_adam.train()
 
         train_loss = 0.0
@@ -227,10 +277,13 @@ def train(args):
             mel = mel.to(device)
             params = params.to(device)
 
-            if opt_muon:
-                opt_muon.zero_grad()
-            if opt_adam:
-                opt_adam.zero_grad()
+            if is_modular:
+                opt_modular.zero_grad()
+            else:
+                if opt_muon:
+                    opt_muon.zero_grad()
+                if opt_adam:
+                    opt_adam.zero_grad()
 
             if args.model_type == "resmlp":
                 loss = resmlp_loss(model(mel), params, w23)
@@ -240,10 +293,13 @@ def train(args):
             loss.backward()
             grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item())  # pre-clip norm
 
-            if opt_muon:
-                opt_muon.step()
-            if opt_adam:
-                opt_adam.step()
+            if is_modular:
+                opt_modular.step()
+            else:
+                if opt_muon:
+                    opt_muon.step()
+                if opt_adam:
+                    opt_adam.step()
 
             loss_val = loss.item()
             train_loss += loss_val
@@ -259,12 +315,18 @@ def train(args):
                 else:
                     dir_cosine = 1.0
                 w_norm = float(current_weights.norm().item())
-                up_norm = opt_muon.last_update_norm if opt_muon else 0.0
-                curr_lr = opt_adam.param_groups[0]["lr"] if opt_adam else 0.0
+                if is_modular:
+                    up_norm = opt_modular.component_telemetry.get("comp/spectral_update_norm", 0.0)
+                    curr_lr = opt_modular.param_groups[0].get("lr", 0.0)
+                else:
+                    up_norm = opt_muon.last_update_norm if opt_muon else 0.0
+                    curr_lr = opt_adam.param_groups[0]["lr"] if opt_adam else 0.0
+
                 with open(telemetry_path, "a") as f:
                     f.write(f"{global_step}\t{epoch}\t{batch_idx}\t{loss_val:.6f}\t{step_vel:.4f}\t{dir_cosine:.4f}\t{grad_norm:.4f}\t{w_norm:.4f}\t{up_norm:.4f}\t{curr_lr:.2e}\n")
                 if global_step % 100 == 0:
-                    print(f"Step {global_step:6d} [Ep {epoch:2d}/{args.epochs}] | Loss: {loss_val:.5f} | Vel: {step_vel:6.2f} | CosDir: {dir_cosine:+.3f} | ||g||: {grad_norm:.3f} | ||w||: {w_norm:.2f}")
+                    ev_info = f" | EV_d: {opt_modular.component_telemetry.get('comp/ev_d', 1.0):.2f}" if is_modular else ""
+                    print(f"Step {global_step:6d} [Ep {epoch:2d}/{args.epochs}] | Loss: {loss_val:.5f} | Vel: {step_vel:6.2f} | CosDir: {dir_cosine:+.3f} | ||g||: {grad_norm:.3f} | ||w||: {w_norm:.2f}{ev_info}")
                     sys.stdout.flush()
                 prev_delta = current_delta
                 prev_weights = current_weights
@@ -274,7 +336,9 @@ def train(args):
             scheduler.step()
 
         model.eval()
-        if use_sf and opt_adam is not None:
+        if is_modular:
+            opt_modular.eval()
+        elif use_sf and opt_adam is not None:
             opt_adam.eval()  # swap to the averaged iterate for eval + checkpointing
         val = validate(model, args.model_type, val_loader, w23, device,
                        max_batches=args.val_batches, flow_k=args.flow_val_draws, flow_steps=args.flow_val_steps)
@@ -294,7 +358,7 @@ def train(args):
         cat_acc = " ".join(f"{k}={v:.3f}" for k, v in val["val_cat_acc"].items())
         extra = (f" | 1-draw {val['flow_single_draw_score']:.5f} | best-of-{args.flow_val_draws} {val['flow_best_of_k_score']:.5f}"
                  if args.model_type == "flow" else "")
-        lr_display = opt_adam.param_groups[0]["lr"] if opt_adam else 0.0
+        lr_display = opt_modular.param_groups[0]["lr"] if opt_modular else (opt_adam.param_groups[0]["lr"] if opt_adam else 0.0)
         print(f"=== Epoch {epoch:3d}/{args.epochs:3d} === Train {train_loss:.5f} | Val score {val['val_score']:.5f} {star} "
               f"(cont wMSE {val['val_cont_wmse']:.5f}; acc {cat_acc}){extra} | LR {lr_display:.2e}")
         sys.stdout.flush()
@@ -302,7 +366,7 @@ def train(args):
     total_time = time.time() - t0
     print(f"\n[{args.run_id}] Finished in {total_time:.1f}s ({total_time/3600:.2f}h). Best val score: {best['val_score']:.5f} (epoch {best['epoch']})")
 
-    lr_main = args.lr_muon if args.opt_family == "normuon_sf" else args.lr_adam
+    lr_main = args.lr_muon if args.opt_family in ("normuon_sf", "modular") else args.lr_adam
     row = [
         args.run_id, args.model_type, args.opt_family, args.param_encoding, args.hidden_dim, args.num_layers,
         lr_main, args.lr_adam, args.batch_size, args.epochs, best["epoch"], f"{best['val_score']:.5f}",
@@ -319,8 +383,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--h5_path", type=str, default="/run/media/kim/Mantu/surge_dataset/surge_bass_200k.h5")
     parser.add_argument("--model_type", type=str, default="resmlp", choices=["resmlp", "flow"])
-    parser.add_argument("--opt_family", type=str, default="normuon_sf", choices=["normuon_sf", "adamw"],
-                        help="normuon_sf = Muon (hidden 2D) + Schedule-Free AdamW (rest); name kept for old scripts")
+    parser.add_argument("--opt_family", type=str, default="modular", choices=["normuon_sf", "adamw", "modular"],
+                        help="modular = full 6-stage ModularOptimizer with all modular brakes active except SNR gate")
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--num_layers", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=64)
