@@ -162,7 +162,10 @@ def validate(model, loader, normalizer, lambda_sig, device, max_batches=50, seed
 
 def main():
     parser = argparse.ArgumentParser(description="Train Synth-JEPA model")
-    parser.add_argument("--h5_path", type=str, default="/run/media/kim/Mantu/surge_dataset/surge_bass_200k.h5")
+    default_h5 = ("/run/media/kim/Kosmos/surge_dataset/surge_bass_200k.h5"
+                  if os.path.exists("/run/media/kim/Kosmos/surge_dataset/surge_bass_200k.h5")
+                  else "/run/media/kim/Mantu/surge_dataset/surge_bass_200k.h5")
+    parser.add_argument("--h5_path", type=str, default=default_h5)
     parser.add_argument("--out_dir", type=str, default="/run/media/kim/Mantu/surge_200k_models/synth_jepa_runs")
     parser.add_argument("--run_id", type=str, default="synth_jepa_v2_20ep")
     parser.add_argument("--epochs", type=int, default=20)
