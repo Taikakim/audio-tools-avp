@@ -102,6 +102,46 @@ $PY scripts/synth_inversion/train_bracket.py \
     --epochs 20 \
     --device "cuda:0"
 
+# Run 5: High-LR Muon (LR=1.0) with Cosine Annealing (disable Schedule-Free)
+echo -e "\n>>> Launching B05_resmlp_512d_muon_lr1_cosine_20ep <<<"
+$PY scripts/synth_inversion/train_bracket.py \
+    --h5_path "$H5_PATH" \
+    --output_dir "$OUT_DIR" \
+    --run_id "B05_resmlp_512d_muon_lr1_cosine_20ep" \
+    --model_type "resmlp" \
+    --opt_family "modular" \
+    --hidden_dim 512 \
+    --num_layers 6 \
+    --lr_muon 1.0 \
+    --lr_adam 0.003 \
+    --radial_brake 0.85 \
+    --adam_warmup_steps 100 \
+    --disable_sf \
+    --lr_schedule "cosine" \
+    --batch_size 64 \
+    --epochs 20 \
+    --device "cuda:0"
+
+# Run 6: High-LR Muon (LR=1.0) with Exponential Decay (disable Schedule-Free)
+echo -e "\n>>> Launching B06_resmlp_512d_muon_lr1_exp_20ep <<<"
+$PY scripts/synth_inversion/train_bracket.py \
+    --h5_path "$H5_PATH" \
+    --output_dir "$OUT_DIR" \
+    --run_id "B06_resmlp_512d_muon_lr1_exp_20ep" \
+    --model_type "resmlp" \
+    --opt_family "modular" \
+    --hidden_dim 512 \
+    --num_layers 6 \
+    --lr_muon 1.0 \
+    --lr_adam 0.003 \
+    --radial_brake 0.85 \
+    --adam_warmup_steps 100 \
+    --disable_sf \
+    --lr_schedule "exp" \
+    --batch_size 64 \
+    --epochs 20 \
+    --device "cuda:0"
+
 echo -e "\n=========================================================================="
 echo "=== Phase 2 Suite Complete at $(date) ==="
 cat "$OUT_DIR/leaderboard_v2.tsv"
