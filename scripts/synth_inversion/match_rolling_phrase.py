@@ -79,13 +79,16 @@ SEARCH_SPACE = [
 
 
 def load_phrase_midi(midi_path: str, duration_s: float):
+    """Note events (absolute seconds) before duration_s. Reads ALL tracks merged (v1 read only
+    track 0; in a type-1 file that is often the tempo track, which yields no notes and a silent
+    synth that DE then "matches")."""
     mid = mido.MidiFile(midi_path)
     ticks_per_beat = mid.ticks_per_beat
     current_tempo = 500000
 
     events = []
     current_time_s = 0.0
-    for msg in mid.tracks[0]:
+    for msg in mido.merge_tracks(mid.tracks):
         if msg.type == "set_tempo":
             current_tempo = msg.tempo
         current_time_s += mido.tick2second(msg.time, ticks_per_beat, current_tempo)
@@ -93,7 +96,8 @@ def load_phrase_midi(midi_path: str, duration_s: float):
             break
         if msg.type in ["note_on", "note_off"]:
             events.append(mido.Message(msg.type, note=msg.note, velocity=msg.velocity, time=current_time_s))
-
+    if not any(e.type == "note_on" and e.velocity > 0 for e in events):
+        raise ValueError(f"{midi_path}: no note-on events in the first {duration_s:.2f} s")
     return events
 
 
@@ -128,16 +132,13 @@ def match_rolling_phrase(stem_path: str = DEFAULT_STEM,
     events = load_phrase_midi(midi_path, phrase_dur)
     print(f"Loaded {len(events)} MIDI events over {phrase_dur:.2f}s.")
 
-    # 3. Setup Synth & Loss
-    synth = init_synth(verify=False)
-    # Prime synth to prevent block-0 muting
-    synth.process(np.zeros((2, 1024), dtype=np.float32), sr)
+    # 3. Setup Synth & Loss (init_synth primes the voice engine)
+    synth = init_synth()
 
     loss_stft = MultiScaleSTFTLoss()
 
     if filter_candidates is None:
-        # Benchmark top Goa trance lowpass circuits:
-        # idx 0: LP 24 dB, idx 1: LP OB-Xd 12 dB, idx 4: LP Vintage Ladder, idx 7: LP Diode Ladder
+        # Lowpass circuits (surge_spec.LP_FILTERS): 0 LP 12 dB, 1 LP 24 dB, 4 LP OB-Xd 12 dB, 7 LP Diode Ladder
         filter_candidates = [0, 1, 4, 7]
 
     bounds = [(lo, hi) for _, lo, hi in SEARCH_SPACE]
@@ -237,14 +238,9 @@ def match_rolling_phrase(stem_path: str = DEFAULT_STEM,
             "bpm": bpm,
             "duration_s": phrase_dur,
         },
-        copy_to_user_dir=True,
+        copy_to_user_dir=True,  # copies rolling_phrase_best.vstpreset into DAW_DIR (never overwrites)
     )
-
-    # Also copy preset to DAW AI Inversions directory
-    daw_preset_path = f"{DAW_DIR}/rolling_phrase_inversion.vstpreset"
-    import shutil
-    shutil.copy(f"{OUT_DIR}/rolling_phrase_best.vstpreset", daw_preset_path)
-    print(f"\nSaved DAW preset to: {daw_preset_path}")
+    print(f"\nSaved preset to {OUT_DIR}/rolling_phrase_best.vstpreset (and a copy in {DAW_DIR})")
     print(f"Saved audio renders to: {OUT_DIR}/")
 
     # Generate Comparison Plot: Waveform, Envelope Contour, and Spectrogram

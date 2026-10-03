@@ -145,7 +145,7 @@ def main():
     with open(sum_path, "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\nEvaluation complete. Full report written to: {sum_path}")
-    print(f"Patches exported to DAW directory: ~/Documents/Surge XT/Patches/AI Inversions/")
+    print(f"Patches (.json / .vstpreset) written next to the clips in {args.out_dir}")
 
 
 if __name__ == "__main__":

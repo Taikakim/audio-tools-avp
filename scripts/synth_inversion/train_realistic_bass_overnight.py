@@ -33,7 +33,6 @@ v2 (2026-10-02 review). What changed and why:
 import argparse
 import glob
 import json
-import math
 import os
 import signal
 import sys
@@ -242,7 +241,10 @@ def train(args):
 
     loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin), batch_size=args.batch_size,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
-                        persistent_workers=args.num_workers > 0, worker_init_fn=_worker_init)
+                        persistent_workers=args.num_workers > 0, worker_init_fn=_worker_init,
+                        # spawn, not fork: the main process has loaded Surge (validation renders),
+                        # and a forked copy of the plugin/audio state can deadlock
+                        multiprocessing_context="spawn" if args.num_workers > 0 else None)
     batches = iter(loader)
 
     latest = os.path.join(args.out_dir, "checkpoint_latest.pt")

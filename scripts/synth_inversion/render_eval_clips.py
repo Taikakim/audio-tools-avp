@@ -90,6 +90,8 @@ def main():
             sf.write(out_wav, best_audio, SAMPLE_RATE)
             
             results[base][stem_name] = {
+                # flow: best of 8 renders chosen AGAINST THE TARGET (renderer in the loop), not draw 0
+                "selection": "best_of_8_vs_target" if flow else "point",
                 "filter": LP_FILTERS[best_patch["filter_idx"]][0],
                 "waveshaper": WAVESHAPER_TYPES[best_patch["ws_idx"]][0],
                 "stft_loss": best_loss,

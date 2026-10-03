@@ -70,6 +70,8 @@ class SurgeOnlineDataset(Dataset):
 
     Seeds are drawn strictly from [min_seed, ...) to guarantee ZERO overlap with the
     validation set (which occupies seeds 5000 + 160000 .. 5000 + 200000 in the H5).
+    Sample idx of epoch e uses seed min_seed + e * length + idx, so every epoch is new audio
+    (set .epoch before iterating; v1 used min_seed + idx and replayed the same patches).
     Workers generate raw audio waveforms on CPU; the GPU calculates ExactGpuMel in batches.
     """
     def __init__(self, length=160000, min_seed=1_000_000, plugin_path=None):
@@ -82,6 +84,7 @@ class SurgeOnlineDataset(Dataset):
         h5_val_max = SEED_OFFSET + 200_000
         assert min_seed > h5_val_max, f"min_seed {min_seed} intersects H5 val range [..., {h5_val_max}]"
         self._synth = None
+        self.epoch = 0
 
     def __len__(self):
         return self.length
@@ -95,7 +98,7 @@ class SurgeOnlineDataset(Dataset):
     def __getitem__(self, idx):
         from surge_spec import draw_patch, patch_to_vector, render_patch
 
-        seed = self.min_seed + idx
+        seed = self.min_seed + self.epoch * self.length + idx
         patch = draw_patch(seed)
         synth = self._get_synth()
         audio = render_patch(synth, patch, patch["midi_note"], patch["note_dur"])
@@ -205,8 +208,12 @@ def main():
         train_ds = SurgeH5Dataset(args.h5_path, split="train")
 
     val_ds = SurgeH5Dataset(args.h5_path, split="val")
+    # spawn: online workers each load their own Surge; forking a process that has touched the
+    # plugin/audio stack can deadlock
+    mp_ctx = torch.multiprocessing.get_context("spawn") if args.online and args.num_workers > 0 else None
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=not args.online,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                              num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                              multiprocessing_context=mp_ctx)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2, drop_last=True)
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
@@ -231,6 +238,8 @@ def main():
     open(log_path, "w").close()
     for epoch in range(1, args.epochs + 1):
         model.train()
+        if args.online:
+            train_ds.epoch = epoch - 1
         sums, n_b, t0 = dict(loss=0.0, lp=0.0, la=0.0, sa=0.0, sp=0.0), 0, time.time()
         for batch_item1, batch_item2 in train_loader:
             if step >= total_steps:

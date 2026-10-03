@@ -78,7 +78,7 @@ confirming the differences are cosmetic.
 
 **Tests (no Surge, no GPU):**
 ```
-python -m pytest -q test_synth_inversion.py      # ~20 s; expect "33 passed"
+python -m pytest -q test_synth_inversion.py      # ~20 s; expect "39 passed"
 ```
 
 **Generate a dataset** (v2 also stores `note_dur` and generator attributes; params are identical to v1 for the same seeds):

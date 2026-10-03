@@ -12,7 +12,6 @@ directly into ~/Documents/Surge XT/Patches/AI Inversions/.
 
 import os
 import sys
-import shutil
 import numpy as np
 import soundfile as sf
 import librosa
@@ -29,9 +28,7 @@ from audio_utils import save_patch, MultiScaleSTFTLoss
 from envelope_extractor import compute_bass_match_loss, lowpass_300hz, zolzer_envelope_follower
 
 DAW_DIR = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
-os.makedirs(DAW_DIR, exist_ok=True)
 BENCH_DIR = "/run/media/kim/Mantu/surge_200k_models/stem_inversion_results/multi_artist_benchmarks"
-os.makedirs(BENCH_DIR, exist_ok=True)
 
 TARGETS = [
     {
@@ -133,8 +130,7 @@ def invert_track(target: dict):
     y_target = y_raw.astype(np.float32)
     y_target = y_target / (np.max(np.abs(y_target)) + 1e-7)
 
-    synth = init_synth(sample_rate=sr)
-    synth.process(np.zeros((2, 1024), dtype=np.float32), 1024 / sr, sr, 2)
+    synth = init_synth(sample_rate=sr)  # (v1's extra "prime" call ran the plugin at sample_rate=0.023 Hz)
 
     loss_stft = MultiScaleSTFTLoss()
     filter_candidates = [0, 1, 4, 7]  # LP 12dB, LP 24dB, OB-Xd 12dB, Diode Ladder
@@ -210,12 +206,9 @@ def invert_track(target: dict):
             "stft_loss": stft_val,
             "bass_metrics": bass_metrics,
         },
-        copy_to_user_dir=True,
+        copy_to_user_dir=True,  # copies <prefix>.vstpreset into DAW_DIR (never overwrites)
     )
-
-    daw_preset_path = f"{DAW_DIR}/{target['prefix']}_inversion.vstpreset"
-    if os.path.exists(f"{out_prefix}.vstpreset"):
-        shutil.copy(f"{out_prefix}.vstpreset", daw_preset_path)
+    daw_preset_path = f"{DAW_DIR}/{target['prefix']}.vstpreset"
 
     fig, axs = plt.subplots(3, 1, figsize=(14, 10))
     t_axis = np.linspace(0, phrase_dur, len(y_target))
@@ -257,6 +250,7 @@ def invert_track(target: dict):
 
 
 def main():
+    os.makedirs(BENCH_DIR, exist_ok=True)
     for target in TARGETS:
         invert_track(target)
     print("\n" + "=" * 70)

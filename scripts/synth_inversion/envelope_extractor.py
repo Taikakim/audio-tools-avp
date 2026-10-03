@@ -262,13 +262,29 @@ def profile_note_envelope(audio: np.ndarray, fs: int = 44100, bpm: float = 143.0
     sc_sustain = float(np.median(sc[int(len(sc) * 0.4):int(len(sc) * 0.8)])) if len(sc) > 4 else 400.0
     feg_sweep_ratio = float(sc_peak / max(100.0, sc_sustain))
 
-    # 8. Surge XT parameter suggestions
-    sug_aeg_decay = float(np.clip(aeg_half_ms / 150.0, 0.05, 0.65))
-    sug_aeg_sustain = float(np.clip(sustain_level * 0.85, 0.0, 0.80))
-    sug_aeg_release = float(np.clip(100.0 / max(20.0, rel_rate), 0.02, 0.40))
-    sug_feg_decay = float(np.clip(feg_half_ms / 120.0, 0.03, 0.65))
-    sug_feg_amount = float(np.clip((feg_sweep_ratio - 1.0) / 4.0 + 0.3, 0.20, 0.95))
-    sug_cutoff = float(np.clip((sc_sustain - 150.0) / 3000.0, 0.08, 0.90))
+    # 8. Surge XT parameter suggestions, in the 23-d vector units (= Surge raw values) and
+    #    clipped to the uniform-prior training box. v1 mapped times and frequencies LINEARLY
+    #    (half-life / 150 ms, (centroid - 150) / 3000 Hz), but Surge's envelope times are
+    #    log2-seconds over [-8, 5] and its cutoff is semitones re 440 Hz over [-60, 70], so a
+    #    50 ms decay came out as 0.33 instead of 0.28 and anything over 100 ms hit the clip.
+    #    Decay time ~ time to fall 20 dB (tenth-life); release time ~ time to fall 60 dB at the
+    #    measured release rate; cutoff ~ the sustain-phase spectral centroid. These are proxies
+    #    (Surge's envelope curves are not single exponentials), meant as a search prior only.
+    from surge_spec import CONT_BOUNDS
+
+    def env_raw(seconds):
+        return (math.log2(max(seconds, 2.0 ** -8)) + 8.0) / 13.0
+
+    def box(name, v):
+        lo, hi = CONT_BOUNDS[name]
+        return float(np.clip(v, lo, hi))
+
+    sug_aeg_decay = box("aeg_decay", env_raw(aeg_tenth_ms / 1000.0))
+    sug_aeg_sustain = box("aeg_sustain", sustain_level)
+    sug_aeg_release = box("aeg_release", env_raw(60.0 / max(rel_rate, 1.0)))
+    sug_feg_decay = box("feg_decay", env_raw(feg_tenth_ms / 1000.0))
+    sug_feg_amount = box("feg_amount", (feg_sweep_ratio - 1.0) / 4.0 + 0.3)  # heuristic, unchanged
+    sug_cutoff = box("cutoff", (12.0 * math.log2(max(sc_sustain, 20.0) / 440.0) + 60.0) / 130.0)
 
     suggested = {
         "a_amp_eg_decay": sug_aeg_decay,

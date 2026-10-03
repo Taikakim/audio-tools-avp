@@ -6,11 +6,25 @@ References:
   - Barkan et al., "InverSynth II", ISMIR 2023 [11].
 
 Characteristics:
-  * 139 active parameters covering 3 Oscillators, Mixer, Dual Filters, Envelopes,
-    and 6 LFOs.
+  * 139 parameters covering 3 Oscillators, Mixer, Dual Filters, Envelopes, and 6 LFOs.
   * Audio effects are strictly disabled (all FX slots set to bypass/0.0).
-  * Non-deterministic modulators (Random / S&H) are excluded.
   * Standard audio rendering: 3.0 seconds, stereo, 44.1 kHz.
+
+v2 (2026-10-03 review). v1 assumed every enum's length (osc type 7, filter type 12, unison
+voices 8, LFO type 5 "deterministic", ...) and set raw = class/(n-1). Surge's real lists are
+longer (e.g. 34 filter types, see surge_spec.LP_FILTERS), so class k landed on an arbitrary list
+entry, and the five "deterministic" LFO classes swept the WHOLE LFO list, including Noise, S&H,
+Step Seq and MSEG. It also silently skipped any name the plugin does not expose. Now:
+  * verify_param_names() fails loudly if any of the 139 names is missing from the plugin;
+  * calibrate_enums() reads each enum's real entries from the plugin (sweeping raw values and
+    collecting the distinct display strings), drops entries that make a training sample
+    meaningless (LFO shapes other than Sine/Triangle/Square/Sawtooth, which are random or
+    sequenced; the Audio Input oscillator, which is silent), and returns class -> raw tables;
+  * the mute switches are categorical (on/off), not continuous;
+  * render_patch_139() returns None for a silent render (e.g. every oscillator muted), so the
+    dataset can redraw instead of training on a normalised noise floor.
+Known gap, not fixed: in a default patch the LFOs are not routed to anything, so their 60
+parameters have no audible effect; the paper's parameterisation presumably includes routings.
 """
 
 import os
@@ -23,6 +37,7 @@ DURATION_S = 3.0
 NUM_SAMPLES = int(SAMPLE_RATE * DURATION_S)  # 132,300 samples
 NUM_PARAMS = 139
 DEFAULT_PLUGIN_PATH = "~/.vst3/Surge XT.vst3"
+SILENCE_PEAK = 1e-5
 
 # 139 Parameters in canonical order
 PARAM_NAMES: List[str] = []
@@ -130,45 +145,76 @@ assert len(PARAM_NAMES) == 139, f"Expected 139 parameters, got {len(PARAM_NAMES)
 
 PARAM_INDEX: Dict[str, int] = {name: i for i, name in enumerate(PARAM_NAMES)}
 
-# Categorical parameters: (index, n_classes)
-# Surge XT parameter enum sizes
-CATEGORICAL_MAP = {
-    "a_osc_1_type": 7, "a_osc_2_type": 7, "a_osc_3_type": 7,
-    "a_osc_1_unison_voices": 8, "a_osc_2_unison_voices": 8, "a_osc_3_unison_voices": 8,
-    "a_osc_1_route": 3, "a_osc_2_route": 3, "a_osc_3_route": 3,
-    "a_filter_1_type": 12, "a_filter_2_type": 12,
-    "a_filter_configuration": 4,
-    "a_waveshaper_type": 6,
-    "a_fm_routing": 3,
-}
-for lfo in range(1, 7):
-    CATEGORICAL_MAP[f"a_lfo_{lfo}_type"] = 5  # Sine, Tri, Square, Ramp, Noise (deterministic)
-
-CAT_INDICES: List[Tuple[int, int]] = [
-    (PARAM_INDEX[name], k) for name, k in CATEGORICAL_MAP.items() if name in PARAM_INDEX
-]
-CAT_INDEX_SET = {i for i, _ in CAT_INDICES}
+# Which parameters are categorical. Their class lists come from the plugin (calibrate_enums).
+CATEGORICAL_NAMES = (
+    [f"a_osc_{o}_{p}" for o in (1, 2, 3) for p in ("type", "unison_voices", "route", "mute")]
+    + ["a_ring_modulation_1x2_mute", "a_ring_modulation_2x3_mute", "a_filter_1_type", "a_filter_2_type",
+       "a_filter_configuration", "a_waveshaper_type", "a_fm_routing"]
+    + [f"a_lfo_{lfo}_type" for lfo in range(1, 7)]
+)
+CAT_INDEX_SET = {PARAM_INDEX[n] for n in CATEGORICAL_NAMES}
 CONT_INDICES: List[int] = [i for i in range(NUM_PARAMS) if i not in CAT_INDEX_SET]
 
+# Entries excluded from enum classes (lower-case substrings of the display string)
+LFO_KEEP = ("sine", "tri", "square", "saw")  # periodic and deterministic
+OSC_TYPE_DROP = ("audio in",)                 # silent without an input signal
 
-def draw_patch_139(seed: int) -> dict:
-    """Draw a random 139-parameter patch from the synthesizer prior."""
-    rng = np.random.default_rng(seed)
 
-    patch = {}
-    for i, name in enumerate(PARAM_NAMES):
-        if i in CAT_INDEX_SET:
-            n_classes = next(k for idx, k in CAT_INDICES if idx == i)
-            patch[name] = float(rng.integers(0, n_classes) / max(1, n_classes - 1))
+def verify_param_names(plugin) -> None:
+    missing = [n for n in PARAM_NAMES if n not in plugin.parameters]
+    if missing:
+        raise RuntimeError(f"{len(missing)} of the 139 parameter names are not exposed by this plugin: {missing[:12]}"
+                           f"{' ...' if len(missing) > 12 else ''}. Fix PARAM_NAMES in surge_139_spec.py.")
+
+
+def _sweep_enum(param, steps: int = 2049) -> List[Tuple[str, float]]:
+    """Distinct display strings in raw order -> [(display, raw at the middle of its band)]."""
+    old = param.raw_value
+    bands = []
+    for r in np.linspace(0.0, 1.0, steps):
+        param.raw_value = float(r)
+        s = str(param.string_value)
+        if bands and bands[-1][0] == s:
+            bands[-1][2] = float(r)
         else:
-            # Continuous raw parameter in [0.0, 1.0]
-            patch[name] = float(rng.uniform(0.0, 1.0))
+            bands.append([s, float(r), float(r)])
+    param.raw_value = old
+    return [(s, 0.5 * (lo + hi)) for s, lo, hi in bands]
 
-    # Musical pitch & duration
+
+def calibrate_enums(plugin) -> Dict[str, List[Tuple[str, float]]]:
+    """{categorical name: [(display, raw)] per class}, read from the plugin."""
+    tables = {}
+    for name in CATEGORICAL_NAMES:
+        entries = _sweep_enum(plugin.parameters[name])
+        if "_lfo_" in name and name.endswith("_type"):
+            entries = [e for e in entries if any(k in e[0].lower() for k in LFO_KEEP)]
+        elif name.startswith("a_osc_") and name.endswith("_type"):
+            entries = [e for e in entries if not any(k in e[0].lower() for k in OSC_TYPE_DROP)]
+        if len(entries) < 2:
+            raise RuntimeError(f"{name}: enum calibration found {len(entries)} usable entries ({entries})")
+        tables[name] = entries
+    return tables
+
+
+def cat_indices(tables) -> List[Tuple[int, int]]:
+    """[(vector index, n_classes)] in PARAM_NAMES order."""
+    return [(i, len(tables[n])) for i, n in enumerate(PARAM_NAMES) if n in tables]
+
+
+def draw_patch_139(seed: int, tables) -> dict:
+    """Draw a random 139-parameter patch from the uniform prior. Categoricals are stored as
+    class / (n - 1), continuous parameters as their raw value."""
+    rng = np.random.default_rng(seed)
+    patch = {}
+    for name in PARAM_NAMES:
+        if name in tables:
+            n = len(tables[name])
+            patch[name] = float(rng.integers(0, n) / (n - 1))
+        else:
+            patch[name] = float(rng.uniform(0.0, 1.0))
     patch["midi_note"] = int(rng.integers(24, 96))
     patch["note_dur"] = float(rng.uniform(0.2, 2.5))
-
-    # Audio effects explicitly bypassed
     patch["fx_bypass"] = True
     return patch
 
@@ -187,9 +233,11 @@ def vector_to_patch_139(vec: np.ndarray, midi_note: int = 60, note_dur: float = 
     return patch
 
 
-def init_synth_139(plugin_path: str = DEFAULT_PLUGIN_PATH, sample_rate: int = SAMPLE_RATE):
+def init_synth_139(plugin_path: str = DEFAULT_PLUGIN_PATH, sample_rate: int = SAMPLE_RATE, verify: bool = True):
     import pedalboard
     synth = pedalboard.load_plugin(os.path.expanduser(plugin_path))
+    if verify:
+        verify_param_names(synth)
     synth.parameters["active_scene"].raw_value = 0.0
 
     # Explicitly silence / bypass ALL FX slots to eliminate delay / chorus
@@ -205,11 +253,14 @@ def init_synth_139(plugin_path: str = DEFAULT_PLUGIN_PATH, sample_rate: int = SA
     return synth
 
 
-def apply_patch_139(plugin, patch: dict) -> None:
+def apply_patch_139(plugin, patch: dict, tables) -> None:
     P = plugin.parameters
     for name in PARAM_NAMES:
-        if name in patch and name in P:
-            P[name].raw_value = float(patch[name])
+        v = float(patch[name])
+        if name in tables:
+            n = len(tables[name])
+            v = tables[name][int(np.clip(round(v * (n - 1)), 0, n - 1))][1]
+        P[name].raw_value = v
 
     # Ensure all FX output mixes are 0.0 (Strictly dry)
     for k in ["fx_a1_output_mix", "fx_a2_output_mix", "fx_a3_output_mix", "fx_a4_output_mix"]:
@@ -217,18 +268,19 @@ def apply_patch_139(plugin, patch: dict) -> None:
             P[k].raw_value = 0.0
 
 
-def render_patch_139(plugin, patch: dict, midi_note: int, note_dur: float,
-                     duration: float = DURATION_S, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Render 3.0s stereo audio; returns peak-normalised float32 array [2, NUM_SAMPLES]."""
+def render_patch_139(plugin, patch: dict, midi_note: int, note_dur: float, tables,
+                     duration: float = DURATION_S, sample_rate: int = SAMPLE_RATE):
+    """Render 3.0 s stereo; peak-normalised float32 [2, NUM_SAMPLES], or None if silent."""
     import mido
 
-    apply_patch_139(plugin, patch)
+    apply_patch_139(plugin, patch, tables)
     plugin.reset()
     events = [
         mido.Message("note_on", note=int(midi_note), velocity=105, time=0.0),
         mido.Message("note_off", note=int(midi_note), velocity=0, time=float(note_dur)),
     ]
     audio = plugin.process(events, duration=duration, sample_rate=sample_rate, num_channels=2)
-    # audio shape: [2, NUM_SAMPLES]
-    peak = np.max(np.abs(audio)) + 1e-7
+    peak = float(np.max(np.abs(audio)))
+    if not np.isfinite(peak) or peak < SILENCE_PEAK:
+        return None
     return (audio / peak).astype(np.float32)

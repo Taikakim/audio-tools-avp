@@ -13,11 +13,30 @@ from `/home/kim/Projects/SAO/stable-audio-tools/scripts/synth_inversion`.
 | `watchdog_supervisor.py` | Halved LR and doubled batch on noise (5 rising 50-step averages ≈ once per 120 log lines). Rolled back to a `checkpoint_best.pt` that was never written. Sent SIGTERM first, so the bad state was saved. | Crash-only. Restarts on non-zero exit or a stalled log (20 min). Gives up after 5 restarts per hour. Never touches hyperparameters. |
 | `synth_jepa_search.py` + eval scripts | Search box was always the uniform prior's `CONT_BOUNDS`, so it searched chorus/delay that the realistic model never saw. | `SynthJEPASearcher(bounds=...)`; `checkpoint_bounds(path)` reads the checkpoint's `prior_bounds`. Wired into `evaluate_holdout_audio`, `evaluate_200k_inversion`, `evaluate_envelope_guided_search` and `render_jepa_clips`. |
 
-Tests: `python -m pytest -q test_synth_inversion.py` should report 33 passed. The new tests are a
+Tests: `python -m pytest -q test_synth_inversion.py` should report 39 passed (after round 2 below). The new tests are a
 calibration accept/reject, an XML → vector → `apply_patch` raw-value round trip, skip/zeroing rules,
 prior spike rates / bounds / no edge pile-up / categoricals copied, trainer fresh → resume → exports
 → search, refusal of v1 checkpoints, and watchdog restart/give-up.
 **None of this has run against real Surge or on the GPU.** Step 1 below is the first real check.
+
+## Round 2 (2026-10-03): everything else on the branch
+
+| File | Problem | Fix |
+|---|---|---|
+| `train_synth_jepa.py --online` | Seeds were `min_seed + idx`, so every epoch re-rendered the **same 160k patches**. "Online" was just an uncached fixed dataset. | Seed = `min_seed + epoch·length + idx`. The DataLoader now uses spawn instead of fork. |
+| `train_realistic_bass_overnight.py` | `1ddaf61` frees the main-process synth before the fork. `del` doesn't guarantee the plugin unloads. | Also uses spawn workers, which never inherit the main process's plugin or audio state. |
+| `train_synth_jepa_139.py` + `surge_139_spec.py` | (a) Enum sizes were guessed (osc 7, filter 12, voices 8, LFO 5) and raw = class/(n−1). The five "deterministic" LFO classes actually swept the whole LFO list, including Noise, S&H, Step Seq and MSEG. (b) Names the plugin lacks were silently skipped. (c) Retrieval was the cosine between z_a and z_p, two different spaces, so it measured nothing, and "best" was chosen by it. (d) Same per-epoch seed replay. (e) Mute switches were treated as continuous, and all-muted renders trained as normalised silence. | Enum classes are read from the plugin (sweeping raw values and collecting display strings). LFO shapes are limited to Sine/Triangle/Square/Sawtooth and Audio Input is dropped. Missing names now fail loudly. Retrieval goes through the predictors over the whole validation set, and best is chosen by validation loss. Seeds advance per epoch. Mutes are categorical and silent renders are redrawn. Added `--lambda_sig` (default still 0.1), gradient clipping and atomic checkpoints that include the enum tables. **Old `jepa_139_online_v1` checkpoints won't load into the new model** (class counts changed). |
+| `envelope_extractor.py` | The envelope-guided search's suggestions used linear maps for log-scaled controls: decay half-life ÷ 150 ms, and cutoff (centroid − 150 Hz) ÷ 3000. | Uses Surge's scales: envelope times as log2 seconds over [−8, 5], cutoff as semitones relative to 440 Hz over [−60, 70]. Decay uses the 20 dB time and release the 60 dB time. Values are clipped to the training box. |
+| `audio_utils.py` | `save_patch` copied every preset into `~/Documents/Surge XT/Patches/AI Inversions/` **by default**, overwriting same-named files. `ExactGpuMel.to()` raised `NameError` (torch wasn't imported). | The copy is opt-in (`copy_to_user_dir=True`) and never overwrites (it uses `_2`, `_3`, …). `.to()` is fixed. |
+| `benchmark_ground_truth_reconstruction.py` | The inverter's input was 0.8 s cut from a rolling phrase (6+ overlapping notes), which is out of distribution, and best-of-8 was scored against that chunk. | The input is one note rendered alone, as in training. The out-of-distribution warning fires for gates under 180 ms, and best-of-8 is labelled as peeking at the target. |
+| `benchmark_multi_artist.py`, `warm_mel_inversion.py`, `benchmark_ground_truth_reconstruction.py` | A "prime" call, `process(array, 1024/sr, sr, 2)`, was an *effect* call at sample_rate = 0.023 Hz. Directories on Mantu were created at import time. There was a duplicate DAW copy under a second name. | Prime call removed (`init_synth` already primes). Directories are created in `main()`. A single DAW copy is made via `save_patch`. |
+| `match_rolling_phrase.py` | Read only MIDI track 0, which in a type-1 file is often the tempo track. That means no notes, and DE "matched" a silent synth. Filter-index comment was wrong. | Tracks are merged, and it errors if there are no note-ons. Comment corrected. |
+| `render_eval_clips.py` | Flow results were best-of-8 chosen against the target, unlabelled. | Labelled `selection: best_of_8_vs_target`. |
+
+The 139-parameter run has its own gaps (not fixed, design decisions):
+- The LFOs aren't routed to anything in a default patch, so their 60 parameters are inert.
+- The MIDI note (24–96) and note length aren't in the parameter vector, so the model can't
+  attribute pitch to anything.
 
 ## Known, not fixed (needs your ears or a decision)
 - **FM depth may be inert in every dataset.** `surge_spec.init_synth` never sets the FM routing.

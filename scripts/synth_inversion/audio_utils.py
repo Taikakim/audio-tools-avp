@@ -53,6 +53,8 @@ class ExactGpuMel:
         self.window = torch.from_numpy(win).float().to(self.device)
 
     def to(self, device):
+        import torch
+
         self.device = torch.device(device)
         self.mel_fb = self.mel_fb.to(self.device)
         self.window = self.window.to(self.device)
@@ -178,7 +180,7 @@ def compute_wmfcc(ref_audio: np.ndarray, syn_audio: np.ndarray, sr: int = SAMPLE
     return float(cost_matrix[-1, -1] / max(1, len(wp)))
 
 
-def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_user_dir: bool = True) -> None:
+def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_user_dir: bool = False) -> None:
     """Export a matched patch for DAW workflows.
 
     Writes:
@@ -186,8 +188,12 @@ def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_
       2. <stem>.pedalboard_state: pedalboard raw_state blob.
       3. <stem>.vstpreset: native Steinberg VST3 preset container directly loadable
          in Bitwig, Ableton, FL Studio, Reaper, Cubase, etc.
-      4. Optionally installs <stem>.vstpreset directly into
-         ~/Documents/Surge XT/Patches/AI Inversions/ for instant access in Surge's patch browser.
+      4. copy_to_user_dir=True: also copies <stem>.vstpreset into
+         ~/Documents/Surge XT/Patches/AI Inversions/ (opt-in since the 2026-10-03 review: it was
+         the default, so every evaluation run wrote into the home directory and overwrote
+         same-named presets). An existing file there is never overwritten; a numbered name is used.
+         Note: a DAW's VST3 preset browser on Linux looks in ~/.vst3/presets/<vendor>/<plugin>/;
+         Surge's own patch browser lists .fxp patches. Check where your host picks these up.
     """
     import os
 
@@ -213,8 +219,10 @@ def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_
             user_patches_dir = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
             try:
                 os.makedirs(user_patches_dir, exist_ok=True)
-                preset_name = os.path.basename(vstpreset_path)
-                target_dest = os.path.join(user_patches_dir, preset_name)
+                base = os.path.splitext(os.path.basename(vstpreset_path))[0]
+                target_dest, k = os.path.join(user_patches_dir, base + ".vstpreset"), 2
+                while os.path.exists(target_dest):
+                    target_dest, k = os.path.join(user_patches_dir, f"{base}_{k}.vstpreset"), k + 1
                 with open(target_dest, "wb") as f:
                     f.write(preset_bytes)
             except Exception as e:

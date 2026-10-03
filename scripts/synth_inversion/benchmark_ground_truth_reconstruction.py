@@ -16,7 +16,6 @@ Process:
 
 import os
 import sys
-import shutil
 import numpy as np
 import soundfile as sf
 import librosa
@@ -33,9 +32,7 @@ from inference import load_inverter, predict_vectors, vectors_to_patches
 
 DAW_DIR = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
 OUT_DIR = "/run/media/kim/Mantu/surge_200k_models/stem_inversion_results/ground_truth_benchmark"
-os.makedirs(OUT_DIR, exist_ok=True)
 EVAL_DIR = f"{OUT_DIR}/eval_clips"
-os.makedirs(EVAL_DIR, exist_ok=True)
 
 # 4 Ground-Truth Archetypes (Classic Goa/Psy & Techno Basslines)
 GROUND_TRUTH_PATCHES = [
@@ -46,7 +43,7 @@ GROUND_TRUTH_PATCHES = [
         "bpm": 140.0,
         "patch": {
             "midi_note": 36,
-            "filter_idx": 1,     # LP 24 dB (Moog ladder)
+            "filter_idx": 1,     # LP 24 dB
             "shape": 0.0,        # 100% Pure Sawtooth
             "width": 0.50,
             "sub_mix": 0.0,      # Single oscillator
@@ -183,8 +180,10 @@ def build_rolling_events(note: int, bpm: float, bars: int = 2):
 
 def main():
     sr = 44100
+    os.makedirs(EVAL_DIR, exist_ok=True)
+    # (v1 "primed" the synth with process(array, 1024/sr, sr, 2), which pedalboard reads as an
+    # EFFECT call with sample_rate = 0.023 Hz; init_synth already primes the voice engine.)
     synth = init_synth(sample_rate=sr)
-    synth.process(np.zeros((2, 1024), dtype=np.float32), 1024/sr, sr, 2)
     loss_fn = MultiScaleSTFTLoss()
 
     # Load neural inverter (Flow matching model)
@@ -212,25 +211,28 @@ def main():
         mono_gt = np.mean(audio_gt, axis=0).astype(np.float32)
         mono_gt = mono_gt / (np.max(np.abs(mono_gt)) + 1e-7)
 
-        # 2. Extract single 0.8s representative note for the neural inverter input
-        # Note starts at first offbeat 16th
+        # 2. Model input: ONE note rendered alone, the way the training data was made. v1 cut
+        # 0.8 s out of the rolling phrase, which holds 6+ overlapping 16th notes: an input the
+        # model never saw in training, so the benchmark measured generalisation to phrases.
         sixteenth = (60.0 / bpm) / 4.0
-        start_samp = int(sixteenth * sr)
-        note_chunk = mono_gt[start_samp : start_samp + int(0.8 * sr)]
-        if len(note_chunk) < int(0.8 * sr):
-            note_chunk = np.pad(note_chunk, (0, int(0.8 * sr) - len(note_chunk)))
+        gate = sixteenth * 0.85
+        note_chunk = render_patch(synth, p_gt, note, note_dur=gate, duration=0.8, sample_rate=sr)
+        if gate < 0.18:
+            print(f"  NOTE: gate {gate * 1000:.0f} ms is shorter than the training notes (180-450 ms): "
+                  "out of distribution for the inverter")
 
         mel = torch.from_numpy(make_mel_spec(note_chunk)).unsqueeze(0)
 
         # 3. Model Prediction (Inference)
         vecs, _ = predict_vectors(model, mel, n_draws=8, steps=25)
-        # Evaluate candidate draws against the note
+        # Best of 8 draws, each rendered and scored against the reference note: this peeks at the
+        # target (renderer in the loop), so it is an upper bound, not the model's single-shot output.
         cand_patches = vectors_to_patches(vecs[:, 0])
         best_p = None
         best_l = float("inf")
         for cp in cand_patches:
             # Render single note to pick best draw
-            r_audio = render_patch(synth, cp, note, note_dur=sixteenth * 0.85, duration=0.8, sample_rate=sr)
+            r_audio = render_patch(synth, cp, note, note_dur=gate, duration=0.8, sample_rate=sr)
             l = loss_fn(r_audio, note_chunk)
             if l < best_l:
                 best_l = l
@@ -248,7 +250,7 @@ def main():
         cent_gt = np.mean(librosa.feature.spectral_centroid(y=mono_gt, sr=sr))
         cent_pred = np.mean(librosa.feature.spectral_centroid(y=mono_pred, sr=sr))
 
-        print(f"RESULTS FOR {name}:")
+        print(f"RESULTS FOR {name} (best of 8 draws, chosen against the reference note):")
         print(f"  STFT Loss:          {stft_loss:.3f}")
         print(f"  Centroid:           GT: {cent_gt:.1f} Hz | Pred: {cent_pred:.1f} Hz (Ratio: {cent_pred/cent_gt:.2f}x)")
         print(f"  Circuit:            GT: {LP_FILTERS[p_gt['filter_idx']][0]} | Pred: {LP_FILTERS[best_p['filter_idx']][0]}")
@@ -272,8 +274,7 @@ def main():
         sf.write(f"{EVAL_DIR}/{name}_stereo_L_gt_R_pred.wav", stereo, sr)
 
         # Save Presets
-        save_patch(synth, best_p, f"{OUT_DIR}/{name}_predicted", copy_to_user_dir=True)
-        shutil.copy(f"{OUT_DIR}/{name}_predicted.vstpreset", f"{DAW_DIR}/{name}_predicted.vstpreset")
+        save_patch(synth, best_p, f"{OUT_DIR}/{name}_predicted", copy_to_user_dir=True)  # also copies to DAW_DIR
 
         # 7. Comparison Diagnostic Plot
         fig, axs = plt.subplots(3, 1, figsize=(14, 10))

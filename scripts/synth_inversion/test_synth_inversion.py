@@ -711,3 +711,125 @@ def test_watchdog_restarts_on_crash_and_gives_up(tmp_path):
     assert rc == 1 and log.count("Launching") == 3 and "Giving up" in log
     assert wd.main(["--out_dir", str(tmp_path / "ok"), "--poll_s", "0.05", "--",
                     sys.executable, "-c", "pass"]) == 0
+
+
+def test_exact_gpu_mel_to_device():
+    from audio_utils import ExactGpuMel
+    m = ExactGpuMel(device="cpu").to("cpu")  # v1 raised NameError: torch was not imported in .to()
+    assert m(torch.zeros(1, 35280)).shape == (1, 128, 81)
+
+
+def test_save_patch_user_dir_is_opt_in_and_never_overwrites(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    synth = FakeSurge()
+    synth.preset_data = b"VST3preset"
+    patch = surge_spec.draw_patch(5000)
+    audio_utils.save_patch(synth, patch, str(tmp_path / "a"))
+    user = tmp_path / "home" / "Documents" / "Surge XT" / "Patches" / "AI Inversions"
+    assert (tmp_path / "a.vstpreset").exists() and not user.exists()
+    audio_utils.save_patch(synth, patch, str(tmp_path / "a"), copy_to_user_dir=True)
+    audio_utils.save_patch(synth, patch, str(tmp_path / "a"), copy_to_user_dir=True)
+    assert sorted(p.name for p in user.iterdir()) == ["a.vstpreset", "a_2.vstpreset"]
+
+
+def test_envelope_suggestions_use_surge_log_scales():
+    import math
+    from envelope_extractor import profile_note_envelope
+    fs = 44100
+    t = np.arange(int(0.4 * fs)) / fs
+    audio = (np.sin(2 * np.pi * 65.4 * t) * np.exp(-t / 0.02)).astype(np.float32)
+    prof = profile_note_envelope(audio, fs=fs)
+    s = prof.suggested_params
+    # decay suggestion = Surge's log2-seconds scale of the measured 20 dB time (v1: half-life / 150 ms)
+    expected = (math.log2(prof.aeg_decay_tenth_ms / 1000.0) + 8) / 13
+    lo, hi = surge_spec.CONT_BOUNDS["aeg_decay"]
+    assert abs(s["a_amp_eg_decay"] - min(max(expected, lo), hi)) < 1e-6
+    # cutoff suggestion = semitones re 440 Hz over [-60, 70] of the sustain centroid
+    f = prof.spectral_centroid_sustain_hz
+    lo, hi = surge_spec.CONT_BOUNDS["cutoff"]
+    assert abs(s["a_filter1_cutoff"] - min(max((12 * math.log2(f / 440) + 60) / 130, lo), hi)) < 1e-6
+
+
+def test_online_datasets_advance_seeds_per_epoch():
+    import train_synth_jepa as tsj
+    ds = tsj.SurgeOnlineDataset(length=10, min_seed=1_000_000)
+    ds._synth = FakeSurge()
+    a = ds[3][1].numpy()
+    ds.epoch = 1
+    b = ds[3][1].numpy()
+    assert not np.allclose(a, b)
+    ds.epoch = 0
+    assert np.allclose(ds[3][1].numpy(), a)
+
+
+class _EnumParam:
+    def __init__(self, names):
+        self.names, self.raw_value = names, 0.0
+
+    @property
+    def string_value(self):
+        return self.names[min(int(self.raw_value * len(self.names)), len(self.names) - 1)]
+
+
+_LFO = ["Sine", "Triangle", "Square", "Sawtooth", "Noise", "S&H", "Envelope", "Step Seq", "MSEG", "Formula"]
+_OSC = ["Classic", "Modern", "Wavetable", "Window", "Sine", "FM2", "FM3", "String", "Twist", "Alias",
+        "S&H Noise", "Audio Input"]
+
+
+class _P139(dict):
+    def __missing__(self, k):
+        import surge_139_spec as s139
+        if "_lfo_" in k and k.endswith("_type"):
+            v = _EnumParam(_LFO)
+        elif k.startswith("a_osc_") and k.endswith("_type"):
+            v = _EnumParam(_OSC)
+        elif k in s139.CATEGORICAL_NAMES:
+            v = _EnumParam(["A", "B", "C"])
+        else:
+            v = _Param(k, None)
+        self[k] = v
+        return v
+
+
+class _Fake139(FakeSurge):
+    def __init__(self):
+        self.parameters = _P139()
+
+    def process(self, events, duration=None, sample_rate=44100, num_channels=2):
+        if not isinstance(events, list):
+            return events  # the priming call (an audio buffer)
+        return FakeSurge.process(self, events, duration, sample_rate, num_channels)
+
+
+def test_139_enum_calibration_and_render_contract():
+    import surge_139_spec as s139
+
+    class Plug:
+        parameters = _P139()
+    tables = s139.calibrate_enums(Plug())
+    assert [n for n, _ in tables["a_lfo_1_type"]] == ["Sine", "Triangle", "Square", "Sawtooth"]
+    assert "Audio Input" not in [n for n, _ in tables["a_osc_1_type"]] and len(tables["a_osc_1_type"]) == 11
+    plug = Plug()
+    patch = s139.draw_patch_139(7, tables)
+    s139.apply_patch_139(plug, patch, tables)
+    k = round(patch["a_lfo_2_type"] * 3)
+    assert plug.parameters["a_lfo_2_type"].string_value == tables["a_lfo_2_type"][k][0]
+
+    class Missing:
+        parameters = {"a_osc_1_type": None}
+    with pytest.raises(RuntimeError, match="not exposed"):
+        s139.verify_param_names(Missing())
+
+
+def test_train_synth_jepa_139_smoke(tmp_path, monkeypatch):
+    import json
+    import train_synth_jepa_139 as t139
+    monkeypatch.setattr(t139, "init_synth_139", lambda *a, **k: _Fake139())
+    args = t139.build_parser().parse_args(["--out_dir", str(tmp_path), "--run_id", "r", "--epochs", "2",
+                                           "--batch_size", "2", "--num_workers", "0", "--norm_spectrograms", "4",
+                                           "--samples_per_epoch", "4", "--val_samples", "4", "--device", "cpu"])
+    t139.train(args, plugin_factory=_Fake139)
+    rows = [json.loads(line) for line in (tmp_path / "r" / "val.jsonl").read_text().splitlines()]
+    assert len(rows) == 2 and abs(rows[0]["chance"] - 25.0) < 1e-6
+    ck = torch.load(tmp_path / "r" / "checkpoint_best.pt", weights_only=False)
+    assert "enum_tables" in ck and ck["model_kwargs"]["cat_sizes"][0] == 11
