@@ -236,6 +236,9 @@ def train(args):
     val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1),
                 "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2)}
     log(f"Rendered fixed validation sets ({args.val_size} notes each) in {time.time() - t0:.1f}s")
+    del synth
+    import gc
+    gc.collect()
 
     loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin), batch_size=args.batch_size,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
