@@ -52,6 +52,10 @@ scripts/synth_inversion/
 |-- synth_jepa_model.py        # Synth-JEPA (arXiv:2609.31024): audio/param encoders, predictors, SIGReg
 |-- train_synth_jepa.py        # Synth-JEPA training (Welford pre-pass, WSD schedule, retrieval-accuracy validation)
 |-- synth_jepa_search.py       # Renderer-free JADE + Adam search over the training support; checkpoint loader
+|-- extract_real_bass_manifold.py  # Real Surge bass presets (.fxp) -> 23-d vectors, plugin-calibrated (v2)
+|-- realistic_bass_prior.py    # Patch prior sampled around those presets (train / held-out split)
+|-- train_realistic_bass_overnight.py  # Online joint Synth-JEPA + flow training on that prior
+|-- watchdog_supervisor.py     # Crash-only restarter for the overnight trainer
 |-- test_synth_inversion.py    # CPU tests with a fake Surge (no plugin or GPU needed)
 `-- run_overnight_suite.sh     # 200-epoch Muon+SF run, then 100-epoch AdamW baseline
 ```
@@ -74,7 +78,7 @@ confirming the differences are cosmetic.
 
 **Tests (no Surge, no GPU):**
 ```
-python -m pytest -q test_synth_inversion.py      # ~20 s; expect "25 passed"
+python -m pytest -q test_synth_inversion.py      # ~20 s; expect "33 passed"
 ```
 
 **Generate a dataset** (v2 also stores `note_dur` and generator attributes; params are identical to v1 for the same seeds):
@@ -128,3 +132,16 @@ sounds) over 139 parameters at 3 s stereo; we have a fixed 200k set of 0.8 s mon
 so long runs revisit the same data (the script prints how many passes) and the train/val gap needs watching.
 The EMA-teacher ablation is not implemented. The search keeps to the training support (`surge_spec.CONT_BOUNDS`)
 and pins the MIDI note; see `synth_jepa_search.py`'s docstring for why both matter on this dataset.
+
+**Real-preset bass prior + overnight online training** (v2, 2026-10-02 review; handover:
+`HANDOVER_2026-10-02_realistic_prior.md`):
+```
+/home/kim/Projects/synth_env/bin/python extract_real_bass_manifold.py      # needs the Surge plugin; checks every unit conversion
+bash run_overnight_realistic_bass.sh                                        # trainer under the crash-only watchdog
+```
+The v1 manifold (any `real_bass_manifold.npz` without `format_version` 2) was built with guessed unit conversions
+(wrong oscillator slots for sub/sync, a discontinuous shape mapping, filter/waveshaper enums divided by guessed
+list lengths, wrong drive/keytrack scaling); the v2 prior refuses to load it. The trainer validates on notes from
+HELD-OUT presets and on training presets every 1000 steps (`val.jsonl`); the gap between the two is the
+memorisation check. Exports: `jepa_best.pt` (for `--jepa`, carries the prior's search box) and `flow_best.pt`
+(for `--ckpt`).

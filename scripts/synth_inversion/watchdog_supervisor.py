@@ -1,175 +1,107 @@
-"""Automated Training Watchdog & Adaptive Hyperparameter Supervisor.
+"""Crash-only supervisor for train_realistic_bass_overnight.py (v2, 2026-10-02 review).
 
-Monitors overnight training metrics in real-time. If loss increases across consecutive
-evaluation windows (divergence/plateau/instability), it automatically:
-  1. Gracefully terminates the diverging process.
-  2. Rolls back model weights to the best recorded checkpoint.
-  3. Adapts hyperparameters (increases batch size to next power of 2, halves LR, increases damping).
-  4. Relaunches training and logs the remediation action to watchdog.log.
+Launches the trainer itself and restarts it (the trainer resumes from checkpoint_latest.pt) when:
+  * it exits with a non-zero code (crash, OOM, or code 3 = repeated non-finite steps), or
+  * training.log stops growing for --stall_minutes while the process is alive (GPU hang, stuck
+    worker): SIGTERM, then SIGKILL after 90 s, then restart.
+It gives up after --max_restarts restarts within --restart_window_minutes (a crash loop is a bug to
+read, not to retry). A zero exit code (time budget reached, or stopped by Ctrl-C/SIGTERM) ends it.
+
+What it deliberately does NOT do any more: change batch size or learning rate. v1 halved the LR and
+doubled the batch whenever five consecutive 50-step loss averages rose, which happens by chance
+about once per 120 log lines on a noisy online loss — an LR decay driven by noise. Its rollback
+target (checkpoint_best.pt) was never written by the v1 trainer, and it SIGTERMed first, so the
+trainer saved the state it was meant to roll back from. LR decay belongs in the trainer's schedule.
+
+Usage (everything after -- is the trainer command, run as is):
+  python watchdog_supervisor.py --out_dir DIR -- /path/python train_realistic_bass_overnight.py --out_dir DIR ...
 """
-
+import argparse
 import os
-import re
-import shutil
 import signal
 import subprocess
 import sys
 import time
-from typing import List, Tuple
 
-LOG_DIR = "/run/media/kim/Mantu/surge_200k_models/overnight_realistic_bass"
-RUN_LOG = os.path.join(LOG_DIR, "run.log")
-WATCHDOG_LOG = os.path.join(LOG_DIR, "watchdog.log")
-PYTHON_BIN = "/home/kim/Projects/SAO/stable-audio-tools/sat-venv/bin/python"
-TRAIN_SCRIPT = "/home/kim/Projects/SAO/stable-audio-tools/scripts/synth_inversion/train_realistic_bass_overnight.py"
+_stop = False
 
-CHECK_INTERVAL_S = 45  # Check every 45s
-CONSECUTIVE_INCREASE_LIMIT = 4  # Trigger after 4 consecutive loss increases
-DIVERGENCE_RATIO_LIMIT = 1.30   # Trigger if loss spikes > 30% above best seen
 
-# Initial hyperparameter state
-current_batch_size = 32
-current_lr_jepa = 9e-5
-current_lr_flow = 6e-5
+def _on_signal(sig, _frame):
+    global _stop
+    _stop = True
 
-def log_watchdog(msg: str):
-    ts = time.strftime("[%Y-%m-%d %H:%M:%S]")
-    line = f"{ts} [WATCHDOG] {msg}"
-    print(line, flush=True)
-    with open(WATCHDOG_LOG, "a") as f:
-        f.write(line + "\n")
-        f.flush()
 
-def parse_recent_log_metrics() -> List[Tuple[int, float, float, float]]:
-    """Returns list of (step, jepa_loss, flow_loss, combined_loss) from run.log."""
-    if not os.path.exists(RUN_LOG):
-        return []
-    
-    entries = []
-    # Pattern: Step   1050 | ... | JEPA Loss: 0.6369 | ... | Flow Loss: 0.2898 | ...
-    pattern = re.compile(r"Step\s+(\d+)\s+\|\s+Elapsed:\s+[\d\.]+h\s+\|\s+ETA:\s+[\d\.]+h\s+\|\s+JEPA Loss:\s+([\d\.]+)\s+.*?\|\s+Flow Loss:\s+([\d\.]+)")
-    with open(RUN_LOG, "r") as f:
-        for line in f:
-            m = pattern.search(line)
-            if m:
-                step = int(m.group(1))
-                jepa_loss = float(m.group(2))
-                flow_loss = float(m.group(3))
-                combined = jepa_loss + flow_loss
-                entries.append((step, jepa_loss, flow_loss, combined))
-    return entries
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out_dir", required=True, help="the trainer's --out_dir (logs live there)")
+    ap.add_argument("--stall_minutes", type=float, default=20.0)
+    ap.add_argument("--max_restarts", type=int, default=5)
+    ap.add_argument("--restart_window_minutes", type=float, default=60.0)
+    ap.add_argument("--poll_s", type=float, default=30.0)
+    ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- trainer command")
+    args = ap.parse_args(argv)
+    cmd = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+    if not cmd:
+        ap.error("give the trainer command after --")
 
-def find_active_train_pid():
-    try:
-        out = subprocess.check_output(["pgrep", "-f", "train_realistic_bass_overnight.py"]).decode()
-        pids = [int(p.strip()) for p in out.strip().split() if p.strip()]
-        return pids
-    except:
-        return []
+    os.makedirs(args.out_dir, exist_ok=True)
+    train_log = os.path.join(args.out_dir, "training.log")
+    wd_log = open(os.path.join(args.out_dir, "watchdog.log"), "a", buffering=1)
 
-def apply_remediation(reason: str, best_step: int):
-    global current_batch_size, current_lr_jepa, current_lr_flow
-    log_watchdog(f"ALERT: Divergence condition detected! Reason: {reason}")
-    log_watchdog("Initiating Automated Remediation Sequence...")
+    def log(msg):
+        line = f"{time.strftime('[%Y-%m-%d %H:%M:%S]')} {msg}"
+        print(line, flush=True)
+        wd_log.write(line + "\n")
 
-    # 1. Terminate running training process
-    pids = find_active_train_pid()
-    if pids:
-        log_watchdog(f"Stopping active training processes: {pids}")
-        for p in pids:
-            try:
-                os.kill(p, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        time.sleep(6)  # Allow clean checkpoint write
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+    restarts = []
 
-    # 2. Revert checkpoint to best known state
-    best_ckpt = os.path.join(LOG_DIR, "checkpoint_best.pt")
-    latest_ckpt = os.path.join(LOG_DIR, "checkpoint_latest.pt")
-    if os.path.exists(best_ckpt):
-        shutil.copy2(best_ckpt, latest_ckpt)
-        log_watchdog(f"Reverted checkpoint_latest.pt to checkpoint_best.pt (best step: {best_step})")
-    else:
-        log_watchdog("checkpoint_best.pt not found; keeping current latest checkpoint.")
+    def launch():
+        log("Launching: " + " ".join(cmd))
+        out = open(os.path.join(args.out_dir, "run.log"), "a")
+        return subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT), time.time()
 
-    # 3. Adapt hyperparameters
-    old_bs = current_batch_size
-    current_batch_size = min(128, current_batch_size * 2)  # Power of 2 escalation: 32 -> 64 -> 128
-    current_lr_jepa *= 0.50                                # Halve learning rates
-    current_lr_flow *= 0.50
+    def stop(proc):
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=90)
+        except subprocess.TimeoutExpired:
+            log("Trainer did not stop within 90 s; SIGKILL")
+            proc.kill()
+            proc.wait()
 
-    log_watchdog(f"Adapted Hyperparameters:")
-    log_watchdog(f"  Batch size: {old_bs} -> {current_batch_size} (power of 2 escalation)")
-    log_watchdog(f"  LR JEPA:    {current_lr_jepa:.2e} (damped 50%)")
-    log_watchdog(f"  LR Flow:    {current_lr_flow:.2e} (damped 50%)")
-
-    # 4. Relaunch training process
-    cmd = [
-        PYTHON_BIN, TRAIN_SCRIPT,
-        "--out_dir", LOG_DIR,
-        "--hours", "8.0",
-        "--batch_size", str(current_batch_size),
-        "--num_workers", "4",
-        "--lr_jepa", str(current_lr_jepa),
-        "--lr_flow", str(current_lr_flow),
-        "--checkpoint_interval_steps", "1000",
-        "--log_interval_steps", "50",
-        "--device", "cuda:0",
-    ]
-    log_watchdog(f"Relaunching training command: {' '.join(cmd)}")
-    with open(RUN_LOG, "a") as f_out:
-        proc = subprocess.Popen(cmd, stdout=f_out, stderr=subprocess.STDOUT)
-    log_watchdog(f"Training resumed under PID {proc.pid}. Watchdog resumed.")
-
-def main():
-    log_watchdog("Watchdog Supervisor started. Monitoring run.log every 45s...")
-    last_processed_step = 0
-    all_time_best_loss = float("inf")
-    best_step = 0
-
+    proc, started = launch()
     while True:
-        time.sleep(CHECK_INTERVAL_S)
-        entries = parse_recent_log_metrics()
-        if not entries:
+        time.sleep(args.poll_s)
+        if _stop:
+            log("Watchdog stopping; forwarding SIGTERM to the trainer (it saves a checkpoint)")
+            stop(proc)
+            return 0
+        rc = proc.poll()
+        reason = None
+        if rc is not None:
+            if rc == 0:
+                log("Trainer finished (exit 0).")
+                return 0
+            reason = f"trainer exited with code {rc}"
+        else:
+            last = os.path.getmtime(train_log) if os.path.exists(train_log) else started
+            idle_min = (time.time() - max(last, started)) / 60.0
+            if idle_min > args.stall_minutes:
+                reason = f"training.log idle for {idle_min:.1f} min"
+                stop(proc)
+        if reason is None:
             continue
+        now = time.time()
+        restarts = [t for t in restarts if now - t < args.restart_window_minutes * 60] + [now]
+        if len(restarts) > args.max_restarts:
+            log(f"{reason}; {len(restarts) - 1} restarts within {args.restart_window_minutes:.0f} min already. "
+                "Giving up: read run.log.")
+            return 1
+        log(f"{reason}; restarting from checkpoint_latest.pt (restart {len(restarts)}/{args.max_restarts} in window)")
+        proc, started = launch()
 
-        latest_step, jepa_loss, flow_loss, combined_loss = entries[-1]
-        
-        # Track all-time best
-        for s, j_l, f_l, comb in entries:
-            if comb < all_time_best_loss:
-                all_time_best_loss = comb
-                best_step = s
-
-        # Check if new steps have occurred
-        if latest_step <= last_processed_step:
-            # Check if training process crashed / died unexpectedly
-            pids = find_active_train_pid()
-            if not pids:
-                log_watchdog("WARNING: Training process is not running! Relaunching from latest checkpoint...")
-                apply_remediation("Process not found / unexpected termination", best_step)
-            continue
-
-        last_processed_step = latest_step
-
-        # Analyze trend over the last N log entries
-        if len(entries) >= CONSECUTIVE_INCREASE_LIMIT + 1:
-            recent_losses = [e[3] for e in entries[-CONSECUTIVE_INCREASE_LIMIT-1:]]
-            
-            # Check for monotonic increase
-            is_increasing = all(recent_losses[i] < recent_losses[i+1] for i in range(len(recent_losses)-1))
-            
-            # Check for sudden severe spike
-            is_spike = combined_loss > all_time_best_loss * DIVERGENCE_RATIO_LIMIT
-
-            if is_increasing:
-                apply_remediation(f"Loss monotonically increasing over last {CONSECUTIVE_INCREASE_LIMIT} checks ({recent_losses})", best_step)
-                time.sleep(60) # Allow new process to spin up
-            elif is_spike and latest_step > 2000:
-                apply_remediation(f"Loss spiked to {combined_loss:.4f} (> {DIVERGENCE_RATIO_LIMIT}x best {all_time_best_loss:.4f})", best_step)
-                time.sleep(60)
-            else:
-                log_watchdog(f"Status OK @ step {latest_step:6d} | Combined Loss: {combined_loss:.4f} (Best: {all_time_best_loss:.4f} @ {best_step})")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

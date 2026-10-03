@@ -512,3 +512,202 @@ def test_envelope_extractor_profiling_and_decoupling():
     loss_diff = compute_envelope_loss_np(audio, audio_diff, fs=fs)
     assert loss_diff["loss_env_total"] > 0.0
 
+
+
+# ---------------------------------------------------------------------------
+# Real-preset prior (v2): extractor conversions, sampler, trainer, watchdog
+# ---------------------------------------------------------------------------
+def _display(kind, x):
+    """What Surge would show for native value x (the units extract_real_bass_manifold parses)."""
+    if kind == "pct":
+        return f"{100 * x:.2f} %"
+    if kind == "semitones":
+        return f"{x:.2f} semitones"
+    if kind == "cents":
+        return f"{100 * x:.2f} cents"
+    if kind == "db":
+        return f"{x:.2f} dB"
+    if kind == "hz":
+        hz = 440.0 * 2 ** (x / 12)
+        return f"{hz / 1000:.3f} kHz" if hz >= 1000 else f"{hz:.2f} Hz"
+    if kind == "seconds":
+        s = 2 ** x
+        return f"{s * 1000:.1f} ms" if s < 1 else f"{s:.3f} s"
+    raise ValueError(kind)
+
+
+class _DisplayParam:
+    def __init__(self, lo, hi, kind):
+        self.lo, self.hi, self.kind, self.raw_value = lo, hi, kind, 0.0
+
+    @property
+    def string_value(self):
+        return _display(self.kind, self.lo + self.raw_value * (self.hi - self.lo))
+
+
+class _DisplaySurge:
+    def __init__(self, override=None):
+        import extract_real_bass_manifold as ex
+        self.parameters = {}
+        for name, (_tag, pname, lo, hi, kind) in ex.CONTINUOUS.items():
+            lo, hi = (override or {}).get(name, (lo, hi))
+            self.parameters[pname] = _DisplayParam(lo, hi, kind)
+
+
+def _xml_preset(values: dict) -> bytes:
+    body = "".join(f'<{k} type="2" value="{v:.6f}" />' for k, v in values.items())
+    return b"CcnK\x00\x00\x00\x00FPCh" + b"\x00" * 48 + \
+        f'<?xml version="1.0" encoding="UTF-8"?><patch revision="21"><parameters>{body}</parameters></patch>'.encode()
+
+
+def _preset_values(rng=None, **kw):
+    import extract_real_bass_manifold as ex
+    rng = rng or np.random.RandomState(0)
+    v = {"a_osc1_type": 0, "a_osc1_param6": 1, "a_filter1_type": 2, "a_ws_type": 0, "a_fm_switch": 0}
+    for name, (tag, _p, lo, hi, _k) in ex.CONTINUOUS.items():
+        v[tag] = lo + (hi - lo) * rng.uniform(0.3, 0.7)
+    v["a_osc1_param5"] = rng.uniform(0.05, 0.3)  # detune inside our 0..0.35 range (no clipping)
+    v.update(kw)
+    return v
+
+
+def test_extractor_calibration_accepts_matching_and_rejects_wrong_ranges():
+    import extract_real_bass_manifold as ex
+    ranges = ex.calibrate_ranges(_DisplaySurge())
+    assert ranges == {n: (c[2], c[3]) for n, c in ex.CONTINUOUS.items()}
+    with pytest.raises(RuntimeError, match="fm_depth"):
+        ex.calibrate_ranges(_DisplaySurge(override={"fm_depth": (-48.0, 24.0)}))
+    measured = ex.calibrate_ranges(_DisplaySurge(override={"fm_depth": (-48.0, 24.0)}), use_measured=True)
+    assert abs(measured["fm_depth"][1] - 24.0) < 0.1
+
+
+def test_extractor_roundtrip_through_apply_patch():
+    """XML native value -> vector -> vector_to_patch -> apply_patch must set exactly the raw value
+    Surge would compute from the native value: raw = (x - min) / (max - min)."""
+    import extract_real_bass_manifold as ex
+    ranges = {n: (c[2], c[3]) for n, c in ex.CONTINUOUS.items()}
+    xml = _preset_values(**{"a_osc1_param6": 2, "a_osc1_param5": 0.2, "a_filter1_type": 15, "a_ws_type": 23,
+                            "a_ws_drive": 6.0, "a_filter1_keytrack": 0.5, "a_osc1_param0": -0.4,
+                            "a_fm_switch": 1, "a_fm_depth": -10.0, "a_filter1_cutoff": -12.0})
+    vec, clipped, reason = ex.preset_to_vector(ex.parse_fxp(_xml_preset(xml)), ranges)
+    assert reason is None and clipped == []
+    patch = surge_spec.vector_to_patch(vec)
+    assert surge_spec.LP_FILTERS[patch["filter_idx"]][0] == "LP Diode Ladder"
+    assert surge_spec.WAVESHAPER_TYPES[patch["ws_idx"]][0] == "Fuzz" and patch["unison"]
+    synth = FakeSurge()
+    surge_spec.apply_patch(synth, patch)
+    for name, (tag, pname, lo, hi, _k) in ex.CONTINUOUS.items():
+        expected = (xml[tag] - lo) / (hi - lo)
+        assert abs(synth.parameters[pname].raw_value - expected) < 1e-5, name
+    assert abs(synth.parameters["a_filter_1_type"].raw_value - 15 / 33) < 1e-3
+
+
+def test_extractor_skips_and_zeroes_inactive_controls():
+    import extract_real_bass_manifold as ex
+    ranges = {n: (c[2], c[3]) for n, c in ex.CONTINUOUS.items()}
+    run = lambda **kw: ex.preset_to_vector(ex.parse_fxp(_xml_preset(_preset_values(**kw))), ranges)  # noqa: E731
+    assert run(a_osc1_type=1)[2] == "osc 1 not Classic"
+    assert "lowpass" in run(a_filter1_type=4)[2]  # a highpass is skipped, not relabelled
+    assert "waveshaper" in run(a_ws_type=7)[2]
+    vec, _, _ = run(a_fm_switch=0, a_ws_type=0, a_osc1_param6=1)
+    for n in ("fm_depth", "drive", "unison_detune"):
+        assert vec[surge_spec.PARAM_INDEX[n]] == 0.0
+    vec, clipped, _ = run(a_ws_type=1, a_ws_drive=20.0)  # +20 dB is past our +15.36 dB ceiling
+    assert vec[surge_spec.PARAM_INDEX["drive"]] == 1.0 and clipped == ["drive"]
+    assert ex.parse_fxp(b"garbage") is None
+
+
+def _tiny_manifold(path, n=60, seed=0):
+    import extract_real_bass_manifold as ex
+    rng = np.random.RandomState(seed)
+    presets = []
+    for i in range(n):
+        kw = {"a_filter1_type": [1, 2, 3, 10, 15][i % 5], "a_ws_type": [0, 1, 23][i % 3],
+              "a_osc1_param6": 1 + (i % 2), "a_fm_switch": i % 2}
+        if i % 3 == 0:
+            kw["a_osc1_param4"] = 0.0  # sync off in a third of presets
+        presets.append((f"p{i}.fxp", _xml_preset(_preset_values(rng, **kw))))
+    presets.append(("hp.fxp", _xml_preset(_preset_values(rng, a_filter1_type=4))))
+    presets.append(("dup.fxp", presets[0][1]))
+    ranges = {k: (c[2], c[3]) for k, c in ex.CONTINUOUS.items()}
+    params, names, is_val, skips, clip = ex.build_manifold(presets, ranges, val_frac=0.2)
+    import json
+    np.savez_compressed(path, params=params, preset_names=np.array(names), is_val=is_val,
+                        param_names=np.array(surge_spec.PARAM_NAMES), clip_frac=clip.astype(np.float32),
+                        skip_reasons=json.dumps(skips), ranges=json.dumps(ranges), calibrated=True,
+                        format_version=ex.FORMAT_VERSION)
+    return params, is_val, skips
+
+
+def test_manifold_split_dedup_and_prior_sampling(tmp_path):
+    from realistic_bass_prior import JITTER_IDX, RealisticBassPrior
+    path = str(tmp_path / "m.npz")
+    params, is_val, skips = _tiny_manifold(path)
+    assert skips.get("duplicate vector") == 1 and any("lowpass" in k for k in skips)
+    assert 0 < is_val.sum() < len(is_val)
+    prior = RealisticBassPrior(path, split="train")
+    train = params[~is_val]
+    sync = surge_spec.PARAM_INDEX["sync"]
+    rng = np.random.RandomState(0)
+    bounds = prior.support_bounds()
+    draws = np.stack([prior.sample_vector(rng) for _ in range(3000)])
+    # sync is a spike dimension: off in ~1/3 of presets, and the draws keep roughly that rate
+    assert abs(np.mean(draws[:, sync] == 0) - np.mean(train[:, sync] == 0)) < 0.05
+    # every draw is inside the recorded support box, and nothing piles up at a box edge
+    for i in JITTER_IDX:
+        lo, hi = bounds[surge_spec.PARAM_NAMES[i]]
+        col = draws[:, i]
+        assert col.min() >= lo - 1e-6 and col.max() <= hi + 1e-6
+        on = col[col > 0]
+        if len(on) > 100 and hi > lo:
+            assert np.mean(np.isclose(on, on.min())) < 0.02 and np.mean(np.isclose(on, hi)) < 0.02
+    # categoricals are copied from a preset, never jittered into new classes
+    cats = [i for i, _ in surge_spec.CAT_INDICES]
+    train_cats = {tuple(r) for r in np.round(train[:, cats], 5)}
+    assert all(tuple(r) in train_cats for r in np.round(draws[:, cats], 5))
+    for n in ("chorus_mix", "delay_mix", "delay_fb"):
+        assert np.all(draws[:, surge_spec.PARAM_INDEX[n]] == 0) and bounds[n] == (0.0, 0.0)
+    v1 = tmp_path / "v1.npz"
+    np.savez(v1, params=params)
+    with pytest.raises(ValueError, match="v1 manifold"):
+        RealisticBassPrior(str(v1))
+
+
+def test_realistic_trainer_fresh_resume_and_exports(tmp_path, monkeypatch):
+    import train_realistic_bass_overnight as tr
+    from synth_jepa_search import SynthJEPASearcher, checkpoint_bounds, load_synth_jepa
+    manifold = str(tmp_path / "m.npz")
+    _tiny_manifold(manifold)
+    monkeypatch.setattr(tr, "init_synth", lambda *a, **k: FakeSurge())
+    out = tmp_path / "run"
+    base = ["--out_dir", str(out), "--manifold", manifold, "--device", "cpu", "--num_workers", "0",
+            "--batch_size", "4", "--val_size", "6", "--val_interval_steps", "2", "--checkpoint_interval_steps", "2",
+            "--norm_batches", "2", "--warmup_steps", "2", "--log_interval_steps", "2", "--keep_last", "1"]
+    tr.train(tr.build_parser().parse_args(base + ["--max_steps", "2"]))
+    for f in ("checkpoint_latest.pt", "checkpoint_best.pt", "jepa_best.pt", "flow_best.pt", "run_meta.json", "val.jsonl"):
+        assert (out / f).exists(), f
+    tr.train(tr.build_parser().parse_args(base + ["--max_steps", "4"]))  # resumes, does not restart
+    ck = torch.load(out / "checkpoint_latest.pt", weights_only=False)
+    assert ck["step"] == 4 and "opt_jepa" in ck and ck["prior_bounds"]["chorus_mix"] == (0.0, 0.0)
+    assert len(list(out.glob("checkpoint_step_*.pt"))) == 1
+    log = (out / "training.log").read_text()
+    assert "Resumed at step 2" in log and "VAL step 4" in log
+    flow = load_inverter(str(out / "flow_latest.pt"))
+    assert isinstance(flow, FlowMatchingResMLP)
+    model, norm = load_synth_jepa(str(out / "jepa_latest.pt"))
+    s = SynthJEPASearcher(model, norm, device="cpu", seed=0, bounds=checkpoint_bounds(str(out / "jepa_latest.pt")))
+    res = s.search(torch.zeros(128, 81), midi_note=36, total_eval_budget=64)
+    assert res["vector"][surge_spec.PARAM_INDEX["chorus_mix"]] == 0.0
+    torch.save({"step": 1}, out / "checkpoint_latest.pt")  # a v1 checkpoint is refused
+    with pytest.raises(SystemExit, match="v1 trainer"):
+        tr.train(tr.build_parser().parse_args(base + ["--max_steps", "6"]))
+
+
+def test_watchdog_restarts_on_crash_and_gives_up(tmp_path):
+    import watchdog_supervisor as wd
+    crash = [sys.executable, "-c", "import sys; sys.exit(1)"]
+    rc = wd.main(["--out_dir", str(tmp_path), "--poll_s", "0.05", "--max_restarts", "2", "--"] + crash)
+    log = (tmp_path / "watchdog.log").read_text()
+    assert rc == 1 and log.count("Launching") == 3 and "Giving up" in log
+    assert wd.main(["--out_dir", str(tmp_path / "ok"), "--poll_s", "0.05", "--",
+                    sys.executable, "-c", "pass"]) == 0

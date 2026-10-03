@@ -1,216 +1,353 @@
-"""Extracts empirical parameter distributions from all 430 real curated Surge XT bass presets.
+"""Project real Surge XT bass presets (.fxp) into the 23-d parameter space of surge_spec.py.
 
-Saves:
-  /run/media/kim/Mantu/surge_200k_models/real_bass_manifold.npz
-Containing:
-  - 'params': [N, D] array of real bass normalized parameter vectors
-  - 'param_names': list of parameter names
-  - 'mean': empirical mean vector
-  - 'cov': empirical covariance matrix
-  - 'p10', 'p50', 'p90': percentiles
-  - 'zero_prob': fraction of presets where parameter is 0 / off
+Output (default /run/media/kim/Mantu/surge_200k_models/real_bass_manifold.npz, format_version 2):
+  params       [N, 23] float32, the h5 'params' layout (surge_spec.patch_to_vector conventions)
+  preset_names [N]     source file of each row
+  is_val       [N]     held-out presets (split by a hash of the row's parameter vector, so a preset
+                       that appears in both sources cannot land on both sides)
+  param_names, clip_frac [23] (fraction of rows clipped into the renderable range per parameter),
+  skip_reasons (JSON), ranges (JSON, the native ranges used), calibrated (bool), format_version
+
+How a preset value becomes a vector value (v2, 2026-10-02 review; v1 guessed every conversion):
+  1. Surge stores each parameter in its NATIVE unit in the patch XML (semitones, log2 seconds,
+     dB, fractions). The VST parameter the renderer sets (pedalboard raw_value) is that value
+     mapped linearly over the parameter's native range: raw = (x - min) / (max - min).
+  2. The native ranges below come from Surge's Parameter.cpp. calibrate_ranges() CHECKS them
+     against the plugin itself: it sets raw values, reads the plugin's display strings, converts
+     them back to native units and compares. A mismatch stops the run and prints the measured
+     range (pass --use_measured_ranges to adopt it once you have looked at it).
+  3. raw -> vector value with exactly the conventions vector_to_patch() inverts (detune = raw/0.35,
+     keytrack = (raw-0.5)/0.5, drive = (raw-0.5)/0.32); anything outside [0, 1] is clipped and
+     counted in clip_frac.
+  4. Enum parameters (filter, waveshaper) are integer positions in Surge's lists; the raw values in
+     surge_spec.LP_FILTERS / WAVESHAPER_TYPES are those positions / (list length - 1), which
+     verify_surge_mapping() checks against the plugin's names. A preset whose filter is not one of
+     our 10 lowpass circuits, whose waveshaper is not one of our 6, or whose oscillator 1 is not
+     the Classic oscillator (the only one whose param0..6 mean shape/width/.../voices) is SKIPPED
+     and counted, not relabelled.
+  5. Only scene A, oscillator 1, filter 1 and the two envelopes are read; oscillators 2/3, LFOs,
+     modulation routings, filter 2 and FX are not part of the 23-d space. The projected patch
+     therefore does not sound like the preset; it is a prior over OUR space, informed by where
+     real bass presets put these 20 controls.
+
+Needs pedalboard (the data venv), the Surge XT VST3, and the preset files. --no_plugin skips the
+calibration (prints a warning and records calibrated=False); use it only for a dry look.
 """
-
+import argparse
+import hashlib
+import json
+import math
 import os
-import glob
-import zipfile
+import re
+import tempfile
 import xml.etree.ElementTree as ET
+import zipfile
+
 import numpy as np
 
+from surge_spec import (DEFAULT_PLUGIN_PATH, LP_FILTERS, NUM_PARAMS, PARAM_INDEX, PARAM_NAMES, UNISON_VOICES_RAW,
+                        WAVESHAPER_TYPES, verify_surge_mapping)
+
+FORMAT_VERSION = 2
 OUTPUT_PATH = "/run/media/kim/Mantu/surge_200k_models/real_bass_manifold.npz"
 SURGE_DATA_DIR = "/home/kim/Downloads/surge-xt-portable-content-1.3.4/Surge Synth Team/SurgeXTData"
 NEW_LOOPS_ZIP = "/home/kim/Downloads/New_Loops-Surge_Presets.zip"
-NL_EXTRACT_DIR = "/tmp/new_loops_bass"
 
-def collect_fxp_files():
-    files = []
-    # 1. SurgeXTData
-    for root, dirs, f_list in os.walk(SURGE_DATA_DIR):
-        if "bass" in root.lower():
-            for f in f_list:
-                if f.endswith(".fxp"):
-                    files.append(os.path.join(root, f))
-    # 2. New Loops
-    os.makedirs(NL_EXTRACT_DIR, exist_ok=True)
-    if os.path.exists(NEW_LOOPS_ZIP):
-        with zipfile.ZipFile(NEW_LOOPS_ZIP, "r") as z:
+# Surge enum list lengths - 1 (the raw value of position i is i / N). surge_spec's enum raw
+# values are exact multiples of these, which _enum_positions() asserts.
+FILTER_TYPE_DENOM = 33
+WAVESHAPER_DENOM = 40
+CLASSIC_OSC_TYPE = 0  # a_osc1_type value of the Classic oscillator (surge_spec.init_synth sets raw 0.0)
+
+# Continuous parameters: vector name -> (patch XML tag, plugin parameter, native min, native max, display unit kind)
+CONTINUOUS = {
+    "shape":         ("a_osc1_param0",       "a_osc_1_shape",             -1.0,  1.0, "pct"),
+    "width":         ("a_osc1_param1",       "a_osc_1_width_1",            0.0,  1.0, "pct"),
+    "sub_mix":       ("a_osc1_param3",       "a_osc_1_sub_mix",            0.0,  1.0, "pct"),
+    "sync":          ("a_osc1_param4",       "a_osc_1_sync",               0.0, 60.0, "semitones"),
+    "unison_detune": ("a_osc1_param5",       "a_osc_1_unison_detune",      0.0,  1.0, "cents"),
+    "fm_depth":      ("a_fm_depth",          "a_fm_depth",               -48.0, 16.0, "db"),
+    "cutoff":        ("a_filter1_cutoff",    "a_filter_1_cutoff",        -60.0, 70.0, "hz"),
+    "resonance":     ("a_filter1_resonance", "a_filter_1_resonance",       0.0,  1.0, "pct"),
+    "keytrack":      ("a_filter1_keytrack",  "a_filter_1_keytrack",       -1.0,  1.0, "pct"),
+    "feg_amount":    ("a_filter1_envmod",    "a_filter_1_feg_mod_amount", -96.0, 96.0, "semitones"),
+    "feg_decay":     ("a_env2_decay",        "a_filter_eg_decay",          -8.0,  5.0, "seconds"),
+    "feg_sustain":   ("a_env2_sustain",      "a_filter_eg_sustain",        0.0,  1.0, "pct"),
+    "aeg_decay":     ("a_env1_decay",        "a_amp_eg_decay",             -8.0,  5.0, "seconds"),
+    "aeg_sustain":   ("a_env1_sustain",      "a_amp_eg_sustain",           0.0,  1.0, "pct"),
+    "aeg_release":   ("a_env1_release",      "a_amp_eg_release",           -8.0,  5.0, "seconds"),
+    "drive":         ("a_ws_drive",          "a_waveshaper_drive",       -24.0, 24.0, "db"),
+}
+ENUM_TAGS = {"osc_type": "a_osc1_type", "voices": "a_osc1_param6", "filter_type": "a_filter1_type",
+             "ws_type": "a_ws_type", "fm_switch": "a_fm_switch"}
+
+# Raw -> vector value, inverse of surge_spec.vector_to_patch
+_RAW_TO_VEC = {
+    "unison_detune": lambda r: r / 0.35,
+    "keytrack": lambda r: (r - 0.5) / 0.5,
+    "drive": lambda r: (r - 0.5) / 0.32,
+}
+
+
+# --------------------------------------------------------------------------- display parsing
+_NUM_UNIT = re.compile(r"([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*([a-zA-Z%]*)")
+
+
+def display_to_native(text: str, kind: str) -> float:
+    """Plugin display string -> native unit. Raises ValueError when it cannot be read."""
+    m = _NUM_UNIT.search(str(text).replace(",", ""))
+    if not m:
+        raise ValueError(f"no number in {text!r}")
+    v, unit = float(m.group(1)), m.group(2).lower()
+    if kind == "pct":
+        if unit != "%":
+            raise ValueError(f"expected %, got {text!r}")
+        return v / 100.0
+    if kind == "semitones":
+        if unit not in ("", "st", "semi", "semis", "semitone", "semitones"):
+            raise ValueError(f"expected semitones, got {text!r}")
+        return v
+    if kind == "cents":
+        if unit not in ("c", "ct", "cent", "cents"):
+            raise ValueError(f"expected cents, got {text!r}")
+        return v / 100.0
+    if kind == "db":
+        if unit != "db":
+            raise ValueError(f"expected dB, got {text!r}")
+        return v
+    if kind == "hz":
+        hz = v * 1000.0 if unit == "khz" else v if unit == "hz" else None
+        if hz is None or hz <= 0:
+            raise ValueError(f"expected Hz/kHz, got {text!r}")
+        return 12.0 * math.log2(hz / 440.0)
+    if kind == "seconds":
+        sec = v / 1000.0 if unit == "ms" else v if unit == "s" else None
+        if sec is None or sec <= 0:
+            raise ValueError(f"expected s/ms, got {text!r}")
+        return math.log2(sec)
+    raise ValueError(f"unknown display kind {kind}")
+
+
+def calibrate_ranges(plugin, use_measured=False, points=(0.2, 0.5, 0.8), tol=0.02):
+    """Check every native range in CONTINUOUS against the plugin's own display strings.
+    Returns {name: (min, max)} to use. Raises RuntimeError listing each mismatch."""
+    ranges, problems = {}, []
+    for name, (_tag, pname, lo, hi, kind) in CONTINUOUS.items():
+        param = plugin.parameters[pname]
+        old = param.raw_value
+        xs, ys = [], []
+        try:
+            for r in points:
+                param.raw_value = r
+                xs.append(r)
+                ys.append(display_to_native(param.string_value, kind))
+        except ValueError as e:
+            problems.append(f"  {name} ({pname}): cannot read display: {e}")
+            continue
+        finally:
+            param.raw_value = old
+        slope, icpt = np.polyfit(xs, ys, 1)
+        measured = (float(icpt), float(icpt + slope))
+        expected = np.array([lo + r * (hi - lo) for r in xs])
+        worst = float(np.max(np.abs(np.array(ys) - expected)))
+        if worst > tol * (hi - lo):
+            problems.append(f"  {name} ({pname}): source range [{lo}, {hi}] but the plugin reads as "
+                            f"[{measured[0]:.3f}, {measured[1]:.3f}] (worst error {worst:.3f})")
+            ranges[name] = measured
+        else:
+            ranges[name] = (lo, hi)
+    if problems and not use_measured:
+        raise RuntimeError("Native ranges do not match this Surge build:\n" + "\n".join(problems)
+                           + "\nCheck them, then rerun with --use_measured_ranges to adopt the measured ones.")
+    for p in problems:
+        print("WARNING (adopting measured range):", p.strip())
+    return ranges
+
+
+def _enum_positions():
+    """Surge list position -> our class index, from surge_spec's verified raw values."""
+    def positions(table, denom):
+        out = {}
+        for k, (name, raw) in enumerate(table):
+            pos = raw * denom
+            if abs(pos - round(pos)) > 0.02:
+                raise RuntimeError(f"{name}: raw {raw} is not a multiple of 1/{denom}; "
+                                   "the enum list length assumption is wrong")
+            out[int(round(pos))] = k
+        return out
+    return positions(LP_FILTERS, FILTER_TYPE_DENOM), positions(WAVESHAPER_TYPES, WAVESHAPER_DENOM)
+
+
+FILTER_POS_TO_CLASS, WS_POS_TO_CLASS = _enum_positions()
+
+
+# --------------------------------------------------------------------------- preset parsing
+def parse_fxp(data: bytes):
+    """Surge .fxp bytes -> {xml tag: float value} for the patch's <parameters>, or None."""
+    start = data.find(b"<?xml")
+    end = data.rfind(b"</patch>")
+    if start == -1 or end == -1:
+        return None
+    try:
+        root = ET.fromstring(data[start:end + len(b"</patch>")].decode("utf-8", errors="replace"))
+    except ET.ParseError:
+        return None
+    params = root.find("parameters")
+    if params is None:
+        return None
+    out = {}
+    for elem in params:
+        if "value" in elem.attrib:
+            try:
+                out[elem.tag] = float(elem.attrib["value"])
+            except ValueError:
+                pass
+    return out
+
+
+def preset_to_vector(xml_p: dict, ranges: dict):
+    """-> (23-d vector, clipped-parameter names, None) or (None, None, skip reason)."""
+    required = [t for k, t in ENUM_TAGS.items() if k != "fm_switch"] + [c[0] for c in CONTINUOUS.values()]
+    missing = [t for t in required if t not in xml_p]
+    if missing:
+        return None, None, "missing tag: " + missing[0]
+    if int(round(xml_p[ENUM_TAGS["osc_type"]])) != CLASSIC_OSC_TYPE:
+        return None, None, "osc 1 not Classic"
+    f_pos = int(round(xml_p[ENUM_TAGS["filter_type"]]))
+    if f_pos not in FILTER_POS_TO_CLASS:
+        return None, None, f"filter type {f_pos} not one of our lowpass circuits"
+    ws_pos = int(round(xml_p[ENUM_TAGS["ws_type"]]))
+    if ws_pos not in WS_POS_TO_CLASS:
+        return None, None, f"waveshaper type {ws_pos} not one of our six"
+
+    vec = np.zeros(NUM_PARAMS, dtype=np.float64)
+    vec[PARAM_INDEX["midi_note"]] = 0.5  # placeholder; the sampler draws the note
+    vec[PARAM_INDEX["filter_type"]] = FILTER_POS_TO_CLASS[f_pos] / (len(LP_FILTERS) - 1)
+    ws_class = WS_POS_TO_CLASS[ws_pos]
+    vec[PARAM_INDEX["waveshaper_type"]] = ws_class / (len(WAVESHAPER_TYPES) - 1)
+    voices = int(round(xml_p[ENUM_TAGS["voices"]]))
+    unison = voices > 1  # our space has 1 or 2 voices; 3+ voice presets become 2 voices
+    vec[PARAM_INDEX["unison"]] = 1.0 if unison else 0.0
+
+    clipped = []
+    for name, (tag, _pname, _lo, _hi, _kind) in CONTINUOUS.items():
+        lo, hi = ranges[name]
+        raw = (xml_p[tag] - lo) / (hi - lo)
+        v = _RAW_TO_VEC.get(name, lambda r: r)(raw)
+        if v < -1e-6 or v > 1 + 1e-6:
+            clipped.append(name)
+        vec[PARAM_INDEX[name]] = min(max(v, 0.0), 1.0)
+    # Inactive controls are exactly 0, as in surge_spec.draw_patch / canonicalize_vector
+    if not unison:
+        vec[PARAM_INDEX["unison_detune"]] = 0.0
+    if ws_class == 0:
+        vec[PARAM_INDEX["drive"]] = 0.0
+    fm_off = int(round(xml_p.get(ENUM_TAGS["fm_switch"], 1))) == 0  # tag absent: keep the depth
+    if fm_off:
+        vec[PARAM_INDEX["fm_depth"]] = 0.0
+    # chorus_mix / delay_mix / delay_fb stay 0: preset FX are not projected
+    inactive = {"unison_detune": not unison, "drive": ws_class == 0,
+                "fm_depth": fm_off}
+    return vec.astype(np.float32), [c for c in clipped if not inactive.get(c, False)], None
+
+
+def is_val_row(vec: np.ndarray, val_frac: float) -> bool:
+    h = hashlib.md5(np.round(vec, 5).astype(np.float32).tobytes()).hexdigest()
+    return (int(h[:8], 16) % 10000) < val_frac * 10000
+
+
+def collect_presets(surge_data_dir, new_loops_zip):
+    """-> list of (name, bytes) for every .fxp under a path containing 'bass'."""
+    out = []
+    if surge_data_dir and os.path.isdir(surge_data_dir):
+        for root, _dirs, files in os.walk(surge_data_dir):
+            if "bass" in root.lower():
+                for f in files:
+                    if f.endswith(".fxp"):
+                        with open(os.path.join(root, f), "rb") as fh:
+                            out.append((os.path.relpath(os.path.join(root, f), surge_data_dir), fh.read()))
+    if new_loops_zip and os.path.exists(new_loops_zip):
+        with zipfile.ZipFile(new_loops_zip) as z:
             for info in z.infolist():
                 if "bass" in info.filename.lower() and info.filename.endswith(".fxp"):
-                    z.extract(info, NL_EXTRACT_DIR)
-                    files.append(os.path.join(NL_EXTRACT_DIR, info.filename))
-    return sorted(list(set(files)))
+                    out.append(("NewLoops/" + info.filename, z.read(info)))
+    return sorted(out)
 
-def parse_fxp_to_xml(path):
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-        start = data.find(b"<?xml")
-        if start == -1: return None
-        end = data.rfind(b"</patch>") + 8
-        root = ET.fromstring(data[start:end].decode("utf-8", errors="ignore"))
-        params = root.find("parameters")
-        if params is None: return None
-        d = {}
-        for elem in params:
-            try:
-                d[elem.tag] = float(elem.attrib.get("value", 0.0))
-            except:
-                pass
-        return d
-    except:
-        return None
 
-def extract_preset_vector(xml_p: dict) -> np.ndarray:
-    """Map XML parameters into the canonical normalized 23-d vector space."""
-    # 0: midi_note (default around 36 = C2, normalized [0, 1] for 28..50)
-    midi_note = (36.0 - 28.0) / (50.0 - 28.0)
+def build_manifold(presets, ranges, val_frac=0.1):
+    rows, names, skips = [], [], {}
+    clip_counts = np.zeros(NUM_PARAMS)
+    seen = set()
+    for name, data in presets:
+        xml_p = parse_fxp(data)
+        if xml_p is None:
+            reason = "unparseable"
+            vec = None
+        else:
+            vec, clipped, reason = preset_to_vector(xml_p, ranges)
+        if vec is None:
+            skips[reason] = skips.get(reason, 0) + 1
+            continue
+        key = np.round(vec, 5).tobytes()
+        if key in seen:
+            skips["duplicate vector"] = skips.get("duplicate vector", 0) + 1
+            continue
+        seen.add(key)
+        for c in clipped:
+            clip_counts[PARAM_INDEX[c]] += 1
+        rows.append(vec)
+        names.append(name)
+    if not rows:
+        raise RuntimeError(f"no usable presets (skips: {skips})")
+    params = np.stack(rows)
+    is_val = np.array([is_val_row(v, val_frac) for v in params])
+    return params, names, is_val, skips, clip_counts / len(rows)
 
-    # 1: filter_type (LP 12dB=0, LP 24dB=1, Legacy=2, Vintage=3, OB12=4, OB24=5, K35=6, Diode=7, Warp=8, Res=9)
-    f_type_raw = xml_p.get("a_filter1_type", 1.0)
-    filter_type = np.clip(f_type_raw / 9.0, 0.0, 1.0)
-
-    # 2: shape (saw <-> morph <-> pulse). XML a_osc1_param0: -1 to +1 or 0 to 1
-    p0 = xml_p.get("a_osc1_param0", 0.0)
-    if p0 < 0:
-        shape = (p0 + 1.0) / 2.0
-    elif p0 <= 1.0:
-        shape = p0
-    else:
-        shape = 0.5
-    shape = float(np.clip(shape, 0.0, 1.0))
-
-    # 3: width (pulse width). XML a_osc1_param1: 0.0 to 1.0
-    p1 = xml_p.get("a_osc1_param1", 0.5)
-    if -1.0 <= p1 <= 1.0:
-        width = (p1 + 1.0) / 2.0 if p1 < 0 else p1
-    else:
-        width = 0.5
-    width = float(np.clip(width, 0.0, 1.0))
-
-    # 4: sub_mix. XML a_osc1_param2: 0.0 to 1.0, clamp max to 0.50
-    p2 = xml_p.get("a_osc1_param2", 0.0)
-    sub_mix = float(np.clip(p2 if 0.0 <= p2 <= 1.0 else 0.0, 0.0, 0.50))
-
-    # 5: sync. XML a_osc1_param3: 0.0 to 60.0 semitones
-    p3 = xml_p.get("a_osc1_param3", 0.0)
-    sync = float(np.clip(p3 / 60.0 if 0.0 <= p3 <= 60.0 else 0.0, 0.0, 0.40))
-
-    # 6: fm_depth. XML a_fm_depth: -48 dB to +24 dB
-    fm = xml_p.get("a_fm_depth", -48.0)
-    fm_raw = (fm + 48.0) / 72.0 if -48.0 <= fm <= 24.0 else 0.0
-    fm_depth = float(np.clip(fm_raw, 0.0, 0.45))
-
-    # 7: unison (0 or 1). XML a_osc1_param6: voices
-    u_voices = xml_p.get("a_osc1_param6", 1.0)
-    unison = 1.0 if u_voices > 1.0 else 0.0
-
-    # 8: unison_detune (raw / 0.35)
-    u_detune = xml_p.get("a_osc1_param5", 0.0)
-    unison_detune = float(np.clip(u_detune / 0.35 if unison > 0.5 and 0 <= u_detune <= 0.35 else 0.0, 0.0, 1.0))
-
-    # 9: cutoff (-60 to +70 semitones -> 0..1)
-    f_cut = xml_p.get("a_filter1_cutoff", -8.5)
-    cutoff = float(np.clip((f_cut + 60.0) / 130.0, 0.05, 0.90))
-
-    # 10: resonance (0..1)
-    res = xml_p.get("a_filter1_resonance", 0.0)
-    resonance = float(np.clip(res if 0 <= res <= 1.0 else 0.0, 0.0, 0.95))
-
-    # 11: keytrack (-100% to +100% -> 0..1)
-    kt = xml_p.get("a_filter1_keytrack", 1.0)
-    keytrack = float(np.clip((kt + 1.0) / 2.0 if -1 <= kt <= 1.0 else 0.5, 0.0, 1.0))
-
-    # 12: feg_amount (-96 to +96 -> 0..1)
-    f_env = xml_p.get("a_filter1_envmod", 0.0)
-    feg_amount = float(np.clip((f_env + 96.0) / 192.0, 0.0, 1.0))
-
-    # 13: feg_decay (-8 to +5 -> 0..1)
-    fe_d = xml_p.get("a_env2_decay", -2.0)
-    feg_decay = float(np.clip((fe_d + 8.0) / 13.0, 0.02, 0.85))
-
-    # 14: feg_sustain (0..1)
-    fe_s = xml_p.get("a_env2_sustain", 0.0)
-    feg_sustain = float(np.clip(fe_s if 0 <= fe_s <= 1.0 else 0.0, 0.0, 1.0))
-
-    # 15: aeg_decay (-8 to +5 -> 0..1)
-    ae_d = xml_p.get("a_env1_decay", -0.75)
-    aeg_decay = float(np.clip((ae_d + 8.0) / 13.0, 0.02, 0.85))
-
-    # 16: aeg_sustain (0..1)
-    ae_s = xml_p.get("a_env1_sustain", 1.0)
-    aeg_sustain = float(np.clip(ae_s if 0 <= ae_s <= 1.0 else 1.0, 0.0, 1.0))
-
-    # 17: aeg_release (-8 to +5 -> 0..1)
-    ae_r = xml_p.get("a_env1_release", -3.75)
-    aeg_release = float(np.clip((ae_r + 8.0) / 13.0, 0.01, 0.85))
-
-    # 18: waveshaper_type (0 to 5)
-    ws = xml_p.get("a_ws_type", 0.0)
-    ws_idx = float(np.clip(ws / 5.0 if 0 <= ws <= 5.0 else 0.0, 0.0, 1.0))
-
-    # 19: drive (0..1)
-    drv = xml_p.get("a_ws_drive", 0.0)
-    drive = float(np.clip(drv / 24.0 if 0 <= drv <= 24.0 else 0.0, 0.0, 1.0))
-
-    # 20: chorus_mix, 21: delay_mix, 22: delay_fb (dry)
-    chorus_mix = 0.0
-    delay_mix = 0.0
-    delay_fb = 0.0
-
-    return np.array([
-        midi_note, filter_type, shape, width, sub_mix, sync, fm_depth,
-        unison, unison_detune, cutoff, resonance, keytrack, feg_amount,
-        feg_decay, feg_sustain, aeg_decay, aeg_sustain, aeg_release,
-        ws_idx, drive, chorus_mix, delay_mix, delay_fb
-    ], dtype=np.float32)
 
 def main():
-    files = collect_fxp_files()
-    print(f"Collected {len(files)} bass preset files.")
-    vectors = []
-    names = []
-    for f in files:
-        xml_p = parse_fxp_to_xml(f)
-        if xml_p is not None:
-            vec = extract_preset_vector(xml_p)
-            vectors.append(vec)
-            names.append(os.path.basename(f))
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--surge_data_dir", default=SURGE_DATA_DIR)
+    ap.add_argument("--new_loops_zip", default=NEW_LOOPS_ZIP)
+    ap.add_argument("--out", default=OUTPUT_PATH)
+    ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
+    ap.add_argument("--val_frac", type=float, default=0.1, help="held-out preset fraction")
+    ap.add_argument("--use_measured_ranges", action="store_true")
+    ap.add_argument("--no_plugin", action="store_true", help="skip calibration (unverified; dry look only)")
+    args = ap.parse_args()
 
-    vectors = np.array(vectors, dtype=np.float32)
-    print(f"Extracted parameter matrix shape: {vectors.shape}")
+    if args.no_plugin:
+        print("WARNING: --no_plugin: native ranges are UNVERIFIED against the plugin.")
+        ranges = {n: (c[2], c[3]) for n, c in CONTINUOUS.items()}
+    else:
+        import pedalboard
+        plugin = pedalboard.load_plugin(os.path.expanduser(args.plugin))
+        verify_surge_mapping(plugin)  # enum raw values <-> names
+        ranges = calibrate_ranges(plugin, use_measured=args.use_measured_ranges)
+        print("Native ranges verified against the plugin.")
 
-    mean = np.mean(vectors, axis=0)
-    cov = np.cov(vectors, rowvar=False)
-    p10 = np.percentile(vectors, 10, axis=0)
-    p50 = np.percentile(vectors, 50, axis=0)
-    p90 = np.percentile(vectors, 90, axis=0)
-    zero_prob = (vectors == 0).mean(axis=0)
+    presets = collect_presets(args.surge_data_dir, args.new_loops_zip)
+    print(f"Found {len(presets)} bass preset files.")
+    params, names, is_val, skips, clip_frac = build_manifold(presets, ranges, args.val_frac)
+    print(f"Kept {len(params)} presets ({int(is_val.sum())} held out). Skipped:")
+    for k, v in sorted(skips.items(), key=lambda kv: -kv[1]):
+        print(f"  {v:4d}  {k}")
+    print(f"\n{'parameter':16s} {'mean':>6s} {'p10':>6s} {'p50':>6s} {'p90':>6s} {'zero%':>6s} {'clip%':>6s}")
+    for i, n in enumerate(PARAM_NAMES):
+        col = params[:, i]
+        print(f"{n:16s} {col.mean():6.3f} {np.percentile(col, 10):6.3f} {np.percentile(col, 50):6.3f} "
+              f"{np.percentile(col, 90):6.3f} {100 * np.mean(col == 0):6.1f} {100 * clip_frac[i]:6.1f}")
 
-    PARAM_NAMES = [
-        "midi_note", "filter_type", "shape", "width", "sub_mix", "sync", "fm_depth",
-        "unison", "unison_detune", "cutoff", "resonance", "keytrack", "feg_amount",
-        "feg_decay", "feg_sustain", "aeg_decay", "aeg_sustain", "aeg_release",
-        "waveshaper_type", "drive", "chorus_mix", "delay_mix", "delay_fb"
-    ]
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(dir=os.path.dirname(os.path.abspath(args.out)), suffix=".npz", delete=False)
+    tmp.close()
+    np.savez_compressed(tmp.name, params=params, preset_names=np.array(names), is_val=is_val,
+                        param_names=np.array(PARAM_NAMES), clip_frac=clip_frac.astype(np.float32),
+                        skip_reasons=json.dumps(skips), ranges=json.dumps(ranges),
+                        calibrated=not args.no_plugin, format_version=FORMAT_VERSION,
+                        unison_voices_raw=json.dumps(UNISON_VOICES_RAW))
+    os.replace(tmp.name, args.out)
+    print(f"\nSaved {args.out}")
 
-    print("\n--- Empirical Bass Manifold Statistics ---")
-    for i, name in enumerate(PARAM_NAMES):
-        print(f"  {name:18s}: mean={mean[i]:.3f}, std={np.sqrt(cov[i, i]):.3f}, p10={p10[i]:.3f}, p50={p50[i]:.3f}, p90={p90[i]:.3f}, zero_pct={zero_prob[i]*100:5.1f}%")
-
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    np.savez_compressed(
-        OUTPUT_PATH,
-        params=vectors,
-        preset_names=names,
-        param_names=PARAM_NAMES,
-        mean=mean,
-        cov=cov,
-        p10=p10,
-        p50=p50,
-        p90=p90,
-        zero_prob=zero_prob
-    )
-    print(f"\nSaved empirical bass manifold to: {OUTPUT_PATH}")
 
 if __name__ == "__main__":
     main()

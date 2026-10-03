@@ -28,6 +28,9 @@ v2 (2026-10-02 review, checked against the paper PDF):
   * JADE adaptation follows Zhang & Sanderson: mu_F updated with the Lehmer mean, F redrawn
     while <= 0 and truncated at 1, r1 != r2 != i, at least one crossed gene. (No external
     archive — "optional" in JADE; the paper does not say it used one.)
+  * A checkpoint trained on another prior (e.g. train_realistic_bass_overnight.py's preset prior)
+    stores its own support box as 'prior_bounds'; pass it as SynthJEPASearcher(bounds=...)
+    (checkpoint_bounds() reads it) so the search box follows the model's training data.
   * WelfordNormalizer is CHANNEL-wise (one mean/var per mel band) as in Sec. 3.1, not per
     (band, frame) element, and refuses to normalise before its statistics are frozen.
 """
@@ -110,6 +113,13 @@ def load_synth_jepa(ckpt_path: str, device: str = "cpu"):
     return model.to(device).eval(), WelfordNormalizer.from_state_dict(ckpt["normalizer"])
 
 
+def checkpoint_bounds(ckpt_path: str) -> Optional[dict]:
+    """The training-support box a checkpoint recorded ('prior_bounds'), or None (uniform prior:
+    surge_spec.CONT_BOUNDS applies)."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    return ckpt.get("prior_bounds")
+
+
 def _to_pm1(v01):
     return 2.0 * v01 - 1.0
 
@@ -117,7 +127,10 @@ def _to_pm1(v01):
 class SynthJEPASearcher:
     """Renderer-free hybrid JADE + Adam searcher over the training support."""
 
-    def __init__(self, model, normalizer: WelfordNormalizer, device="cuda:0", seed: int = 0):
+    def __init__(self, model, normalizer: WelfordNormalizer, device="cuda:0", seed: int = 0,
+                 bounds: Optional[dict] = None):
+        """bounds: {continuous parameter name: (lo, hi)} in [0, 1] vector units; default
+        surge_spec.CONT_BOUNDS (the uniform-prior training support)."""
         self.device = torch.device(device)
         self.model = model.to(self.device).eval()
         for p in self.model.parameters():
@@ -127,8 +140,9 @@ class SynthJEPASearcher:
         self.cat_sizes = [k for _, k in CAT_INDICES]
         self.gen = torch.Generator(device=self.device).manual_seed(seed)
         cont_names = [PARAM_NAMES[i] for i in CONT_INDICES]
-        self.lo = torch.tensor([_to_pm1(CONT_BOUNDS[n][0]) for n in cont_names], device=self.device)
-        self.hi = torch.tensor([_to_pm1(CONT_BOUNDS[n][1]) for n in cont_names], device=self.device)
+        box = dict(CONT_BOUNDS) if bounds is None else {n: tuple(bounds[n]) for n in cont_names}
+        self.lo = torch.tensor([_to_pm1(box[n][0]) for n in cont_names], device=self.device)
+        self.hi = torch.tensor([_to_pm1(box[n][1]) for n in cont_names], device=self.device)
         pos = {n: j for j, n in enumerate(cont_names)}
         self.pos = pos
         self.cont_names = cont_names

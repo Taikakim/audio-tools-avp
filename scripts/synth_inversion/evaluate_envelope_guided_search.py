@@ -20,7 +20,7 @@ import torch
 from audio_utils import MultiScaleSTFTLoss, make_mel_spec, prepare_target, save_patch, spectral_centroid
 from envelope_extractor import compute_envelope_loss_np, plot_envelope_profile, profile_note_envelope
 from surge_spec import LP_FILTERS, SAMPLE_RATE, WAVESHAPER_TYPES, init_synth, render_patch
-from synth_jepa_search import SynthJEPASearcher, load_synth_jepa
+from synth_jepa_search import SynthJEPASearcher, checkpoint_bounds, load_synth_jepa
 
 STEMS = [
     ("untitled_c2", "/run/media/kim/Mantu/surge_200k_models/stem_inversion_results/untitled.wav", 36, 0.08),
@@ -49,7 +49,7 @@ def main():
 
     print(f"Loading checkpoint: {args.ckpt} on {device}")
     model, normalizer = load_synth_jepa(args.ckpt, device=device)
-    searcher = SynthJEPASearcher(model, normalizer, device=device, seed=42)
+    searcher = SynthJEPASearcher(model, normalizer, device=device, seed=42, bounds=checkpoint_bounds(args.ckpt))
     synth = init_synth(verify=False)
     loss_stft = MultiScaleSTFTLoss()
 

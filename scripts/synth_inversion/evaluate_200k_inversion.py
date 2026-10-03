@@ -71,9 +71,9 @@ def main():
         print(f"Loaded {name}: {type(m).__name__} ({m.encoding})")
     searchers = []
     for name, path in parse_ckpt_specs(args.jepa):
-        from synth_jepa_search import SynthJEPASearcher, load_synth_jepa
+        from synth_jepa_search import SynthJEPASearcher, checkpoint_bounds, load_synth_jepa
         jm, jn = load_synth_jepa(path)
-        searchers.append((name, SynthJEPASearcher(jm, jn, device="cpu", seed=0)))
+        searchers.append((name, SynthJEPASearcher(jm, jn, device="cpu", seed=0, bounds=checkpoint_bounds(path))))
         print(f"Loaded {name}: Synth-JEPA ({args.jepa_budget} evals/target)")
     synth = init_synth(args.plugin)
     loss_fn = MultiScaleSTFTLoss()

@@ -121,9 +121,10 @@ def main():
 
     search_stats = {}
     for name, path in parse_ckpt_specs(args.jepa):
-        from synth_jepa_search import SynthJEPASearcher, load_synth_jepa
+        from synth_jepa_search import SynthJEPASearcher, checkpoint_bounds, load_synth_jepa
         model, normalizer = load_synth_jepa(path, device=args.device)
-        searcher = SynthJEPASearcher(model, normalizer, device=args.device, seed=0)
+        searcher = SynthJEPASearcher(model, normalizer, device=args.device, seed=0,
+                                     bounds=checkpoint_bounds(path))
         print(f"{name}: Synth-JEPA search ({args.jepa_budget} evals/target, note pinned) from {path}")
         t0, evals = time.time(), []
         for k, idx in enumerate(indices):

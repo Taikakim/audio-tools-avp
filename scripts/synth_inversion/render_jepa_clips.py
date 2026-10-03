@@ -15,7 +15,7 @@ import torch
 
 from audio_utils import MultiScaleSTFTLoss, make_mel_spec, prepare_target, save_patch, spectral_centroid
 from surge_spec import LP_FILTERS, SAMPLE_RATE, WAVESHAPER_TYPES, init_synth, render_patch
-from synth_jepa_search import SynthJEPASearcher, load_synth_jepa
+from synth_jepa_search import SynthJEPASearcher, checkpoint_bounds, load_synth_jepa
 
 STEMS = [
     ("untitled_c2", "/run/media/kim/Mantu/surge_200k_models/stem_inversion_results/untitled.wav", 36, 0.08),
@@ -63,7 +63,8 @@ def main():
         base = os.path.basename(ckpt_path).replace(".pt", "")
         print(f"\n=== Evaluating Checkpoint: {base} ===")
         model, normalizer = load_synth_jepa(ckpt_path, device=device)
-        searcher = SynthJEPASearcher(model, normalizer, device=device, seed=42)
+        searcher = SynthJEPASearcher(model, normalizer, device=device, seed=42,
+                                     bounds=checkpoint_bounds(ckpt_path))
 
         results[base] = {}
         for stem_name, t in targets.items():
