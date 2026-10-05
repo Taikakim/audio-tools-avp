@@ -43,6 +43,9 @@ WAVESHAPER_TYPES = [
 ]
 FX_SLOTS = [("fx_a1_fx_type", "Chorus", 0.3103), ("fx_a2_fx_type", "Delay", 0.0345)]
 UNISON_VOICES_RAW = {1: 0.0, 2: 0.05}
+# See apply_patch: FX state leaks between renders in one Surge instance. Keep False for anything
+# that renders more than one patch per instance (training workers, rerankers, refinement).
+FX_RENDER_ENABLED = False
 
 PARAM_NAMES = [
     "midi_note",        # 0  (NOTE_LOW..NOTE_HIGH) -> [0, 1]
@@ -354,9 +357,18 @@ def apply_patch(plugin, patch: dict) -> None:
     P["a_amp_eg_release"].raw_value = patch["aeg_release"]
     P["a_waveshaper_type"].raw_value = WAVESHAPER_TYPES[patch["ws_idx"]][1]
     P["a_waveshaper_drive"].raw_value = patch["drive_raw"]
-    P["fx_a1_output_mix"].raw_value = patch["chorus_mix"]
-    P["fx_a2_output_mix"].raw_value = patch["delay_mix"]
-    P["fx_a2_feedback_eq_feedback"].raw_value = patch["delay_fb"]
+    # FX are rendered OFF unless FX_RENDER_ENABLED. Surge keeps hidden chorus/delay state across
+    # renders: once ANY patch with chorus or delay > 0 has played in an instance, every later render
+    # in that instance comes out different, even with mix/feedback back at 0, after plugin.reset() and
+    # a 3 s silent flush (measured 2026-10-06: mel L1 0.23 vs 0.06 repeat noise, 40/40 random patches;
+    # 0/40 with FX forced off). The 5 % unconstrained random patches carried FX, so every persistent
+    # DataLoader worker was poisoned within its first few dozen samples and the whole
+    # modular_shampoo_sf_b64 run trained on altered renders (train JEPA 0.13 vs 2.8 on clean renders).
+    # The preset-derived prior has no FX (presets' FX are not projected), so off costs nothing.
+    fx_on = FX_RENDER_ENABLED
+    P["fx_a1_output_mix"].raw_value = patch["chorus_mix"] if fx_on else 0.0
+    P["fx_a2_output_mix"].raw_value = patch["delay_mix"] if fx_on else 0.0
+    P["fx_a2_feedback_eq_feedback"].raw_value = patch["delay_fb"] if fx_on else 0.0
 
 
 def render_patch(plugin, patch: dict, midi_note: int, note_dur: float,

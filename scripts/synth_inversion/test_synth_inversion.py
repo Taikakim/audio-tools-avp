@@ -833,3 +833,23 @@ def test_train_synth_jepa_139_smoke(tmp_path, monkeypatch):
     assert len(rows) == 2 and abs(rows[0]["chance"] - 25.0) < 1e-6
     ck = torch.load(tmp_path / "r" / "checkpoint_best.pt", weights_only=False)
     assert "enum_tables" in ck and ck["model_kwargs"]["cat_sizes"][0] == 11
+
+
+@pytest.mark.skipif(not os.path.exists(os.path.expanduser(__import__("surge_spec").DEFAULT_PLUGIN_PATH)),
+                    reason="needs the real Surge XT VST3")
+def test_random_patches_do_not_change_later_renders():
+    """Regression (2026-10-06): a random patch with chorus/delay used to leave hidden FX state in the
+    Surge instance, so every later render differed (the root cause of the modular_shampoo_sf_b64
+    train/val gap). With FX rendered off, a reference patch must sound the same before and after."""
+    import train_realistic_bass_overnight as T
+    from audio_utils import make_mel_spec
+    from surge_spec import DEFAULT_PLUGIN_PATH, init_synth, render_patch
+    s = init_synth(DEFAULT_PLUGIN_PATH, verify=False)
+    ref_patch, _, note, dur = T.sample_unconstrained_random_patch(np.random.RandomState(11))
+    ref = np.mean([make_mel_spec(render_patch(s, ref_patch, note, dur)) for _ in range(4)], axis=0)
+    for k in range(10):
+        p, v, n, d = T.sample_unconstrained_random_patch(np.random.RandomState(500 + k))
+        assert v[[20, 21, 22]].sum() == 0.0
+        render_patch(s, p, n, d)
+    after = np.mean([make_mel_spec(render_patch(s, ref_patch, note, dur)) for _ in range(4)], axis=0)
+    assert np.abs(after - ref).mean() < 0.06

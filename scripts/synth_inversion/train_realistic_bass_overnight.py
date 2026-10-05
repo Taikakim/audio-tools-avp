@@ -84,6 +84,10 @@ def sample_unconstrained_random_patch(rng=None):
     vec[PARAM_INDEX["unison"]] = float(unison_choice)
     ws_choice = int(rng.randint(0, len(WAVESHAPER_TYPES)))
     vec[PARAM_INDEX["waveshaper_type"]] = ws_choice / max(1, len(WAVESHAPER_TYPES) - 1)
+    # no FX: they poison the persistent worker's Surge state (surge_spec.apply_patch), and the preset
+    # prior never uses them, so random patches must not either
+    for fx in ("chorus_mix", "delay_mix", "delay_fb"):
+        vec[PARAM_INDEX[fx]] = 0.0
     vec = canonicalize_vector(vec)
     patch = vector_to_patch(vec)
     midi_note = patch["midi_note"]
