@@ -287,25 +287,41 @@ def load_pedalboard_events_from_midi(midi_path, max_dur=None):
 
 
 def main():
+    global OUT_DIR, CLIPS_DIR, MIDI_DIR, PRESETS_DIR
     import argparse
     ap = argparse.ArgumentParser(description="Invert the real-stem collection into Surge XT patches")
     ap.add_argument("--refine", choices=["phrase", "none"], default="phrase",
                     help="renderer-in-the-loop refinement of cutoff/envelopes against the whole phrase (refine.py)")
     ap.add_argument("--refine_midi", choices=["muscriptor", "mir"], default="muscriptor",
                     help="MIDI that plays the phrase during refinement (MuScriptor if its file exists)")
+    ap.add_argument("--flow_ckpt", default="/run/media/kim/Mantu/surge_200k_models/modular_shampoo_sf_b64/flow_latest.pt")
+    ap.add_argument("--out_dir", default=OUT_DIR, help="eval output root (audio/, midi/, vstpresets/, summary)")
+    ap.add_argument("--muscriptor_midi_dir", default=os.path.join(OUT_DIR, "midi_muscriptor"),
+                    help="<id>_muscriptor.mid files (phrase slicing is deterministic, so they match any out_dir)")
+    ap.add_argument("--playback_midi", choices=["mir", "muscriptor"], default="mir",
+                    help="MIDI that plays the saved phrase clip (muscriptor if its file exists)")
+    ap.add_argument("--no_user_copy", action="store_true", help="do not copy presets into the Surge user folder")
+    ap.add_argument("--stems", default="", help="comma-separated stem ids to run (default: all)")
     args = ap.parse_args()
+    OUT_DIR = args.out_dir
+    CLIPS_DIR, MIDI_DIR, PRESETS_DIR = (os.path.join(OUT_DIR, d) for d in ("audio", "midi", "vstpresets"))
+    for d in (CLIPS_DIR, MIDI_DIR, PRESETS_DIR):
+        os.makedirs(d, exist_ok=True)
     print("=" * 80)
     print("SURGE XT REAL-STEM INVERSION BENCHMARK (DYNAMIC SLICING & MIDI PLAYBACK)")
     print("=" * 80)
     print("Loading Flow model onto CPU for multi-stem inversion benchmark...")
-    model = load_inverter("/run/media/kim/Mantu/surge_200k_models/modular_shampoo_sf_b64/flow_latest.pt", device="cpu")
+    model = load_inverter(args.flow_ckpt, device="cpu")
     synth = init_synth(DEFAULT_PLUGIN_PATH)
 
     results = []
     print(f"\nProcessing {len(STEM_CATALOG)} Diverse Real Bass Stems...")
     print("-" * 80)
 
+    only = {x for x in args.stems.split(",") if x}
     for idx, item in enumerate(STEM_CATALOG):
+        if only and item["id"] not in only:
+            continue
         stem_id = item["id"]
         name = item["name"]
         path = item["path"]
@@ -411,7 +427,7 @@ def main():
         # single-note refinement does not generalise, so the phrase is always the target.
         refine_info = None
         if args.refine == "phrase":
-            mu_midi = os.path.join(OUT_DIR, "midi_muscriptor", f"{stem_id}_muscriptor.mid")
+            mu_midi = os.path.join(args.muscriptor_midi_dir, f"{stem_id}_muscriptor.mid")
             ref_events = (load_pedalboard_events_from_midi(mu_midi, max_dur=phrase_dur)
                           if args.refine_midi == "muscriptor" and os.path.exists(mu_midi) else events)
             if ref_events:
@@ -429,6 +445,9 @@ def main():
                                "midi": "muscriptor" if ref_events is not events else "mir"}
 
         # 6. Render note-matched playback with exact transcribed MIDI events
+        mu_play = os.path.join(args.muscriptor_midi_dir, f"{stem_id}_muscriptor.mid")
+        if args.playback_midi == "muscriptor" and os.path.exists(mu_play):
+            events = load_pedalboard_events_from_midi(mu_play, max_dur=phrase_dur)
         apply_patch(synth, p)
         synth.reset()
         if events:
@@ -445,7 +464,7 @@ def main():
         sf.write(pred_wav, pred_norm.T, SAMPLE_RATE)
 
         preset_name = f"Inverted_{stem_id}"
-        save_patch(synth, p, os.path.join(PRESETS_DIR, preset_name), copy_to_user_dir=True)
+        save_patch(synth, p, os.path.join(PRESETS_DIR, preset_name), copy_to_user_dir=not args.no_user_copy)
 
         # 8. Compute comparative audio metrics
         desc_pred = extract_pitch_and_envelope(pred_norm, SAMPLE_RATE)

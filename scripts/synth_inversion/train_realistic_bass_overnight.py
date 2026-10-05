@@ -58,6 +58,8 @@ from surge_spec import (  # noqa: E402
 )
 from synth_jepa_model import SynthJEPA  # noqa: E402
 from synth_jepa_search import WelfordNormalizer  # noqa: E402
+from training_controls import (EMA, LadderDataset, ladder_validation, ordinal_loss, ot_couple,  # noqa: E402
+                               render_ladder_set)
 
 FORMAT_VERSION = 2
 JEPA_KWARGS = dict(embed_dim=512, predictor_hidden=1024, num_audio_layers=8, num_param_layers=8,
@@ -144,10 +146,13 @@ def prepare_jepa_inputs(params: torch.Tensor):
     return cont, cat_onehots
 
 
-def flow_loss(model, mel, params, w_enc, generator=None):
-    """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout."""
+def flow_loss(model, mel, params, w_enc, generator=None, ot=False):
+    """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout.
+    ot=True pairs noise and targets by minibatch optimal transport (training_controls.ot_couple)."""
     x1 = codec.encode(params)
     x0 = torch.randn(x1.shape, device=x1.device, dtype=x1.dtype, generator=generator)
+    if ot:
+        x0 = ot_couple(x0, x1)
     t = torch.rand(x1.shape[0], device=x1.device, generator=generator)
     xt, target = model.path(x0, x1, t)
     pred = model(xt, t, mel)
@@ -257,6 +262,21 @@ def build_parser():
     ap.add_argument("--allow_prior_change", action="store_true", help="resume although the manifold changed")
     ap.add_argument("--purpose", default="", help="one line for run_meta.json: what question this run answers")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    # --- accuracy controls during training (training_controls.py); all off by default ---
+    ap.add_argument("--ladder_every", type=int, default=0,
+                    help="every N-th step is a ladder batch (bracketed minimal pairs); 0 = off")
+    ap.add_argument("--ladder_anchors", type=int, default=4, help="anchors per ladder batch")
+    ap.add_argument("--ladder_steps", type=int, default=16, help="steps per ladder")
+    ap.add_argument("--ladder_workers", type=int, default=2)
+    ap.add_argument("--lambda_ord", type=float, default=0.5, help="weight of the JEPA ordinal loss on ladders")
+    ap.add_argument("--ladder_val_anchors", type=int, default=0,
+                    help="held-out ladders per axis for ladder validation; 0 = off")
+    ap.add_argument("--ot_coupling", action="store_true", help="minibatch OT noise/target pairing for the flow")
+    ap.add_argument("--ema_halflife_steps", type=float, default=0.0,
+                    help="EMA of the online weights with this half-life (steps); 0 = off")
+    ap.add_argument("--lr_floor", type=float, default=1.0,
+                    help="modular/fusion: LR multiplier reached at the end of a linear decay over the last "
+                         "--decay_frac of the run (step-based when --max_steps > 0); 1.0 = constant LR")
     return ap
 
 
@@ -380,6 +400,11 @@ def train(args):
     val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1),
                 "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2)}
     log(f"Rendered fixed validation sets ({args.val_size} notes each) in {time.time() - t0:.1f}s")
+    ladder_val_set = None
+    if args.ladder_val_anchors > 0:
+        t0 = time.time()
+        ladder_val_set = render_ladder_set(synth, val_prior, args.ladder_val_anchors, args.ladder_steps, seed=3)
+        log(f"Rendered held-out ladder set ({len(ladder_val_set[0])} notes) in {time.time() - t0:.1f}s")
     del synth
     import gc
     gc.collect()
@@ -393,6 +418,19 @@ def train(args):
                         # and a forked copy of the plugin/audio state can deadlock
                         multiprocessing_context="spawn" if args.num_workers > 0 else None)
     batches = iter(loader)
+    ladder_batches = None
+    if args.ladder_every > 0:
+        ladder_loader = DataLoader(LadderDataset(args.manifold, args.plugin, args.ladder_anchors, args.ladder_steps),
+                                   batch_size=None, num_workers=args.ladder_workers, pin_memory=device.type == "cuda",
+                                   prefetch_factor=2, persistent_workers=True, worker_init_fn=_worker_init,
+                                   multiprocessing_context="spawn")
+        ladder_batches = iter(ladder_loader)
+
+    ema_jepa = EMA(jepa, args.ema_halflife_steps) if args.ema_halflife_steps > 0 else None
+    ema_flow = EMA(flow, args.ema_halflife_steps) if args.ema_halflife_steps > 0 else None
+    for g in list(getattr(opt_jepa, "param_groups", [])) + list(getattr(opt_flow, "param_groups", [])):
+        g.setdefault("base_lr", g["lr"])
+    best_kind = {"online": float("inf"), "ema": float("inf")}
 
     latest = os.path.join(args.out_dir, "checkpoint_latest.pt")
     ckpt_target = args.resume_from if args.resume_from else latest
@@ -413,6 +451,10 @@ def train(args):
         step = ckpt["step"]
         elapsed_prev = 0.0 if args.resume_from else ckpt["elapsed_s"]
         best = ckpt.get("best_val", float("inf"))
+        best_kind = ckpt.get("best_kind", best_kind)
+        if ema_jepa is not None and "ema_jepa" in ckpt:
+            ema_jepa.load_state_dict(ckpt["ema_jepa"])
+            ema_flow.load_state_dict(ckpt["ema_flow"])
         log(f"Resumed at step {step} from {os.path.basename(ckpt_target)} "
             f"({ckpt['elapsed_s'] / 3600:.2f} h previously logged, best held-out JEPA loss {best:.4f})")
     else:
@@ -436,7 +478,9 @@ def train(args):
                 "jepa_state_dict": jepa.state_dict(), "flow_state_dict": flow.state_dict(),
                 "opt_jepa": opt_jepa.state_dict(), "opt_flow": opt_flow.state_dict(),
                 "normalizer": normalizer.state_dict(), "prior_md5": prior_md5, "prior_bounds": prior_bounds,
-                "best_val": val_best, "args": vars(args), "jepa_kwargs": jepa_kwargs}
+                "best_val": val_best, "args": vars(args), "jepa_kwargs": jepa_kwargs,
+                "best_kind": best_kind,
+                **({"ema_jepa": ema_jepa.state_dict(), "ema_flow": ema_flow.state_dict()} if ema_jepa else {})}
 
     def export(tag):
         meta = {"step": step, "prior": args.manifold, "prior_md5": prior_md5}
@@ -462,6 +506,56 @@ def train(args):
             opt_jepa.train()
         if hasattr(opt_flow, "train"):
             opt_flow.train()
+        export_kinds("latest")
+
+    def export_kinds(tag):
+        """online = the weights being trained (SF y); ema = EMA of online. ("latest"/"best" stay the SF x.)"""
+        export(f"online_{tag}")
+        if ema_jepa is not None:
+            with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
+                export(f"ema_{tag}")
+
+    def validate_kinds(res_sf):
+        """Online (SF y) and EMA weights on the same fixed sets, plus held-out ladders for all kinds."""
+        kinds = {"sf": None, "online": None}
+        if ema_jepa is not None:
+            kinds["ema"] = None
+        rec = {"step": step, "time": time.time()}
+        for kind in kinds:
+            if kind == "sf":
+                res = res_sf
+            else:
+                def run_val():
+                    return {name: validate(jepa, flow, normalizer, mel_fn, a, p, w_enc, args.lambda_sig, device)
+                            for name, (a, p) in val_sets.items()}
+                if kind == "ema":
+                    with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
+                        res = run_val()
+                        lad = ladder_validation(jepa, flow, normalizer, mel_fn, ladder_val_set, args.ladder_steps,
+                                                device, codec) if ladder_val_set is not None else {}
+                else:
+                    res = run_val()
+                    lad = ladder_validation(jepa, flow, normalizer, mel_fn, ladder_val_set, args.ladder_steps,
+                                            device, codec) if ladder_val_set is not None else {}
+                res["heldout"].update(lad)
+                h = res["heldout"]
+                log(f"VAL[{kind}] step {step} | held-out JEPA {h['jepa']:.4f} flow {h['flow']:.4f} "
+                    f"R a2p {100 * h['r_a2p']:.1f}% p2a {100 * h['r_p2a']:.1f}% | train-presets JEPA "
+                    f"{res['trainpresets']['jepa']:.4f}"
+                    + (f" | ladder rho flow {lad['ladder_flow_rho_mean']:.3f} jepa {lad['ladder_jepa_rho_mean']:.3f}"
+                       if lad else ""))
+                if h["jepa"] < best_kind[kind]:
+                    best_kind[kind] = h["jepa"]
+                    if kind == "ema":
+                        with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
+                            export("ema_best")
+                    else:
+                        export("online_best")
+            for name, r in res.items():
+                for k, v in r.items():
+                    rec[f"{kind}/{name}/{k}"] = v
+        with open(os.path.join(args.out_dir, "val_kinds.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
 
     total_s = args.hours * 3600.0
     start = time.time()
@@ -485,6 +579,13 @@ def train(args):
                 g["lr"] = args.lr_flow * f
         else:
             f = 1.0
+            if args.lr_floor < 1.0:
+                frac = step / args.max_steps if args.max_steps else elapsed / total_s
+                start_decay = 1.0 - args.decay_frac
+                if frac > start_decay:
+                    f = 1.0 - (1.0 - args.lr_floor) * min(1.0, (frac - start_decay) / max(args.decay_frac, 1e-9))
+                for g in list(opt_jepa.param_groups) + list(opt_flow.param_groups):
+                    g["lr"] = g["base_lr"] * f
 
         # Dynamic batch schedule
         time_frac = min(1.0, max(0.0, elapsed / max(1e-6, total_s)))
@@ -499,7 +600,11 @@ def train(args):
             curr_b = args.batch_size
         curr_b = max(args.min_batch_size, min(args.batch_size, curr_b))
 
-        audio, params = next(batches)
+        is_ladder = ladder_batches is not None and step % args.ladder_every == args.ladder_every - 1
+        if is_ladder:
+            audio, params, _axis = next(ladder_batches)
+        else:
+            audio, params = next(batches)
         if curr_b < audio.shape[0]:
             audio = audio[:curr_b]
             params = params[:curr_b]
@@ -510,7 +615,14 @@ def train(args):
         opt_jepa.zero_grad(set_to_none=True)
         cont, cats = prepare_jepa_inputs(params)
         lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats)
-        j_loss = lp + la + args.lambda_sig * (sa + sp)
+        if is_ladder:
+            # no SIGReg on a ladder (not i.i.d.); ordinal loss on the audio embedding instead
+            o_loss = ordinal_loss(za, args.ladder_steps)
+            j_loss = lp + la + args.lambda_ord * o_loss
+            run["ord"] = run.get("ord", 0.0) + float(o_loss.detach())
+            run["n_ladder"] = run.get("n_ladder", 0) + 1
+        else:
+            j_loss = lp + la + args.lambda_sig * (sa + sp)
         j_loss.backward()
         gn = nn.utils.clip_grad_norm_(jepa.parameters(), 1.0)
         if torch.isfinite(j_loss) and torch.isfinite(gn):
@@ -521,7 +633,7 @@ def train(args):
             log(f"Step {step}: non-finite JEPA loss/grad ({float(j_loss):.4g}/{float(gn):.4g}); step skipped")
 
         opt_flow.zero_grad(set_to_none=True)
-        f_loss = flow_loss(flow, mel, params, w_enc)
+        f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling)
         f_loss.backward()
         gn = nn.utils.clip_grad_norm_(flow.parameters(), 1.0)
         if torch.isfinite(f_loss) and torch.isfinite(gn):
@@ -534,6 +646,10 @@ def train(args):
             log(f"{args.max_bad_steps} consecutive non-finite steps; exiting (code 3) without saving")
             log_file.close()
             sys.exit(3)
+
+        if ema_jepa is not None:
+            ema_jepa.update(jepa)
+            ema_flow.update(flow)
 
         with torch.no_grad():
             tgt = torch.arange(za.shape[0], device=device)
@@ -549,7 +665,9 @@ def train(args):
             log(f"Step {step:7d} | {el / 3600:5.2f}h / {args.hours:.2f}h | lr x{f:.3f} | batch {curr_b:2d} | "
                 f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f} | "
                 f"in-batch R a2p {100 * run['r_a2p'] / k:5.1f}% p2a {100 * run['r_p2a'] / k:5.1f}% "
-                f"(chance {100 / curr_b:.1f}%)")
+                f"(chance {100 / curr_b:.1f}%)"
+                + (f" | ladders {run['n_ladder']:.0f} ord {run['ord'] / max(1, run['n_ladder']):.4f}"
+                   if run.get("n_ladder") else ""))
             run = {key: 0.0 for key in run}
 
         if step % args.val_interval_steps == 0:
@@ -575,6 +693,7 @@ def train(args):
                 opt_jepa.train()
             if hasattr(opt_flow, "train"):
                 opt_flow.train()
+            validate_kinds(res)
 
         if step % args.checkpoint_interval_steps == 0:
             save_checkpoint()
@@ -585,6 +704,10 @@ def train(args):
     if hasattr(opt_flow, "eval"):
         opt_flow.eval()
     save_checkpoint()
+    if hasattr(opt_jepa, "eval"):
+        opt_jepa.eval()
+    if hasattr(opt_flow, "eval"):
+        opt_flow.eval()
     atomic_save(resume_state(best), os.path.join(args.out_dir, "checkpoint_final.pt"))
     log(f"Stopped at step {step} ({(elapsed_prev + time.time() - start) / 3600:.2f} h); "
         f"best held-out JEPA loss {best:.4f}")
