@@ -23,6 +23,7 @@ from models import load_inverter
 from surge_spec import init_synth, apply_patch, DEFAULT_PLUGIN_PATH, SAMPLE_RATE, AUDIO_LEN
 from audio_utils import make_mel_spec, save_patch, extract_pitch_and_envelope
 from inference import predict_and_rerank_candidates
+from refine import refine_patch_phrase
 
 OUT_DIR = "/run/media/kim/Mantu/surge_200k_models/real_stems_eval"
 CLIPS_DIR = os.path.join(OUT_DIR, "audio")
@@ -286,6 +287,13 @@ def load_pedalboard_events_from_midi(midi_path, max_dur=None):
 
 
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="Invert the real-stem collection into Surge XT patches")
+    ap.add_argument("--refine", choices=["phrase", "none"], default="phrase",
+                    help="renderer-in-the-loop refinement of cutoff/envelopes against the whole phrase (refine.py)")
+    ap.add_argument("--refine_midi", choices=["muscriptor", "mir"], default="muscriptor",
+                    help="MIDI that plays the phrase during refinement (MuScriptor if its file exists)")
+    args = ap.parse_args()
     print("=" * 80)
     print("SURGE XT REAL-STEM INVERSION BENCHMARK (DYNAMIC SLICING & MIDI PLAYBACK)")
     print("=" * 80)
@@ -398,6 +406,28 @@ def main():
         t_invert = time.time() - t0
         p = best["patch"]
 
+        # 5b. Renderer-in-the-loop refinement of the salient axes against the PHRASE (refine.py).
+        # Held-out test on these 24 stems (refine_phrase/): paper-MSS 11.24 -> 7.78, better on 23/24;
+        # single-note refinement does not generalise, so the phrase is always the target.
+        refine_info = None
+        if args.refine == "phrase":
+            mu_midi = os.path.join(OUT_DIR, "midi_muscriptor", f"{stem_id}_muscriptor.mid")
+            ref_events = (load_pedalboard_events_from_midi(mu_midi, max_dur=phrase_dur)
+                          if args.refine_midi == "muscriptor" and os.path.exists(mu_midi) else events)
+            if ref_events:
+                def render_phrase(patch, _ev=ref_events):
+                    apply_patch(synth, patch)
+                    synth.reset()
+                    a = synth.process(_ev, duration=phrase_dur, sample_rate=SAMPLE_RATE, num_channels=2).mean(axis=0)
+                    return (a / (np.max(np.abs(a)) + 1e-7)).astype(np.float32)
+                t1 = time.time()
+                p_flow = p
+                p, j1, j0, n_r, _ = refine_patch_phrase(render_phrase, p_flow, gt_mono_chunk, fit_fraction=1.0)
+                save_patch(synth, p_flow, os.path.join(PRESETS_DIR, f"Inverted_{stem_id}_flow_unrefined"))
+                refine_info = {"objective": [round(j0, 3), round(j1, 3)], "renders": n_r,
+                               "seconds": round(time.time() - t1, 1),
+                               "midi": "muscriptor" if ref_events is not events else "mir"}
+
         # 6. Render note-matched playback with exact transcribed MIDI events
         apply_patch(synth, p)
         synth.reset()
@@ -449,7 +479,8 @@ def main():
             "gt_wav": gt_wav,
             "pred_wav": pred_wav,
             "midi_file": midi_path,
-            "latency_s": round(t_invert, 2)
+            "latency_s": round(t_invert, 2),
+            "refine": refine_info,
         }
         results.append(record)
 
