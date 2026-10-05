@@ -180,6 +180,76 @@ def compute_wmfcc(ref_audio: np.ndarray, syn_audio: np.ndarray, sr: int = SAMPLE
     return float(cost_matrix[-1, -1] / max(1, len(wp)))
 
 
+def extract_pitch_and_envelope(y: np.ndarray, sr: int = SAMPLE_RATE) -> dict:
+    """Extract fundamental pitch F0, envelope metrics, and harmonic richness.
+    
+    Addresses the issue where low-cutoff targets behave as rhythmic sinewaves:
+    - f0_hz: Fundamental frequency via robust Yin (25 Hz - 250 Hz range)
+    - active_dur_s: Envelope duration where RMS energy > -20 dB (detects plucky vs sustained)
+    - env_center_s: Temporal energy centroid (distinguishes fast attack/decay from swell)
+    - sub_ratio: Fraction of spectral energy below 120 Hz
+    - harmonic_richness: Fraction of spectral energy above 200 Hz (sine vs saw/acid content)
+    """
+    import librosa
+
+    y_raw = np.asarray(y, dtype=np.float32)
+    y = np.mean(y_raw, axis=0) if y_raw.ndim > 1 else y_raw
+
+    # 1. Fundamental frequency (Yin with 4096 frame for clean sub-bass down to 25 Hz)
+    f0 = librosa.yin(y, fmin=25.0, fmax=250.0, sr=sr, frame_length=4096, hop_length=256)
+    valid = f0[(f0 >= 25.0) & (f0 <= 250.0)]
+    med_f0 = float(np.median(valid)) if len(valid) else 0.0
+    note_name = librosa.hz_to_note(med_f0) if med_f0 > 0 else "Unknown"
+
+    # 2. Envelope tracking via RMS energy curve
+    frame_len, hop_len = 512, 128
+    rms = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop_len)[0]
+    rms_norm = rms / (np.max(rms) + 1e-7)
+
+    times = np.arange(len(rms)) * hop_len / sr
+    active_dur = float(np.sum(rms_norm > 0.1) * hop_len / sr)
+    env_center = float(np.sum(times * rms_norm) / (np.sum(rms_norm) + 1e-7))
+
+    # 3. Spectral richness vs pure sine ratio
+    fft = np.abs(np.fft.rfft(y))
+    freqs = np.fft.rfftfreq(len(y), 1.0 / sr)
+    total_energy = np.sum(fft**2) + 1e-9
+    sub_energy = np.sum(fft[freqs <= 120.0]**2)
+    upper_energy = np.sum(fft[freqs > 200.0]**2)
+
+    # 4. Stereo width and detuning / beating modulation speed
+    stereo_width = 0.0
+    mod_speed_hz = 0.0
+    if y_raw is not None and getattr(y_raw, "ndim", 1) > 1 and y_raw.shape[0] >= 2:
+        l, r = y_raw[0], y_raw[1]
+        mid = (l + r) * 0.5
+        side = (l - r) * 0.5
+        m_e = np.sum(mid**2) + 1e-9
+        s_e = np.sum(side**2)
+        stereo_width = float(s_e / (m_e + s_e))
+        
+        # Beating speed via autocorrelation of amplitude envelope
+        import scipy.signal
+        env = np.abs(scipy.signal.hilbert(mid))
+        env_ds = scipy.signal.resample(env - np.mean(env), 500)
+        corr = np.correlate(env_ds, env_ds, mode="full")
+        corr = corr[len(corr)//2:]
+        corr /= (corr[0] + 1e-9)
+        peaks, _ = scipy.signal.find_peaks(corr[10:250], height=0.1)
+        mod_speed_hz = float(500.0 / (peaks[0] + 10)) if len(peaks) else 0.0
+
+    return {
+        "f0_hz": round(med_f0, 1),
+        "f0_note": note_name,
+        "active_dur_s": round(active_dur, 3),
+        "env_center_s": round(env_center, 3),
+        "sub_ratio": round(float(sub_energy / total_energy), 3),
+        "harmonic_richness": round(float(upper_energy / total_energy), 3),
+        "stereo_width": round(stereo_width, 4),
+        "mod_speed_hz": round(mod_speed_hz, 2)
+    }
+
+
 def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_user_dir: bool = False) -> None:
     """Export a matched patch for DAW workflows.
 
