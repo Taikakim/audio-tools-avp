@@ -86,16 +86,36 @@ class Refiner:
             best.append((self.score(q), float(v)))
         return best
 
-    def refine(self, patch, axes=DEFAULT_AXES, passes=2, n_coarse=7, n_fine=4, shrink=0.4):
+    def refine(self, patch, axes=DEFAULT_AXES, passes=2, n_coarse=7, n_fine=4, shrink=0.4,
+               cand_bounds=None, probe_out=0.0, min_span=0.03):
+        """cand_bounds: {key: (lo, hi)} -- first-pass search range per axis from the spread of the model's
+        top candidates (bounds_from_candidates) instead of the fixed half-width around the start value.
+        probe_out: also probe this fraction of the range beyond each end, in case the candidates share
+        a bias (both ideas from bracket_refiner.py, 2026-10-06). Later passes shrink around the current
+        value as before."""
         patch = dict(patch)
         cur = self.score(patch)
         self.trace.append(("start", None, cur))
         for ps in range(passes):
             for key, half in axes:
-                w = half * (shrink ** ps)
                 x = patch[key]
-                lo, hi = max(0.0, x - w), min(1.0, x + w)
+                if ps == 0 and cand_bounds and key in cand_bounds:
+                    lo, hi = cand_bounds[key]
+                    lo, hi = min(lo, x), max(hi, x)
+                    if hi - lo < min_span:
+                        c = 0.5 * (lo + hi)
+                        lo, hi = c - min_span / 2, c + min_span / 2
+                    lo, hi = max(0.0, lo), min(1.0, hi)
+                else:
+                    w = half * (shrink ** ps)
+                    lo, hi = max(0.0, x - w), min(1.0, x + w)
                 coarse = self._ladder(patch, key, lo, hi, n_coarse)
+                if ps == 0 and probe_out > 0:
+                    span = hi - lo
+                    for v in (lo - probe_out * span, hi + probe_out * span):
+                        if 0.0 <= v <= 1.0:
+                            coarse += [(self.score(dict(patch, **{key: float(v)})), float(v))]
+                    coarse.sort(key=lambda sv: sv[1])
                 vals = [v for _, v in coarse]
                 i = int(np.argmin([s for s, _ in coarse]))
                 # bracket that holds the optimum: the neighbours of the best coarse point
@@ -106,6 +126,12 @@ class Refiner:
                     self.trace.append((key, (x, v_best), s_best))
                     patch[key], cur = v_best, s_best
         return patch, cur
+
+
+def bounds_from_candidates(candidates, axes=DEFAULT_AXES, top_k=20):
+    """{key: (min, max)} over the model's top-k candidate patches (sorted best first)."""
+    top = candidates[:top_k]
+    return {k: (min(c[k] for c in top), max(c[k] for c in top)) for k, _ in axes}
 
 
 def refine_patch(synth, patch, target, midi_note, note_dur, duration=0.8, **kw):
