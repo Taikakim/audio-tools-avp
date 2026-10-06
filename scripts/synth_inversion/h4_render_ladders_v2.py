@@ -31,28 +31,40 @@ BPM, DUR = 145.0, 4.0
 VERSION = 2
 KNOBS = ("cutoff", "resonance", "feg_amount", "feg_decay", "aeg_decay", "aeg_sustain", "aeg_release",
          "shape", "sub_mix", "fm_depth")
-RHYTHMS = ("r16", "e8", "q4", "leg")
+# rhythm_id indexes THIS tuple in every file (append only). "sp" = sparse syncopated: per 16-step bar, notes on
+# steps 0 (2 steps long), 7 and 11 (1 step each), leaving 310-520 ms gaps -- room for an amp RELEASE tail.
+RHYTHMS = ("r16", "e8", "q4", "leg", "sp")
+DEFAULT_CYCLE = ("r16", "e8", "q4", "leg")
+
+
+def note_times(rhythm):
+    """[(on_sec, off_sec)] of the phrase; the gate times a release measurement needs."""
+    six = 60.0 / BPM / 4
+    if rhythm == "r16":
+        notes = [(b * 4 * six + k * six, 0.8 * six) for b in range(int(DUR / (4 * six)) + 1) for k in (1, 2, 3)]
+    elif rhythm == "sp":
+        notes = [(bar * 16 * six + st * six, ln * six) for bar in range(int(DUR / (16 * six)) + 1)
+                 for st, ln in ((0, 2), (7, 1), (11, 1))]
+    else:
+        step = {"e8": 2 * six, "q4": 4 * six, "leg": 4 * six}[rhythm]
+        notes = [(i * step, (0.8 if rhythm != "leg" else 0.98) * step) for i in range(int(DUR / step) + 1)]
+    return [(on, on + g) for on, g in notes if on + g <= DUR]
 
 
 def phrase_events(note, rhythm):
     import mido
-    six = 60.0 / BPM / 4
-    if rhythm == "r16":
-        starts, gate = [b * 4 * six + k * six for b in range(int(DUR / (4 * six)) + 1) for k in (1, 2, 3)], 0.8 * six
-    else:
-        step = {"e8": 2 * six, "q4": 4 * six, "leg": 4 * six}[rhythm]
-        starts, gate = [i * step for i in range(int(DUR / step) + 1)], (0.8 if rhythm != "leg" else 0.98) * step
     ev = []
-    for on in starts:
-        if on + gate <= DUR:
-            ev.append(mido.Message("note_on", note=int(note), velocity=100, time=on))
-            ev.append(mido.Message("note_off", note=int(note), velocity=0, time=on + gate))
+    for on, off in note_times(rhythm):
+        ev.append(mido.Message("note_on", note=int(note), velocity=100, time=on))
+        ev.append(mido.Message("note_off", note=int(note), velocity=0, time=off))
     return sorted(ev, key=lambda m: m.time)
 
 
-def make_ladder_v2(base, knob, n, rng):
-    from surge_spec import CONT_BOUNDS, PARAM_INDEX as I, canonicalize_vector
+def make_ladder_v2(base, knob, n, rng, filter_idx=None):
+    from surge_spec import CONT_BOUNDS, LP_FILTERS, PARAM_INDEX as I, canonicalize_vector
     v = np.array(base, dtype=np.float32, copy=True)
+    if filter_idx is not None:                     # force the filter TYPE (pole count / topology)
+        v[I["filter_type"]] = filter_idx / (len(LP_FILTERS) - 1)
 
     def setp(name, lo, hi):
         a, b = CONT_BOUNDS[name]
@@ -77,7 +89,7 @@ def make_ladder_v2(base, knob, n, rng):
 
 
 def render_knob(args):
-    k, knob, per_knob, seed, split = args
+    k, knob, per_knob, seed, split, filter_balanced, cycle = args
     from eval_refine_phrase import make_renderer
     from realistic_bass_prior import MANIFOLD_PATH, RealisticBassPrior
     from surge_spec import DEFAULT_PLUGIN_PATH, PARAM_INDEX, init_synth, vector_to_patch
@@ -90,9 +102,11 @@ def render_knob(args):
         peek.set_state(rng.get_state())
         archetype = peek.randint(0, prior.N)        # sample_vector's first draw picks the base preset
         _, base, note, _ = prior.sample_patch_and_midi(rng)
-        rhythm, n = li % len(RHYTHMS), (8 if (li // len(RHYTHMS)) % 2 == 0 else 16)
-        render = make_renderer(synth, phrase_events(note, RHYTHMS[rhythm]), DUR)
-        for r, vec in enumerate(make_ladder_v2(base, knob, n, rng)):
+        rname, n = cycle[li % len(cycle)], (8 if (li // len(cycle)) % 2 == 0 else 16)
+        rhythm = RHYTHMS.index(rname)
+        render = make_renderer(synth, phrase_events(note, rname), DUR)
+        fidx = li % 10 if filter_balanced else None
+        for r, vec in enumerate(make_ladder_v2(base, knob, n, rng, fidx)):
             cols["audio"].append(render(vector_to_patch(vec)).astype(np.float16))
             cols["vecs"].append(vec)
             cols["ladder"].append(li)
@@ -114,6 +128,9 @@ def main():
     ap.add_argument("--seed", type=int, default=20261007)
     ap.add_argument("--out", default=OUT)
     ap.add_argument("--knobs", default=",".join(KNOBS), help="subset, e.g. cutoff (the v2c supplement)")
+    ap.add_argument("--rhythms", default=",".join(DEFAULT_CYCLE), help=f"per-ladder rhythm cycle, from {RHYTHMS}")
+    ap.add_argument("--filter_balanced", action="store_true",
+                    help="force filter TYPE round-robin over all 10 LP types (one per ladder)")
     ap.add_argument("--split", default="val", help="prior split: val (17 presets) or train (many more)")
     ap.add_argument("--name", default="ladders_v2", help="output file stem, e.g. ladders_v2c")
     a = ap.parse_args()
@@ -121,7 +138,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
     with get_context("spawn").Pool(min(a.procs, len(KNOBS))) as pool:
-        parts = sorted(pool.map(render_knob, [(k, kn, a.per_knob, a.seed, a.split) for k, kn in enumerate(KNOBS)
+        parts = sorted(pool.map(render_knob, [(k, kn, a.per_knob, a.seed, a.split, a.filter_balanced, tuple(a.rhythms.split(","))) for k, kn in enumerate(KNOBS)
                                               if kn in a.knobs.split(",")]),
                        key=lambda p: p[0])
     cat = {c: np.concatenate([p[1][c] for p in parts]) for c in parts[0][1]}
@@ -137,8 +154,8 @@ def main():
                              "separates knob geometry from phrase geometry.",
                "created": str(date.today()), "version": VERSION,
                "script": "stable-audio-tools/scripts/synth_inversion/h4_render_ladders_v2.py",
-               "file": f"{a.name}.npz", "knobs_rendered": a.knobs.split(","), "knobs": list(KNOBS), "rhythms": list(RHYTHMS), "per_knob": a.per_knob, "seed": a.seed,
-               "prior_split": a.split, "n_renders": int(len(knob_id)), "seconds": round(time.time() - t0, 1)},
+               "file": f"{a.name}.npz", "knobs_rendered": a.knobs.split(","), "knobs": list(KNOBS), "rhythms": list(RHYTHMS), "rhythm_cycle": a.rhythms.split(","), "per_knob": a.per_knob, "seed": a.seed,
+               "prior_split": a.split, "filter_balanced": a.filter_balanced, "n_renders": int(len(knob_id)), "seconds": round(time.time() - t0, 1)},
               open(f"{a.out}/run_meta{'' if a.name == 'ladders_v2' else '_' + a.name}.json", "w"), indent=1)
     print(f"wrote {len(knob_id)} renders in {time.time() - t0:.0f}s -> {a.out}")
 
