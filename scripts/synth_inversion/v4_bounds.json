@@ -1,0 +1,198 @@
+{
+  "midi_note": [
+    28.0,
+    50.0
+  ],
+  "osc_drift": [
+    0.0,
+    1.0
+  ],
+  "osc1_volume": [
+    0.0,
+    1.0
+  ],
+  "osc1_octave": [
+    -3.0,
+    3.0
+  ],
+  "osc1_pitch": [
+    -7.0,
+    7.0
+  ],
+  "osc1_shape": [
+    -1.0,
+    1.0
+  ],
+  "osc1_width": [
+    0.0,
+    1.0
+  ],
+  "osc1_sub_mix": [
+    0.0,
+    1.0
+  ],
+  "osc1_sync": [
+    0.0,
+    60.0
+  ],
+  "osc1_unison_detune": [
+    0.0,
+    1.0
+  ],
+  "osc2_volume": [
+    0.0,
+    1.0
+  ],
+  "osc2_octave": [
+    -3.0,
+    3.0
+  ],
+  "osc2_pitch": [
+    -7.0,
+    7.0
+  ],
+  "osc2_shape": [
+    -1.0,
+    1.0
+  ],
+  "osc2_width": [
+    0.0,
+    1.0
+  ],
+  "osc2_sub_mix": [
+    0.0,
+    1.0
+  ],
+  "osc2_sync": [
+    0.0,
+    60.0
+  ],
+  "osc2_unison_detune": [
+    0.0,
+    1.0
+  ],
+  "osc3_volume": [
+    0.0,
+    1.0
+  ],
+  "osc3_octave": [
+    -3.0,
+    3.0
+  ],
+  "osc3_pitch": [
+    -7.0,
+    7.0
+  ],
+  "osc3_shape": [
+    -1.0,
+    1.0
+  ],
+  "osc3_width": [
+    0.0,
+    1.0
+  ],
+  "osc3_sub_mix": [
+    0.0,
+    1.0
+  ],
+  "osc3_sync": [
+    0.0,
+    60.0
+  ],
+  "osc3_unison_detune": [
+    0.0,
+    1.0
+  ],
+  "ringmod_12_volume": [
+    0.0,
+    1.0
+  ],
+  "ringmod_23_volume": [
+    0.0,
+    1.0
+  ],
+  "filter_balance": [
+    -1.0,
+    1.0
+  ],
+  "feedback": [
+    -1.0,
+    1.0
+  ],
+  "filter_1_cutoff": [
+    -60.0,
+    70.0
+  ],
+  "filter_1_resonance": [
+    0.0,
+    1.0
+  ],
+  "filter_1_keytrack": [
+    -1.0,
+    1.0
+  ],
+  "filter_1_feg_amount": [
+    -96.0,
+    96.0
+  ],
+  "filter_2_cutoff": [
+    -60.0,
+    70.0
+  ],
+  "filter_2_resonance": [
+    0.0,
+    1.0
+  ],
+  "filter_2_keytrack": [
+    -1.0,
+    1.0
+  ],
+  "filter_2_feg_amount": [
+    -96.0,
+    96.0
+  ],
+  "waveshaper_drive": [
+    -24.0,
+    24.0
+  ],
+  "aeg_attack": [
+    -8.0,
+    5.0
+  ],
+  "aeg_decay": [
+    -8.0,
+    5.0
+  ],
+  "aeg_sustain": [
+    0.0,
+    1.0
+  ],
+  "aeg_release": [
+    -8.0,
+    5.0
+  ],
+  "feg_attack": [
+    -8.0,
+    5.0
+  ],
+  "feg_decay": [
+    -8.0,
+    5.0
+  ],
+  "feg_sustain": [
+    0.0,
+    1.0
+  ],
+  "feg_release": [
+    -8.0,
+    5.0
+  ],
+  "feg_to_pw": [
+    -1.0,
+    1.0
+  ],
+  "chorus_mix": [
+    0.0,
+    1.0
+  ]
+}

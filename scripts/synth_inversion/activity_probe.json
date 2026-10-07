@@ -1,0 +1,292 @@
+{
+  "total_probed": 18,
+  "mismatches": 0,
+  "n_patches_per_condition": 100,
+  "results": [
+    {
+      "param_name": "osc2_octave",
+      "surge_param_name": "Osc 2 Octave",
+      "condition_name": "osc2_muted",
+      "condition_patch": {
+        "osc2_mute": true
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6218216419219971,
+      "mean_repeat_noise": 0.6218216419219971,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "osc2_octave",
+      "surge_param_name": "Osc 2 Octave",
+      "condition_name": "osc2_unmuted",
+      "condition_patch": {
+        "osc2_mute": false
+      },
+      "n_patches": 100,
+      "mean_param_diff": 2.8386380672454834,
+      "mean_repeat_noise": 0.6586849093437195,
+      "frac_silent": 0.0,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "osc2_shape",
+      "surge_param_name": "Osc 2 Shape",
+      "condition_name": "osc2_muted",
+      "condition_patch": {
+        "osc2_mute": true
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6145271062850952,
+      "mean_repeat_noise": 0.6145271062850952,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "osc2_shape",
+      "surge_param_name": "Osc 2 Shape",
+      "condition_name": "osc2_unmuted",
+      "condition_patch": {
+        "osc2_mute": false,
+        "osc2_type": "Classic"
+      },
+      "n_patches": 100,
+      "mean_param_diff": 1.3499457836151123,
+      "mean_repeat_noise": 0.6423168778419495,
+      "frac_silent": 0.11,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "osc1_unison_detune",
+      "surge_param_name": "Osc 1 Unison Detune",
+      "condition_name": "voices_1",
+      "condition_patch": {
+        "osc1_unison_voices": 1
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6145271062850952,
+      "mean_repeat_noise": 0.6145271062850952,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "osc1_unison_detune",
+      "surge_param_name": "Osc 1 Unison Detune",
+      "condition_name": "voices_2",
+      "condition_patch": {
+        "osc1_unison_voices": 2
+      },
+      "n_patches": 100,
+      "mean_param_diff": 1.879592776298523,
+      "mean_repeat_noise": 0.6179227232933044,
+      "frac_silent": 0.08,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "osc2_unison_detune",
+      "surge_param_name": "Osc 2 Unison Detune",
+      "condition_name": "osc2_muted_voices_2",
+      "condition_patch": {
+        "osc2_mute": true,
+        "osc2_unison_voices": 2
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6145271062850952,
+      "mean_repeat_noise": 0.6145271062850952,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "osc2_unison_detune",
+      "surge_param_name": "Osc 2 Unison Detune",
+      "condition_name": "osc2_unmuted_voices_1",
+      "condition_patch": {
+        "osc2_mute": false,
+        "osc2_unison_voices": 1
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.5075404644012451,
+      "mean_repeat_noise": 0.5075404644012451,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "osc2_unison_detune",
+      "surge_param_name": "Osc 2 Unison Detune",
+      "condition_name": "osc2_unmuted_voices_2",
+      "condition_patch": {
+        "osc2_mute": false,
+        "osc2_unison_voices": 2
+      },
+      "n_patches": 100,
+      "mean_param_diff": 1.2407848834991455,
+      "mean_repeat_noise": 0.5139711499214172,
+      "frac_silent": 0.04,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "waveshaper_drive",
+      "surge_param_name": "Waveshaper Drive",
+      "condition_name": "ws_off",
+      "condition_patch": {
+        "waveshaper_type": "Off"
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6145271062850952,
+      "mean_repeat_noise": 0.6145271062850952,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "waveshaper_drive",
+      "surge_param_name": "Waveshaper Drive",
+      "condition_name": "ws_hard",
+      "condition_patch": {
+        "waveshaper_type": "Hard"
+      },
+      "n_patches": 100,
+      "mean_param_diff": 9.807641983032227,
+      "mean_repeat_noise": 5.7770538330078125,
+      "frac_silent": 0.28,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "filter_2_cutoff",
+      "surge_param_name": "Filter 2 Cutoff",
+      "condition_name": "filter2_off",
+      "condition_patch": {
+        "filter_2_type": "Off"
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6145271062850952,
+      "mean_repeat_noise": 0.6145271062850952,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "filter_2_cutoff",
+      "surge_param_name": "Filter 2 Cutoff",
+      "condition_name": "filter2_on_serial",
+      "condition_patch": {
+        "filter_2_type": "LP K35",
+        "filter_config": "Serial 1"
+      },
+      "n_patches": 100,
+      "mean_param_diff": 7.258063793182373,
+      "mean_repeat_noise": 0.3836134076118469,
+      "frac_silent": 0.0,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "filter_2_cutoff",
+      "surge_param_name": "Filter 2 Cutoff",
+      "condition_name": "filter2_on_dual_mix",
+      "condition_patch": {
+        "filter_2_type": "LP K35",
+        "filter_config": "Dual 2",
+        "filter_balance": 0.0
+      },
+      "n_patches": 100,
+      "mean_param_diff": 5.141013145446777,
+      "mean_repeat_noise": 0.6575948596000671,
+      "frac_silent": 0.02,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "filter_2_cutoff",
+      "surge_param_name": "Filter 2 Cutoff",
+      "condition_name": "filter2_on_dual_single_f1",
+      "condition_patch": {
+        "filter_2_type": "LP K35",
+        "filter_config": "Dual 2",
+        "filter_balance": -1.0
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6147117614746094,
+      "mean_repeat_noise": 0.6147117614746094,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "ringmod_12_volume",
+      "surge_param_name": "Ring Modulation 1x2 Volume",
+      "condition_name": "ringmod_muted",
+      "condition_patch": {
+        "ringmod_12_mute": true,
+        "osc1_mute": false,
+        "osc2_mute": false
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.5075404644012451,
+      "mean_repeat_noise": 0.5075404644012451,
+      "frac_silent": 1.0,
+      "empirically_active": false,
+      "table_predicted_active": false,
+      "agrees": true
+    },
+    {
+      "param_name": "ringmod_12_volume",
+      "surge_param_name": "Ring Modulation 1x2 Volume",
+      "condition_name": "ringmod_unmuted_osc2_muted",
+      "condition_patch": {
+        "ringmod_12_mute": false,
+        "osc1_mute": false,
+        "osc2_mute": true
+      },
+      "n_patches": 100,
+      "mean_param_diff": 1.177354097366333,
+      "mean_repeat_noise": 0.6234150528907776,
+      "frac_silent": 0.17,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    },
+    {
+      "param_name": "ringmod_12_volume",
+      "surge_param_name": "Ring Modulation 1x2 Volume",
+      "condition_name": "ringmod_unmuted_both_active",
+      "condition_patch": {
+        "ringmod_12_mute": false,
+        "osc1_mute": false,
+        "osc2_mute": false
+      },
+      "n_patches": 100,
+      "mean_param_diff": 0.6881096363067627,
+      "mean_repeat_noise": 0.5093684196472168,
+      "frac_silent": 0.36,
+      "empirically_active": true,
+      "table_predicted_active": true,
+      "agrees": true
+    }
+  ]
+}
