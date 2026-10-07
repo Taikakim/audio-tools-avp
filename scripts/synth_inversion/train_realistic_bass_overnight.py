@@ -146,7 +146,7 @@ def prepare_jepa_inputs(params: torch.Tensor):
     return cont, cat_onehots
 
 
-def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3):
+def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3, loss_type="mse"):
     """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout.
     ot=True pairs noise and targets by minibatch optimal transport (training_controls.ot_couple).
     cond_noise=True (H6): each sample's audio condition is noised to level tau (1 = clean, share clean_frac;
@@ -165,7 +165,8 @@ def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=Fa
         pred = model(xt, t, model.noisy(mel, tau, generator=generator), tau=tau)
     else:
         pred = model(xt, t, mel)
-    return ((w_enc * (pred - target) ** 2).sum(dim=1) / w_enc.sum()).mean()
+    err = (pred - target).abs() if loss_type == "mae" else (pred - target) ** 2   # MAE: Synth-JDF supp. 4
+    return ((w_enc * err).sum(dim=1) / w_enc.sum()).mean()
 
 
 def lr_factor(step, frac, warmup_steps, decay_frac):
@@ -283,6 +284,8 @@ def build_parser():
     ap.add_argument("--ot_coupling", action="store_true", help="minibatch OT noise/target pairing for the flow")
     ap.add_argument("--cond_noise", action="store_true",
                     help="EXPERIMENTS H6: train the flow on partly noised audio conditions (tau is a model input)")
+    ap.add_argument("--flow_loss", choices=("mse", "mae"), default="mse",
+                    help="velocity-matching error; Synth-JDF (supp. sec. 4) found MAE slightly better")
     ap.add_argument("--cond_noise_clean_frac", type=float, default=0.3,
                     help="share of flow samples with a clean condition (tau=1); the rest tau ~ logit-normal(0, 1)")
     ap.add_argument("--ema_halflife_steps", type=float, default=0.0,
@@ -658,7 +661,7 @@ def train(args):
 
         opt_flow.zero_grad(set_to_none=True)
         f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
-                           clean_frac=args.cond_noise_clean_frac)
+                           clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss)
         f_loss.backward()
         gn = nn.utils.clip_grad_norm_(flow.parameters(), 1.0)
         if torch.isfinite(f_loss) and torch.isfinite(gn):

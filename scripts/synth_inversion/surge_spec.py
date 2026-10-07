@@ -46,6 +46,11 @@ UNISON_VOICES_RAW = {1: 0.0, 2: 0.05}
 # See apply_patch: FX state leaks between renders in one Surge instance. Keep False for anything
 # that renders more than one patch per instance (training workers, rerankers, refinement).
 FX_RENDER_ENABLED = False
+# FX slot TYPE raw values (30-value list): Off, and the init preset's own A1 Chorus / A2 Delay. Disabling FX
+# must set the TYPE to Off; a zero mix alone leaves the delay audible (see apply_patch, 2026-10-07).
+FX_TYPE_OFF = 0.005
+FX_A1_TYPE_CHORUS = 0.3103
+FX_A2_TYPE_DELAY = 0.0345
 
 PARAM_NAMES = [
     "midi_note",        # 0  (NOTE_LOW..NOTE_HIGH) -> [0, 1]
@@ -365,10 +370,21 @@ def apply_patch(plugin, patch: dict) -> None:
     # DataLoader worker was poisoned within its first few dozen samples and the whole
     # modular_shampoo_sf_b64 run trained on altered renders (train JEPA 0.13 vs 2.8 on clean renders).
     # The preset-derived prior has no FX (presets' FX are not projected), so off costs nothing.
+    # 2026-10-07: "Output - Mix" = 0 does NOT silence the slot. With the init preset's FX A2 = Delay at mix 0
+    # (and feedback 0) a single 8th note still repeats at -11 dB re peak every ~250 ms (a staircase down to
+    # -100 dB), so every render since the 10-06 fix carried a loud fixed delay: training data, refinement,
+    # eval clips (heard in the eval page; measured in single_note / fx_probe checks). Off means the slot TYPE
+    # is Off; set the type first (a type change re-initialises that slot), then the mixes. pedalboard drops an
+    # Off slot's own parameters (mix, feedback) from plugin.parameters, so re-read the dict after the type
+    # change and only touch them when the slot is on.
     fx_on = FX_RENDER_ENABLED
-    P["fx_a1_output_mix"].raw_value = patch["chorus_mix"] if fx_on else 0.0
-    P["fx_a2_output_mix"].raw_value = patch["delay_mix"] if fx_on else 0.0
-    P["fx_a2_feedback_eq_feedback"].raw_value = patch["delay_fb"] if fx_on else 0.0
+    P["fx_a1_fx_type"].raw_value = FX_A1_TYPE_CHORUS if fx_on else FX_TYPE_OFF
+    P["fx_a2_fx_type"].raw_value = FX_A2_TYPE_DELAY if fx_on else FX_TYPE_OFF
+    if fx_on:
+        P = plugin.parameters
+        P["fx_a1_output_mix"].raw_value = patch["chorus_mix"]
+        P["fx_a2_output_mix"].raw_value = patch["delay_mix"]
+        P["fx_a2_feedback_eq_feedback"].raw_value = patch["delay_fb"]
 
 
 def render_patch(plugin, patch: dict, midi_note: int, note_dur: float,

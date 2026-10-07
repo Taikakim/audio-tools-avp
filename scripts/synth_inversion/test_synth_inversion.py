@@ -911,3 +911,39 @@ def test_cond_noise_flow_loss_runs_and_backprops():
     loss = trb.flow_loss(m, mel, params, w, cond_noise=True, clean_frac=0.3)
     loss.backward()
     assert torch.isfinite(loss) and m.tau_embed[1].weight.grad is not None
+
+
+# --- 2026-10-07: FX must be really OFF (a zero mix left the delay audible) --------------------------------
+
+def test_fx_off_single_note_has_no_delay_trail():
+    """One 8th note: after the AEG release the tail must fall away, not repeat. With the delay slot active at
+    mix 0 it repeated at -11 dB every ~250 ms; with the slot type Off it is below -60 dB within 0.3 s."""
+    import mido
+    from surge_spec import DEFAULT_PLUGIN_PATH, SAMPLE_RATE, apply_patch, init_synth, FX_TYPE_OFF
+    synth = init_synth(DEFAULT_PLUGIN_PATH, verify=False)
+    patch = surge_spec.vector_to_patch(surge_spec.patch_to_vector(surge_spec.draw_patch(3)))
+    patch.update(aeg_sustain=0.8, aeg_release=0.05, chorus_mix=0.0, delay_mix=0.0, delay_fb=0.0)
+    apply_patch(synth, patch)
+    P = synth.parameters
+    assert abs(P["fx_a1_fx_type"].raw_value - FX_TYPE_OFF) < 1e-3 and abs(P["fx_a2_fx_type"].raw_value - FX_TYPE_OFF) < 1e-3
+    synth.reset()
+    off_t = 0.05 + 0.207
+    a = synth.process([mido.Message("note_on", note=40, velocity=100, time=0.05),
+                       mido.Message("note_off", note=40, velocity=0, time=off_t)],
+                      duration=1.5, sample_rate=SAMPLE_RATE, num_channels=2).mean(0)
+    peak = np.abs(a[: int(off_t * SAMPLE_RATE)]).max()
+    late = a[int((off_t + 0.4) * SAMPLE_RATE):]
+    assert 20 * np.log10(np.sqrt(np.mean(late ** 2)) / peak + 1e-12) < -60
+
+
+def test_flow_loss_mae_option():
+    import train_realistic_bass_overnight as trb
+    m = _small_flow(False).train()
+    mel = torch.randn(4, 1, 128, 81)
+    params = torch.from_numpy(np.stack([surge_spec.patch_to_vector(surge_spec.draw_patch(i))
+                                        for i in range(4)]).astype(np.float32))
+    w = torch.ones(codec.ENCODED_DIM)
+    g = lambda: torch.Generator().manual_seed(5)   # noqa: E731
+    mse = trb.flow_loss(m, mel, params, w, generator=g(), loss_type="mse")
+    mae = trb.flow_loss(m, mel, params, w, generator=g(), loss_type="mae")
+    assert torch.isfinite(mae) and float(mae) != float(mse)
