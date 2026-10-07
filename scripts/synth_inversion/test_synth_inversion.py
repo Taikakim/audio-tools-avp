@@ -853,3 +853,61 @@ def test_random_patches_do_not_change_later_renders():
         render_patch(s, p, n, d)
     after = np.mean([make_mel_spec(render_patch(s, ref_patch, note, dur)) for _ in range(4)], axis=0)
     assert np.abs(after - ref).mean() < 0.06
+
+
+# --- H6: conditioning-noise flow (cond_noise) -------------------------------------------------------------
+
+def _small_flow(cond_noise):
+    torch.manual_seed(0)
+    return FlowMatchingResMLP(hidden_dim=32, num_layers=2, cond_noise=cond_noise).eval()
+
+
+def test_cond_noise_off_is_unchanged_and_refuses_tau():
+    m = _small_flow(False)
+    assert not hasattr(m, "tau_embed")
+    mel = torch.randn(2, 1, 128, 81)
+    g = torch.Generator().manual_seed(1)
+    x = m.sample(mel, num_steps=2, generator=g)
+    assert x.shape == (2, m.param_dim)
+    with pytest.raises(ValueError):
+        m.sample(mel, num_steps=2, tau=0.5)
+
+
+def test_cond_noise_noisy_endpoints():
+    m = _small_flow(True)
+    with torch.no_grad():
+        m.mel_mean.copy_(torch.linspace(-50, -10, 128))
+        m.mel_std.copy_(torch.full((128,), 7.0))
+    mel = m.mel_mean[None, None, :, None] + 7.0 * torch.randn(4, 1, 128, 81)
+    assert torch.allclose(m.noisy(mel, 1.0), mel, atol=1e-4)            # tau = 1 is the clean condition
+    z0 = (m.noisy(mel, 0.0) - m.mel_mean[None, None, :, None]) / 7.0  # tau = 0 is pure standard noise
+    assert abs(float(z0.mean())) < 0.05 and abs(float(z0.std()) - 1.0) < 0.05
+    per_sample = m.noisy(mel, torch.tensor([1.0, 0.0, 1.0, 0.0]))
+    assert torch.allclose(per_sample[0], mel[0], atol=1e-4) and not torch.allclose(per_sample[1], mel[1])
+
+
+def test_cond_noise_checkpoint_roundtrip(tmp_path):
+    m = _small_flow(True)
+    with torch.no_grad():
+        m.mel_mean.fill_(-30.0)
+        m.mel_std.fill_(5.0)
+    p = tmp_path / "flow.pt"
+    torch.save({"model_state": m.state_dict(), "args": {"model_type": "flow"}}, p)
+    r = load_inverter(str(p))
+    assert r.cond_noise and float(r.mel_mean[0]) == -30.0 and float(r.mel_std[0]) == 5.0
+    mel = torch.randn(2, 1, 128, 81)
+    a = m.sample(mel, num_steps=3, generator=torch.Generator().manual_seed(2), tau=0.3)
+    b = r.sample(mel, num_steps=3, generator=torch.Generator().manual_seed(2), tau=0.3)
+    assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_cond_noise_flow_loss_runs_and_backprops():
+    import train_realistic_bass_overnight as trb
+    m = _small_flow(True).train()
+    mel = torch.randn(4, 1, 128, 81)
+    params = torch.from_numpy(np.stack([surge_spec.patch_to_vector(surge_spec.draw_patch(i))
+                                        for i in range(4)]).astype(np.float32))
+    w = torch.ones(codec.ENCODED_DIM)
+    loss = trb.flow_loss(m, mel, params, w, cond_noise=True, clean_frac=0.3)
+    loss.backward()
+    assert torch.isfinite(loss) and m.tau_embed[1].weight.grad is not None

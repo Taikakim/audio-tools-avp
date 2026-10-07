@@ -146,16 +146,25 @@ def prepare_jepa_inputs(params: torch.Tensor):
     return cont, cat_onehots
 
 
-def flow_loss(model, mel, params, w_enc, generator=None, ot=False):
+def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3):
     """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout.
-    ot=True pairs noise and targets by minibatch optimal transport (training_controls.ot_couple)."""
+    ot=True pairs noise and targets by minibatch optimal transport (training_controls.ot_couple).
+    cond_noise=True (H6): each sample's audio condition is noised to level tau (1 = clean, share clean_frac;
+    otherwise tau ~ logit-normal(0, 1), Synth-JDF's time distribution) and tau is passed to the model."""
     x1 = codec.encode(params)
     x0 = torch.randn(x1.shape, device=x1.device, dtype=x1.dtype, generator=generator)
     if ot:
         x0 = ot_couple(x0, x1)
     t = torch.rand(x1.shape[0], device=x1.device, generator=generator)
     xt, target = model.path(x0, x1, t)
-    pred = model(xt, t, mel)
+    if cond_noise:
+        B = x1.shape[0]
+        clean = torch.rand(B, device=x1.device, generator=generator) < clean_frac
+        tau = torch.where(clean, torch.ones(B, device=x1.device),
+                          torch.sigmoid(torch.randn(B, device=x1.device, generator=generator)))
+        pred = model(xt, t, model.noisy(mel, tau, generator=generator), tau=tau)
+    else:
+        pred = model(xt, t, mel)
     return ((w_enc * (pred - target) ** 2).sum(dim=1) / w_enc.sum()).mean()
 
 
@@ -272,6 +281,10 @@ def build_parser():
     ap.add_argument("--ladder_val_anchors", type=int, default=0,
                     help="held-out ladders per axis for ladder validation; 0 = off")
     ap.add_argument("--ot_coupling", action="store_true", help="minibatch OT noise/target pairing for the flow")
+    ap.add_argument("--cond_noise", action="store_true",
+                    help="EXPERIMENTS H6: train the flow on partly noised audio conditions (tau is a model input)")
+    ap.add_argument("--cond_noise_clean_frac", type=float, default=0.3,
+                    help="share of flow samples with a clean condition (tau=1); the rest tau ~ logit-normal(0, 1)")
     ap.add_argument("--ema_halflife_steps", type=float, default=0.0,
                     help="EMA of the online weights with this half-life (steps); 0 = off")
     ap.add_argument("--lr_floor", type=float, default=1.0,
@@ -310,7 +323,7 @@ def train(args):
     jepa_kwargs = dict(embed_dim=512, predictor_hidden=1024, num_audio_layers=8, num_param_layers=8,
                        num_slices_sigreg=64, ff_dim=args.ff_dim, in_frames=81)
     jepa = SynthJEPA(**jepa_kwargs).to(device)
-    flow = build_model(**FLOW_KWARGS).to(device)
+    flow = build_model(**FLOW_KWARGS, cond_noise=args.cond_noise).to(device)
 
     if args.optimizer == "modular":
         from stable_audio_tools.training.modular_opt import (
@@ -473,6 +486,17 @@ def train(args):
                                  "heldout_presets": val_prior.N, "calibrated": train_prior.calibrated},
                        "result": None, "kim_feedback": None}, f, indent=2)
 
+    if args.cond_noise:
+        # The flow noises its own condition in standardised space, so it carries the frozen mel stats. Write
+        # them into the EMA shadow too: the EMA averages float buffers, and its copy was taken before the stats
+        # existed (it would otherwise drift slowly from the placeholder zeros/ones).
+        with torch.no_grad():
+            flow.mel_mean.copy_(normalizer.frozen_mean.to(device))
+            flow.mel_std.copy_(normalizer.frozen_std.to(device))
+        if ema_flow is not None:
+            ema_flow.shadow["mel_mean"] = flow.mel_mean.detach().clone().float()
+            ema_flow.shadow["mel_std"] = flow.mel_std.detach().clone().float()
+
     def resume_state(val_best):
         return {"format_version": FORMAT_VERSION, "step": step, "elapsed_s": elapsed_prev + time.time() - start,
                 "jepa_state_dict": jepa.state_dict(), "flow_state_dict": flow.state_dict(),
@@ -633,7 +657,8 @@ def train(args):
             log(f"Step {step}: non-finite JEPA loss/grad ({float(j_loss):.4g}/{float(gn):.4g}); step skipped")
 
         opt_flow.zero_grad(set_to_none=True)
-        f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling)
+        f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
+                           clean_frac=args.cond_noise_clean_frac)
         f_loss.backward()
         gn = nn.utils.clip_grad_norm_(flow.parameters(), 1.0)
         if torch.isfinite(f_loss) and torch.isfinite(gn):

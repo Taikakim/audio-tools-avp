@@ -295,6 +295,8 @@ def main():
     ap.add_argument("--refine_midi", choices=["muscriptor", "mir"], default="muscriptor",
                     help="MIDI that plays the phrase during refinement (MuScriptor if its file exists)")
     ap.add_argument("--flow_ckpt", default="/run/media/kim/Mantu/surge_200k_models/modular_shampoo_sf_b64/flow_latest.pt")
+    ap.add_argument("--cond_tau", type=float, default=1.0,
+                    help="condition on a partly noised reference (cond_noise flow models only; H5/H6). 1 = clean")
     ap.add_argument("--out_dir", default=OUT_DIR, help="eval output root (audio/, midi/, vstpresets/, summary)")
     ap.add_argument("--muscriptor_midi_dir", default=os.path.join(OUT_DIR, "midi_muscriptor"),
                     help="<id>_muscriptor.mid files (phrase slicing is deterministic, so they match any out_dir)")
@@ -312,6 +314,10 @@ def main():
     print("=" * 80)
     print("Loading Flow model onto CPU for multi-stem inversion benchmark...")
     model = load_inverter(args.flow_ckpt, device="cpu")
+    if args.cond_tau != 1.0:
+        if not getattr(model, "cond_noise", False):
+            raise SystemExit("--cond_tau < 1 needs a flow trained with --cond_noise")
+        model.default_tau = args.cond_tau
     synth = init_synth(DEFAULT_PLUGIN_PATH)
 
     results = []
