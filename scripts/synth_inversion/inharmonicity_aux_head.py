@@ -12,7 +12,7 @@ class InharmonicityHead(nn.Module):
             nn.Linear(embed_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
-            nn.Sigmoid() # Inharmonicity is [0, 1]
+            nn.Softplus() # Inharmonicity is non-negative, often very small
         )
         
     def forward(self, x):
