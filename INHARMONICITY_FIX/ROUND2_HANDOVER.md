@@ -34,7 +34,10 @@ ordering pass; the extractor follows the API; your real-Essentia fixtures confir
 ## 0b. Decisions recorded, and what changed since the first draft (October 11, 2026)
 
 **Decided by Kim:** D7 = a twin of the live run. D8 = refuse loudly. D9 = write the changes (below).
-**Recommended by KUANG, awaiting Kim's confirmation:** D10 and D11 (end of this section).
+**Accepted by Kim on October 11, 2026 ("I accept all recommendations"):** D10 and D11 as written below, D12 (section 0c),
+the rule to revisit D7 after T0, and the three proposed tasks T3f (`--seed`), T3g (aux-head head start) and T10 (LR
+check). Everything in sections 0b and 0c is now decided; nothing here is awaiting Kim except what is marked below as
+needing a result first.
 
 **New finding that affects everything: the v3 parser's DEFAULTS are not the recipe** [V: parsed with the real parser at
 `a08d184`]. A command that names only a few flags runs batch 32, LRs 9e-5 and 6e-5, a constant LR (`--lr_floor 1.0`),
@@ -76,7 +79,7 @@ with `build_parser().parse_args(...)`, and compare with `RECIPE` in `twin_comman
 checked this at `a08d184`). Paste the check. The launcher has no default for `OUT_DIR`, `MAX_STEPS` or `HOURS`
 (decision D11) and writes `launch_command.txt` into the out dir, so every run records its exact command.
 
-**D10, KUANG's recommendation (gates for the T6 sweeps; fix them BEFORE looking at which cell wins).** Per grid cell:
+**D10, DECIDED (accepted October 11, 2026): the gates for the T6 sweeps; they are fixed BEFORE looking at which cell wins.** Per grid cell:
 1. False-harmonic rate at most 5%.
 2. Clean-class valid rate per window at least 90% (about 80% pooled over two windows, if independent).
 3. Tracking: Spearman at least 0.7 between the descriptor and the swept parameter on valid windows, for `fm_depth` and
@@ -93,7 +96,7 @@ harmonics is only about 3% and 2% [V: arithmetic], so the harmonic reach alone i
 noisy, detuned or FM patches are the likelier cause [I], and T2's excluded-energy histogram will show it. These numbers are judgment, not derived from data; they
 exist so the choice is made by rule, not by eye.
 
-**D11, KUANG's recommendation.** The twin has weight 0, so `W` matters only for the live run (already set) and later
+**D11, DECIDED (accepted October 11, 2026).** The twin has weight 0, so `W` matters only for the live run (already set) and later
 arms. Measure it, do not guess: on the copied live checkpoint, on CPU, compute the gradient norm with respect to `za`
 of the JEPA loss and of the unweighted aux MSE on valid rows, and set `W = target_ratio * |g_jepa| / |g_aux|`. Ratios:
 about 0.02 to 0.05 makes the head a probe in disguise (encoder barely moves); about 0.1 to 0.3 is the likely useful
@@ -129,7 +132,7 @@ Hyperball and the other regulators. What the v3 trainer does [V: `train_realisti
 that names few flags already has the Scion oracles, schedule-free averaging, damping, radial brake and weight decay.
 What it lacks is EMA, cond_noise, ladders, OT coupling, the MAE loss, batch 64, the recipe LRs and the LR schedule.
 
-**Hyperball and escape velocity (proposed decision D12).** Schedule-free and Hyperball cannot be combined (above): the
+**Hyperball and escape velocity (D12, DECIDED October 11, 2026: option (a), leave both out for now).** Schedule-free and Hyperball cannot be combined (above): the
 choice is schedule-free (the recipe) or Hyperball. (a) Leave them out, matching every reference run; the radial
 brake already limits norm growth. (b) A separate experiment on `--optimizer fusion` with `hyperball=True` and `sf` dropped: a different
 optimizer family, so not comparable with H1, H6 or v3-clean, and it needs its own control. (c) Port Hyperball into
@@ -149,7 +152,7 @@ optimizer family, so not comparable with H1, H6 or v3-clean, and it needs its ow
 - So the live run's LR is almost certainly a parser default (9e-5 and 6e-5, constant), not a decision. T0's table
   shows the real values.
 
-**Revisit D7 after T0.** EMA only averages weights for export, and cond_noise, OT coupling and the MAE loss affect only
+**Revisit D7 after T0 (rule accepted October 11, 2026).** EMA only averages weights for export, and cond_noise, OT coupling and the MAE loss affect only
 the flow, so a twin that shares them with the live run is still a valid test of the aux head. Ladders (an ordinal JEPA
 loss on every 4th step), batch size, the LRs and the LR schedule DO change how the JEPA trains. If the T0 table shows
 the live run differs from the recipe on those JEPA-side flags, the aux result may not transfer to the recipe: then
@@ -232,7 +235,11 @@ weight W); the live run then serves as a pilot [D7].
 
 ---
 
-## 4. Tasks (none needs the GPU; do T0 first)
+## 4. Tasks (do T0 first; only T10 needs the GPU, and nothing here launches a run without Kim's go)
+
+**Order of work.** T0 first, today, because the live run prunes its checkpoints. Then T1 (the clips Kim asked for) and
+the T3 fixes in the worktree can proceed in parallel. After T3: T2, then T4, then T7. T5 follows T0. T6 and T9 need
+only the CPU and T3's extractor fixes. T8 is written as decisions arrive. T10 waits for the twin and a free GPU.
 
 **T0 Record the run definition (read-only, about 10 minutes).** Write `RUN_DEFINITION.md` into the run's out dir:
 the exact command line (`ps -o args= -p <pid>`), `git rev-parse HEAD` and `git status --short` of the run tree, the
@@ -272,9 +279,9 @@ written in section 0b.
 first. **Acceptance:** all six test files pass with `REQUIRE_ALL=1` and 0 skipped; a 5-step CPU smoke run
 (`--device cpu --batch_size 4 --num_workers 0 --max_steps 5`) logs a step with `--inharm_weight 0` AND with a weight
 above 0; paste both.
-(f) PROPOSED, needs Kim's yes before you write it: a `--seed` flag that seeds torch, numpy, python `random` and the
+(f) APPROVED (Kim, October 11, 2026): a `--seed` flag that seeds torch, numpy, python `random` and the
 DataLoader workers, so a twin can start from identical initial weights. The trainer has none today [V].
-(g) PROPOSED, needs Kim's yes: a head start for the aux head. At initialization the Softplus head outputs about 0.78
+(g) APPROVED (Kim, October 11, 2026): a head start for the aux head. At initialization the Softplus head outputs about 0.78
 against labels near 0.06 (real labels: T2), so the unweighted aux MSE is about 0.5 against 0.0003 once the offset is
 fitted, and at weight 1 its gradient on the shared embedding is about 3.5 times the JEPA's [V: measured by KUANG on the
 real code with random inputs, so indicative]. Fix by initializing the head's last-layer bias so that Softplus(bias)
@@ -299,7 +306,7 @@ the descriptor value, excluded fraction, selected partial count and validity. Ev
 {0.05, 0.10, 0.15, 0.25}. For each cell report: (i) valid rate on the clean class; (ii) valid rate on each inharmonic
 class; (iii) Spearman correlation between descriptor value and the swept parameter on valid windows; (iv) the
 false-harmonic rate: inharmonic windows reported valid with a value below the clean class's 95th percentile.
-Deliver the tables and plots. Once Kim confirms the D10 gates (section 0b), mark each cell pass or fail against them;
+Deliver the tables and plots. The D10 gates (section 0b) are confirmed: mark each cell pass or fail against them;
 do not pick a winner beyond that rule. Also report per cell the share of windows at the 100-peak cap (T2): if it is more
 than a few percent, raising `max_harmonics` cannot help there, and exposing `max_peaks` as a config field is the next
 change (needs Kim's yes).
@@ -309,13 +316,13 @@ the validation interval, leaving `validate()` and `render_fixed_set` untouched (
 the constant-baseline MSE and R-squared for the train-preset and held-out-preset sets.
 
 **T8 Record decisions.** `DECISIONS.md`: D1 to D6 as answered (ask Kim for the wording if you do not have it), plus
-D7 to D11 (section 6), each with date and source of the answer.
+D7 to D12 (section 6), each with date and source of the answer (Kim, October 11, 2026, in the session).
 
 **T9 Label sanity by ear (CPU).** From the val-split prior render 24 notes: 6 each at pooled-label quantiles 10%,
 50% and 90%, and 6 rejected for high excluded energy. File names carry the label value. Kim listens to see whether
 the value tracks detuned, metallic or noisy character. This is the perceptual check the SPEC asked for.
 
-**T10 LR check (PROPOSED; needs the GPU, so after the twin and only if Kim says go).** There is no recorded test behind
+**T10 LR check (APPROVED by Kim, October 11, 2026; needs the GPU, so prepare the three commands now and launch only after the twin, when the GPU is free, with Kim's go for the slot).** There is no recorded test behind
 the LRs (section 0c). A 3-point check at constant LR: 0.5x, 1x and 2x the recipe LRs for about 5 k steps each, all other
 flags identical (build each command with `twin_command.py` and change only `--lr_jepa` and `--lr_flow`). Compare
 held-out-preset retrieval and flow validation loss at equal step, before the LR decay starts.
@@ -353,7 +360,7 @@ done
 
 ---
 
-## 6. Decisions needed from Kim
+## 6. Decisions (all decided as of October 11, 2026)
 
 - **D7 DECIDED (October 11, 2026): a twin of the live run.** Options were a restart on the reference recipe (A0 and
   A1) or a twin; the recommendation was the twin, unless
@@ -362,10 +369,16 @@ done
   alternative).
 - **D9 DECIDED (October 11, 2026): write the changes.** A new launcher plus the twin tool, and `run_v3.sh` marked
   superseded (section 0b).
-- **D10** Acceptance numbers for the calibration tables (valid rate on clean patches, false-harmonic rate). KUANG's
-  recommendation is in section 0b; awaiting Kim.
-- **D11** The aux weight `W` and the run length (hours or steps) for the next runs. KUANG's recommendation is in
-  section 0b; awaiting Kim.
+- **D10 DECIDED (October 11, 2026): the gates in section 0b**, fixed before the sweep results are read.
+- **D11 DECIDED (October 11, 2026): section 0b.** `W` comes from a measured gradient ratio at the fitted state, together
+  with the T3g head start; the twin stops at the step of the copied live checkpoint.
+- **D12 DECIDED (October 11, 2026): leave Hyperball and escape velocity out** (section 0c). Schedule-free and Hyperball
+  are mutually exclusive.
+- **Approved together with the above:** T3f (`--seed`), T3g (aux-head head start), T10 (LR check, GPU later) and the
+  rule to revisit D7 after T0.
+- **Waiting on a result, not on Kim:** (1) exposing `max_peaks` as a config field, only if T2 shows a capped share above
+  a few percent (ask then); (2) whether the T0 table triggers the restart-on-recipe branch of the D7 rule. A restart is
+  decided by that rule, but launching it still needs Kim's go for the GPU slot.
 
 ---
 
