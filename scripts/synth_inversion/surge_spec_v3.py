@@ -505,27 +505,34 @@ def apply_patch(plugin, patch: dict) -> None:
         P["fx_a2_feedback_eq_feedback"].raw_value = patch["delay_fb"]
 
 
+def phrase_events(midi_note: int):
+    n1 = int(midi_note)
+    n2 = min(n1 + 12, 127)
+    return [
+        ("note_on", n1, 105, 0.000),
+        ("note_off", n1, 0, 0.125),
+        ("note_on", n2, 105, 0.250),
+        ("note_off", n2, 0, 0.500),
+    ]
+
+def phrase_note_spans(midi_note: int):
+    n1 = int(midi_note)
+    n2 = min(n1 + 12, 127)
+    return [
+        {"note": n1, "on_s": 0.000, "off_s": 0.125},
+        {"note": n2, "on_s": 0.250, "off_s": 0.500},
+    ]
+
 def render_patch(plugin, patch: dict, midi_note: int, note_dur: float,
                  duration: float = DURATION_S, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Render a 3-note phrase to capture legato and release contours."""
+    """Render a 2-note phrase to capture legato and release contours."""
     import mido
 
     apply_patch(plugin, patch)
     plugin.reset()
     
-    # 0.8s window at 120 BPM:
-    # 0.000s: Note On (Base octave, 16th note)
-    # 0.125s: Note Off
-    # 0.250s: Note On (Base + 12 semitones, 8th note)
-    # 0.500s: Note Off
-    # Listen to final release tail for remaining 0.3s
-    
-    events = [
-        mido.Message("note_on", note=int(midi_note), velocity=105, time=0.0),
-        mido.Message("note_off", note=int(midi_note), velocity=0, time=0.125),
-        mido.Message("note_on", note=min(int(midi_note) + 12, 127), velocity=105, time=0.125), # 0.250 absolute
-        mido.Message("note_off", note=min(int(midi_note) + 12, 127), velocity=0, time=0.250), # 0.500 absolute
-    ]
+    events = [mido.Message(type, note=n, velocity=v, time=t) 
+              for type, n, v, t in phrase_events(midi_note)]
     audio = plugin.process(events, duration=duration, sample_rate=sample_rate, num_channels=2)
     mono = np.mean(audio, axis=0).astype(np.float32)
     return mono / (np.max(np.abs(mono)) + 1e-7)

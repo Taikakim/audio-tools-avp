@@ -229,8 +229,89 @@ class InharmonicityExtractor:
 
         return res
 
-def process_phrase(): pass
-def note_windows(): pass
-def pool_note_results(): pass
-def to_training_pair(): pass
-class RejectionStats: pass
+    def process_phrase(self, audio, midi_note):
+        import surge_spec_v3
+        spans = surge_spec_v3.phrase_note_spans(midi_note)
+        wins = note_windows(spans, self.cfg)
+        results = []
+        for w in wins:
+            if w is None:
+                results.append(None)
+            else:
+                window_audio = audio[w["start_sample"]:w["end_sample"]]
+                res = self.process_window(window_audio, f0_hz=w["f0_hz"])
+                results.append(res)
+        return pool_note_results(results, self.cfg)
+
+def note_windows(spans, cfg):
+    wins = []
+    for s in spans:
+        end_sample = round(s["off_s"] * cfg.sample_rate)
+        start_sample = end_sample - cfg.frame_size
+        guard_sample = round((s["on_s"] + cfg.attack_guard_s) * cfg.sample_rate)
+        if start_sample < guard_sample:
+            wins.append(None)
+        else:
+            wins.append({
+                "note": s["note"],
+                "start_sample": start_sample,
+                "end_sample": end_sample,
+                "f0_hz": 440.0 * 2.0 ** ((s["note"] - 69) / 12.0)
+            })
+    return wins
+
+def pool_note_results(results, cfg):
+    valid_vals = [r["value"] for r in results if r is not None and r.get("valid")]
+    if len(valid_vals) < cfg.min_valid_windows:
+        return {
+            "valid": False, 
+            "value": float("nan"), 
+            "rejection_reason": Reason.TOO_FEW_VALID_WINDOWS,
+            "all_rejection_reasons": [Reason.TOO_FEW_VALID_WINDOWS],
+            "n_valid_windows": len(valid_vals)
+        }
+    return {
+        "valid": True,
+        "value": float(np.mean(valid_vals)),
+        "rejection_reason": None,
+        "all_rejection_reasons": [],
+        "n_valid_windows": len(valid_vals)
+    }
+
+def to_training_pair(result):
+    if result["valid"]:
+        if not np.isfinite(result["value"]):
+            raise ValueError("Valid result with non-finite value")
+        return (result["value"], 1.0)
+    return (0.0, 0.0)
+
+class RejectionStats:
+    def __init__(self):
+        self.reset()
+        
+    def reset(self):
+        self.total = 0
+        self.valid = 0
+        self.reasons = {}
+        self.note_valid = {}
+        self.note_total = {}
+        
+    def add(self, result, note):
+        self.total += 1
+        self.note_total[note] = self.note_total.get(note, 0) + 1
+        if result["valid"]:
+            self.valid += 1
+            self.note_valid[note] = self.note_valid.get(note, 0) + 1
+        else:
+            r = result.get("rejection_reason")
+            if r:
+                self.reasons[r] = self.reasons.get(r, 0) + 1
+                
+    def summary(self):
+        return {
+            "n": self.total,
+            "n_valid": self.valid,
+            "valid_rate": self.valid / self.total if self.total > 0 else 0.0,
+            "by_reason": self.reasons,
+            "valid_rate_by_note": {k: self.note_valid.get(k, 0) / self.note_total[k] for k in self.note_total}
+        }

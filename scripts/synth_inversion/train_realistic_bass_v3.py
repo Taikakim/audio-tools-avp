@@ -129,8 +129,8 @@ class RealisticOnlineDataset(Dataset):
         audio = render_patch(self._synth, patch, midi_note, note_dur)
         if self._extractor is not None:
             inharm_res = self._extractor.process_phrase(audio, midi_note)
-            res_val = float(inharm_res["value"])
-            res_valid = float(inharm_res["valid"])
+            from inharmonicity_target import to_training_pair
+            res_val, res_valid = to_training_pair(inharm_res)
         else:
             res_val, res_valid = 0.0, 0.0
         return torch.from_numpy(audio), torch.from_numpy(vec), res_val, res_valid

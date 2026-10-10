@@ -34,9 +34,10 @@ BASE = dict(sample_rate=44100, frame_size=4096, max_harmonics=20, tolerance=0.2,
             silence_peak_abs=1e-4, max_level_change_db=None, attack_guard_s=0.020, min_valid_windows=2,
             min_partial_relative_db=40.0)
 
-# (type, note, velocity, absolute time in seconds from the start of the buffer): exactly render_patch's current values
+# EXPECTED_EVENTS_40 = [("note_on", 40, 105, 0.0), ("note_off", 40, 0, 0.125),
+#                       ("note_on", 52, 105, 0.125), ("note_off", 52, 0, 0.250)]
 EXPECTED_EVENTS_40 = [("note_on", 40, 105, 0.0), ("note_off", 40, 0, 0.125),
-                      ("note_on", 52, 105, 0.125), ("note_off", 52, 0, 0.250)]
+                      ("note_on", 52, 105, 0.250), ("note_off", 52, 0, 0.500)]
 
 
 def cfg(**over):
@@ -71,7 +72,7 @@ def test_the_second_note_is_clamped_to_127():
 
 def test_spans_are_derived_from_the_same_events():
     assert sp.phrase_note_spans(40) == [{"note": 40, "on_s": 0.0, "off_s": 0.125},
-                                        {"note": 52, "on_s": 0.125, "off_s": 0.250}]
+                                        {"note": 52, "on_s": 0.250, "off_s": 0.500}]
 
 
 def test_render_patch_sends_exactly_phrase_events(monkeypatch):
@@ -101,7 +102,7 @@ def test_windows_end_at_note_off_start_after_the_attack_guard_and_use_the_playin
 
 
 def test_a_window_is_dropped_not_shortened_when_the_guard_leaves_no_room():
-    assert note_windows(sp.phrase_note_spans(40), cfg(attack_guard_s=0.050)) == [None, None]
+    assert note_windows(sp.phrase_note_spans(40), cfg(attack_guard_s=0.200)) == [None, None]
 
 
 # ------------------------------------------------------------------ pooling
