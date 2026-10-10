@@ -23,30 +23,14 @@ class InharmonicityHead(nn.Module):
         return self.net(x).squeeze(-1)
 
 def masked_inharmonicity_loss(pred, target, valid_mask):
-    """
-    pred: [batch, ...] 
-    target: [batch, ...]
-    valid_mask: [batch, ...] (bool or float 0.0/1.0)
-    
-    Computes masked MSE loss. 
-    Returns loss (scalar) and the number of valid items.
-    """
-    # Ensure no gradients flow into target or mask
+    if not (pred.shape == target.shape == valid_mask.shape):
+        raise ValueError("pred, target and valid_mask must have identical shapes")
     target = target.detach()
-    valid_mask = valid_mask.detach().float()
-    
-    # Compute per-element loss
-    loss = F.mse_loss(pred, target, reduction='none')
-    
-    # Apply mask
-    masked_loss = loss * valid_mask
-    
-    # Calculate denominator
-    valid_count = valid_mask.sum()
-    
-    if valid_count > 0:
-        return masked_loss.sum() / valid_count, valid_count
-    else:
-        # If no valid targets, return 0 loss that still has grad_fn so DDP doesn't complain,
-        # or just 0.0 * pred.sum()
-        return 0.0 * pred.sum(), valid_count
+    valid = valid_mask.detach() != 0                       # bool or 0/1 float
+    safe = torch.where(valid, target, torch.zeros_like(target))   # NaN/inf never reach the arithmetic
+    if not torch.isfinite(safe).all():
+        raise ValueError("non-finite target on a row flagged valid")
+    sq = (pred - safe) ** 2
+    masked = torch.where(valid, sq, torch.zeros_like(sq))
+    n = valid.sum().to(pred.dtype)
+    return masked.sum() / n.clamp_min(1.0), n               # all-invalid -> exact 0 that keeps its graph
