@@ -102,11 +102,12 @@ def sample_unconstrained_random_patch(rng=None):
 class RealisticOnlineDataset(Dataset):
     """Renders prior draws online; one persistent Surge instance per worker (persistent_workers)."""
 
-    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, random_patch_frac=0.0):
+    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, random_patch_frac=0.0, inharm_cfg=None):
         self.manifold_path = manifold_path
         self.plugin_path = plugin_path
         self.length = length
         self.random_patch_frac = float(random_patch_frac)
+        self.inharm_cfg = inharm_cfg
         self._synth = None
         self._prior = None
         self._extractor = None
@@ -118,14 +119,21 @@ class RealisticOnlineDataset(Dataset):
         if self._synth is None:
             self._synth = init_synth(self.plugin_path, verify=False)  # enums verified once in the main process
             self._prior = RealisticBassPrior(self.manifold_path, split="train")
-            self._extractor = InharmonicityExtractor()
+            if self.inharm_cfg is not None:
+                from inharmonicity_target import InharmonicityExtractor
+                self._extractor = InharmonicityExtractor(self.inharm_cfg)
         if self.random_patch_frac > 0.0 and np.random.rand() < self.random_patch_frac:
             patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()
         else:
             patch, vec, midi_note, note_dur = self._prior.sample_patch_and_midi()
         audio = render_patch(self._synth, patch, midi_note, note_dur)
-        inharm_res = self._extractor.process_frame(audio, midi_note=midi_note)
-        return torch.from_numpy(audio), torch.from_numpy(vec), float(inharm_res["value"]), float(inharm_res["valid"])
+        if self._extractor is not None:
+            inharm_res = self._extractor.process_phrase(audio, midi_note)
+            res_val = float(inharm_res["value"])
+            res_valid = float(inharm_res["valid"])
+        else:
+            res_val, res_valid = 0.0, 0.0
+        return torch.from_numpy(audio), torch.from_numpy(vec), res_val, res_valid
 
 
 def _worker_init(_worker_id):
@@ -238,6 +246,8 @@ def build_parser():
                     help="fraction of training draws from unconstrained random parameter space (default: 0.05)")
     ap.add_argument("--snr_gate", action="store_true", default=False,
                     help="enable SNR gating (default: False, disabled)")
+    ap.add_argument("--inharm_weight", type=float, default=0.0)
+    ap.add_argument("--inharm_config", type=str)
     ap.add_argument("--ns_poly", default="cubic5", choices=["quintic", "cubic5", "cubic"],
                     help="Newton-Schulz polynomial for SpectralLMO (default: cubic5)")
     ap.add_argument("--radial_brake", type=float, default=0.8,
@@ -305,6 +315,14 @@ def build_parser():
 
 
 def train(args):
+    inharm_cfg = None
+    if args.inharm_weight > 0:
+        if not args.inharm_config:
+            print("error: --inharm_weight > 0 requires --inharm_config")
+            sys.exit(2)
+        from inharmonicity_target import InharmonicityConfig
+        inharm_cfg = InharmonicityConfig.from_json(args.inharm_config)
+
     global _STOP_REQUESTED
     _STOP_REQUESTED = False
     signal.signal(signal.SIGINT, _sig_handler)
@@ -333,6 +351,8 @@ def train(args):
     mel_fn = ExactGpuMel(device=device)
     jepa_kwargs = dict(embed_dim=args.embed_dim, predictor_hidden=1024, num_audio_layers=8, num_param_layers=8,
                        num_slices_sigreg=64, ff_dim=args.ff_dim, in_frames=81)
+    if args.inharm_weight > 0:
+        jepa_kwargs["inharmonicity_head"] = True
     jepa = SynthJEPA(**jepa_kwargs).to(device)
     FLOW_KWARGS["hidden_dim"] = args.flow_dim
     flow = build_model(**FLOW_KWARGS, cond_noise=args.cond_noise).to(device)
@@ -434,7 +454,7 @@ def train(args):
     import gc
     gc.collect()
 
-    loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin, random_patch_frac=args.random_patch_frac),
+    loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin, random_patch_frac=args.random_patch_frac, inharm_cfg=inharm_cfg),
                         batch_size=args.batch_size,
                         num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
                         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
@@ -468,7 +488,17 @@ def train(args):
         if ckpt["prior_md5"] != prior_md5 and not args.allow_prior_change:
             raise SystemExit(f"{ckpt_target} was trained on a different manifold (md5 {ckpt['prior_md5'][:10]}); "
                              "use a new --out_dir, or --allow_prior_change to continue anyway.")
-        jepa.load_state_dict(ckpt["jepa_state_dict"])
+        res = jepa.load_state_dict(ckpt["jepa_state_dict"], strict=False)
+        if res.missing_keys:
+            if all(k.startswith("inharmonicity_head") for k in res.missing_keys):
+                log(f"Resuming from a checkpoint without inharmonicity_head; head will be randomly initialized.")
+            else:
+                raise SystemExit(f"Unexpected missing keys in JEPA: {res.missing_keys}")
+        if res.unexpected_keys:
+            if all(k.startswith("inharmonicity_head") for k in res.unexpected_keys):
+                log(f"Resuming from a checkpoint with inharmonicity_head into a model without it; head weights ignored.")
+            else:
+                raise SystemExit(f"Unexpected extra keys in JEPA: {res.unexpected_keys}")
         flow.load_state_dict(ckpt["flow_state_dict"])
         opt_jepa.load_state_dict(ckpt["opt_jepa"])
         opt_flow.load_state_dict(ckpt["opt_flow"])
@@ -658,8 +688,13 @@ def train(args):
         opt_jepa.zero_grad(set_to_none=True)
         cont, cats = prepare_jepa_inputs(params)
         lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats)
-        inharm_pred = jepa.inharmonicity_head(za)
-        i_loss, i_count = masked_inharmonicity_loss(inharm_pred, inharm_val, inharm_valid)
+        
+        if args.inharm_weight > 0.0:
+            inharm_pred = jepa.inharmonicity_head(za)
+            i_loss, i_count = masked_inharmonicity_loss(inharm_pred, inharm_val, inharm_valid)
+            i_loss = args.inharm_weight * i_loss
+        else:
+            i_loss = 0.0
 
         if is_ladder:
             # no SIGReg on a ladder (not i.i.d.); ordinal loss on the audio embedding instead

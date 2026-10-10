@@ -1,4 +1,3 @@
-from inharmonicity_aux_head import InharmonicityHead
 """Synth-JEPA: Joint Embedding Prediction Architecture for Synthesizer Parameter Search.
 
 Reference: Hayes, Tian, Lattner, "Synth-JEPA: Joint Embedding Prediction for Renderer-Free
@@ -21,6 +20,7 @@ ff_dim=2048 gives 68.6M. This is a guess at the paper's config, not a reading of
 variant (the paper's ablation, which SIGReg beats) is not implemented.
 """
 import math
+from inharmonicity_aux_head import InharmonicityHead
 from typing import List, Tuple
 
 import torch
@@ -246,9 +246,9 @@ class SynthJEPA(nn.Module):
         num_slices_sigreg: int = 64,
         ff_dim: int = 1024,
         in_frames: int = 81,
+        inharmonicity_head: bool = False,
     ):
         super().__init__()
-        self.inharmonicity_head = InharmonicityHead(embed_dim=embed_dim)
         self.embed_dim = embed_dim
         self.audio_encoder = AudioTransformerEncoder(embed_dim=embed_dim, num_layers=num_audio_layers,
                                                      ff_dim=ff_dim, in_frames=in_frames)
@@ -256,6 +256,8 @@ class SynthJEPA(nn.Module):
         self.f_a2p = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.f_p2a = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.sigreg = SIGRegLoss(num_slices=num_slices_sigreg)
+        if inharmonicity_head:
+            self.inharmonicity_head = InharmonicityHead(embed_dim=embed_dim)
 
     def encode_audio(self, mel: torch.Tensor) -> torch.Tensor:
         return self.audio_encoder(mel)
