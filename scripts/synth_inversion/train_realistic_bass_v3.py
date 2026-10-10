@@ -739,6 +739,7 @@ def train(args):
             run["r_p2a"] += float((torch.cdist(jepa.f_p2a(zp), za).argmin(dim=1) == tgt).float().mean())
         run["jepa"] += float(j_loss.detach())
         run["inharm"] = run.get("inharm", 0.0) + float(i_loss.detach())
+        run["inharm_valid"] = run.get("inharm_valid", 0.0) + float(inharm_valid.mean())
         run["flow"] += float(f_loss.detach())
         step += 1
 
@@ -746,7 +747,7 @@ def train(args):
             k = args.log_interval_steps
             el = elapsed_prev + time.time() - start
             log(f"Step {step:7d} | {el / 3600:5.2f}h / {args.hours:.2f}h | lr x{f:.3f} | batch {curr_b:2d} | "
-                f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f} | Aux {run['inharm'] / k:.4f} | "
+                f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f} | Aux {run['inharm'] / k:.4f} (v={run['inharm_valid'] / k:.2f}) | "
                 f"in-batch R a2p {100 * run['r_a2p'] / k:5.1f}% p2a {100 * run['r_p2a'] / k:5.1f}% "
                 f"(chance {100 / curr_b:.1f}%)"
                 + (f" | ladders {run['n_ladder']:.0f} ord {run['ord'] / max(1, run['n_ladder']):.4f}"

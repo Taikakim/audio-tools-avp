@@ -1,0 +1,14 @@
+{
+    "sample_rate": 44100,
+    "frame_size": 4096,
+    "max_harmonics": 20,
+    "tolerance": 0.2,
+    "min_selected_partials": 2,
+    "max_excluded_energy_fraction": 0.15,
+    "require_fundamental_peak": true,
+    "silence_peak_abs": 1e-4,
+    "max_level_change_db": null,
+    "attack_guard_s": 0.020,
+    "min_valid_windows": 2,
+    "min_partial_relative_db": 40.0
+}
