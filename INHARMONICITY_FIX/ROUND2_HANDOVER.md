@@ -38,8 +38,8 @@ ordering pass; the extractor follows the API; your real-Essentia fixtures confir
 
 **New finding that affects everything: the v3 parser's DEFAULTS are not the recipe** [V: parsed with the real parser at
 `a08d184`]. A command that names only a few flags runs batch 32, LRs 9e-5 and 6e-5, a constant LR (`--lr_floor 1.0`),
-no ladders (`--ladder_every 0`), no OT coupling, no EMA, no `--cond_noise`, an MSE flow loss and smaller networks
-(512/512/1152). Of the 32 recipe flags, 16 differ for a minimal command. So "cond_noise is off" is probably not the only
+no ladders (`--ladder_every 0`), no OT coupling, no EMA, no `--cond_noise`, an MSE flow loss (the network sizes are the same 512/512/1152 as every reference run).
+Of the 32 recipe flags, 13 differ for a minimal command. So "cond_noise is off" is probably not the only
 difference in the live run. There is also NO `--seed` flag [V], so "same seed" in the first draft was not possible.
 
 **D7: the twin.** Generate it from the live run's own record, never by retyping flags:
@@ -85,7 +85,12 @@ checked this at `a08d184`). Paste the check. The launcher has no default for `OU
    |Spearman(descriptor, MIDI note)| at most 0.3.
 
 Among cells passing 1 to 4, pick the highest pooled valid rate on the real prior (T2). If the best is below 50%, flag it
-to Kim: the label would then describe a minority of the prior. These numbers are judgment, not derived from data; they
+to Kim: the label would then describe a minority of the prior. Expectation: the live run's pooled validity of 0.33 is
+about 0.57 per window if the two windows are independent [I]; a pooled 50% needs about 0.71 per window, so the 50% flag
+will probably trigger. Accepting either note's window (`min_valid_windows` 1) would lift pooled validity to about 0.82
+at 0.57 per window, but it changes what the label describes (D1). For clean saw or square waves the energy beyond 20
+harmonics is only about 3% and 2% [V: arithmetic], so the harmonic reach alone is unlikely to explain 0.33: bright,
+noisy, detuned or FM patches are the likelier cause [I], and T2's excluded-energy histogram will show it. These numbers are judgment, not derived from data; they
 exist so the choice is made by rule, not by eye.
 
 **D11, KUANG's recommendation.** The twin has weight 0, so `W` matters only for the live run (already set) and later
@@ -94,8 +99,9 @@ of the JEPA loss and of the unweighted aux MSE on valid rows, and set `W = targe
 about 0.02 to 0.05 makes the head a probe in disguise (encoder barely moves); about 0.1 to 0.3 is the likely useful
 range (watch a2p and p2a for a drop of more than 1 point); 1 or more lets aux dominate and is only an upper bracket.
 Run length for the twin: stop at the step of the copied live checkpoint (the early read), then decide; the full planned
-length is the final-quality comparison, after the LR decay. At the reference speed of about 4 100 steps/h, 20 k steps is
-about 5 h and 78 416 steps about 19 h (estimates; use the real rate).
+length is the final-quality comparison, after the LR decay. At the reference speed of about 4 100 steps/h (measured on the 58 M-parameter reference size), 20 k steps is
+about 5 h and 78 416 steps about 19 h. The v3 scale-up (768/2048) has 121 M parameters, 2.08 times more [V: counted
+from the real model classes]: if compute-bound, double those. Use the real rate.
 
 ---
 
@@ -115,7 +121,7 @@ Hyperball and the other regulators. What the v3 trainer does [V: `train_realisti
 | Whitening and NS polynomial | `--whitening shampoo` and `--ns_poly cubic5` by default |
 | SNR gate | Off by default, and the recipe wants it off (`run_modular_shampoo_b64.sh` header: "avoiding artificial LR braking") |
 | Escape velocity | In `ModularOptimizer` but NOT passed by the trainer: off, and there is no flag for it |
-| **Hyperball** | **Not in `ModularOptimizer`.** It exists only in `FusionOpt` (`fusion_opt.py`), reachable with `--optimizer fusion --fusion_components ...` (default list `shampoo,sf,normuon,ns5,mona`, no hyperball). No reference-recipe run used it |
+| **Hyperball** | **Not in `ModularOptimizer`.** It exists only in `FusionOpt` (`fusion_opt.py`), reachable with `--optimizer fusion --fusion_components ...` (default list `shampoo,sf,normuon,ns5,mona`). It is a constructor flag (`hyperball=True`) that the trainer never passes, and **it is incompatible with schedule-free**: `FusionOpt` raises `ValueError` if both are on, and weight decay is ignored under it [V: `fusion_opt.py` lines 311-321 and 377-384]. No reference-recipe run used it |
 | EMA | OFF by default (`--ema_halflife_steps 0.0`); the recipe sets 2000. It only averages weights for export; it does not change the online training |
 | cond_noise | OFF by default; it affects only the flow |
 
@@ -123,8 +129,9 @@ Hyperball and the other regulators. What the v3 trainer does [V: `train_realisti
 that names few flags already has the Scion oracles, schedule-free averaging, damping, radial brake and weight decay.
 What it lacks is EMA, cond_noise, ladders, OT coupling, the MAE loss, batch 64, the recipe LRs and the LR schedule.
 
-**Hyperball and escape velocity (proposed decision D12).** (a) Leave them out, matching every reference run; the radial
-brake already limits norm growth. (b) A separate experiment on `--optimizer fusion` with hyperball added: a different
+**Hyperball and escape velocity (proposed decision D12).** Schedule-free and Hyperball cannot be combined (above): the
+choice is schedule-free (the recipe) or Hyperball. (a) Leave them out, matching every reference run; the radial
+brake already limits norm growth. (b) A separate experiment on `--optimizer fusion` with `hyperball=True` and `sf` dropped: a different
 optimizer family, so not comparable with H1, H6 or v3-clean, and it needs its own control. (c) Port Hyperball into
 `ModularOptimizer`, with tests, then ablate it. KUANG recommends (a) now and (b) or (c) as a later experiment. Exposing
 `--escape_velocity` as a trainer flag is a small change if Kim wants it.
@@ -146,7 +153,7 @@ optimizer family, so not comparable with H1, H6 or v3-clean, and it needs its ow
 the flow, so a twin that shares them with the live run is still a valid test of the aux head. Ladders (an ordinal JEPA
 loss on every 4th step), batch size, the LRs and the LR schedule DO change how the JEPA trains. If the T0 table shows
 the live run differs from the recipe on those JEPA-side flags, the aux result may not transfer to the recipe: then
-restart both arms on the recipe (the other D7 option, A0 and A1, with the early read keeping it to about 5 h per arm)
+restart both arms on the recipe (the other D7 option, A0 and A1, with the early read keeping it to about 5 h per arm at the reference size, about 10 h at the v3 scale-up size)
 and keep the live run as a pilot. If the live run differs only on flow-side or export-side flags, the twin stands.
 
 ---
@@ -191,16 +198,16 @@ and keep the live run as a pilot. If the live run differs only on flow-side or e
 Sources: `run_v3_clean_home.sh` (header: "H1 recipe + --cond_noise (H6) + --flow_loss mae", Surge FX truly off) for
 the recipe, `run_v3.sh` for the v3 network sizes. All flags below appear in those launchers [V]; whether every one
 exists in the `train_realistic_bass_v3.py` parser is now **[V]**: all 32 recipe flags exist (checked against the parser
-at `a08d184`). The parser's DEFAULTS differ from the recipe on 16 of them (section 0b).
+at `a08d184`). The parser's DEFAULTS differ from the recipe on 13 of them (section 0b).
 
 | Flag(s) | Value in the launchers | Purpose |
 |---|---|---|
 | `--manifold` | v3 prior: `real_bass_manifold_v3.npz` | realistic bass prior, v3 parameters |
 | `--batch_size` | 64 | |
-| `--embed_dim --flow_dim --ff_dim` | 768 768 2048 (`run_v3.sh`) | v3 scale-up (the v1 recipe used `--ff_dim 1152`) |
+| `--embed_dim --flow_dim --ff_dim` | 512 512 1152 (every reference run; the parser defaults) | 58 M parameters. The v3 scale-up of `run_v3.sh` (768 768 2048, 121 M, 2.08 times larger) is a separate, untested choice |
 | `--optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 --sf_c_warmup 1000 --sf_r 1.0` | as shown | modular optimizer, schedule-free |
 | `--wd_jepa 0.02 --wd_overtraining` | | JEPA weight decay |
-| `--lr_jepa --lr_flow --lr_floor 0.333 --decay_frac 0.3` | 3.0e-4 / 2.0e-4 (`run_v3.sh`); 2.7e-4 / 1.8e-4 (v1 clean) | LR and end-of-run decay |
+| `--lr_jepa --lr_flow --lr_floor 0.333 --decay_frac 0.3` | 2.7e-4 / 1.8e-4 (every reference run); 3.0e-4 / 2.0e-4 only in `run_v3.sh` (the scale-up) | LR and end-of-run decay |
 | `--random_patch_frac` | 0.05 | share of unconstrained random patches |
 | `--ladder_every 4 --ladder_anchors 4 --ladder_steps 16 --ladder_workers 3 --lambda_ord 0.5 --ladder_val_anchors 8` | | ladder batches with an ordinal loss in place of SIGReg |
 | `--ot_coupling` | on | minibatch OT pairing of noise and targets for the flow |
@@ -245,7 +252,10 @@ hardcoded drive paths: import `MANIFOLD_PATH` from `realistic_bass_prior_v3`, ac
 sample, fixed `--seed`, `--n 2000` or more, both prior splits reported separately. Print and write `label_stats.json`:
 pooled valid rate; per-window valid rate for window 1 and window 2; rejection reason histogram per window (needs T3e);
 quantiles (min, 5, 25, 50, 75, 95, max), mean and std of valid per-window values and of the pooled label; the
-distribution of `excluded_energy_fraction` over ALL windows as the share above 0.05, 0.10, 0.15, 0.25 and 0.35;
+distribution of `excluded_energy_fraction` over ALL windows as the share above 0.05, 0.10, 0.15, 0.25 and 0.35; the share of windows whose `input_peak_count` equals 100 (the
+`maxPeaks` cap: `PeakDetection` keeps the LOWEST-frequency peaks when ordered by position, so a capped window loses its
+upper harmonics and understates the excluded energy [V: Essentia source; that the extractor's `orderBy='frequency'`
+maps to 'position' is [I]]);
 valid rate by MIDI note; and **the constant-prediction MSE = variance of the pooled labels**, next to the live run's
 logged aux value divided by its weight. Acceptance: reruns with the same seed give identical JSON; no `/run/media`
 string in the file.
@@ -264,6 +274,11 @@ first. **Acceptance:** all six test files pass with `REQUIRE_ALL=1` and 0 skippe
 above 0; paste both.
 (f) PROPOSED, needs Kim's yes before you write it: a `--seed` flag that seeds torch, numpy, python `random` and the
 DataLoader workers, so a twin can start from identical initial weights. The trainer has none today [V].
+(g) PROPOSED, needs Kim's yes: a head start for the aux head. At initialization the Softplus head outputs about 0.78
+against labels near 0.06 (real labels: T2), so the unweighted aux MSE is about 0.5 against 0.0003 once the offset is
+fitted, and at weight 1 its gradient on the shared embedding is about 3.5 times the JEPA's [V: measured by KUANG on the
+real code with random inputs, so indicative]. Fix by initializing the head's last-layer bias so that Softplus(bias)
+equals the T2 label mean, or by warming the weight up over the first N steps. For new runs only.
 
 **T4 Linear probe: does the embedding retain inharmonicity?** New `probe_inharmonicity.py`. Render fixed train-split
 and val-split sets (fixed seeds, same `render_patch`), keep rows with a valid pooled label, compute `za` from the
@@ -285,7 +300,9 @@ the descriptor value, excluded fraction, selected partial count and validity. Ev
 class; (iii) Spearman correlation between descriptor value and the swept parameter on valid windows; (iv) the
 false-harmonic rate: inharmonic windows reported valid with a value below the clean class's 95th percentile.
 Deliver the tables and plots. Once Kim confirms the D10 gates (section 0b), mark each cell pass or fail against them;
-do not pick a winner beyond that rule.
+do not pick a winner beyond that rule. Also report per cell the share of windows at the 100-peak cap (T2): if it is more
+than a few percent, raising `max_harmonics` cannot help there, and exposing `max_peaks` as a config field is the next
+change (needs Kim's yes).
 
 **T7 Held-out aux error (design, then implement in the worktree).** Add a separate `validate_inharmonicity` called at
 the validation interval, leaving `validate()` and `render_fixed_set` untouched (your S7 proposal). Log held-out MSE,

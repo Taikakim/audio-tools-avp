@@ -19,12 +19,14 @@ import os
 import shlex
 import sys
 
-# Reference recipe values: run_v3.sh sizes and LRs + the run_v3_clean_home.sh recipe (ROUND2_HANDOVER.md section 3).
+# Reference recipe values: the run_v3_clean_home.sh recipe, with the sizes (512/512/1152) and LRs (2.7e-4/1.8e-4) of
+# EVERY reference run (H1, H6, v3 clean). The v3 scale-up of run_v3.sh (768/768/2048 with 3.0e-4/2.0e-4) is a separate,
+# untested choice with 2.08x the parameters, so it is NOT the reference (ROUND2_HANDOVER.md section 3).
 RECIPE = {
-    "batch_size": 64, "embed_dim": 768, "flow_dim": 768, "ff_dim": 2048,
+    "batch_size": 64, "embed_dim": 512, "flow_dim": 512, "ff_dim": 1152,
     "optimizer": "modular", "whitening": "shampoo", "ns_poly": "cubic5", "radial_brake": 0.8,
     "var_dampening": 1.15, "sf_c_warmup": 1000, "sf_r": 1.0, "wd_jepa": 0.02, "wd_overtraining": True,
-    "lr_jepa": 3.0e-4, "lr_flow": 2.0e-4, "lr_floor": 0.333, "decay_frac": 0.3,
+    "lr_jepa": 2.7e-4, "lr_flow": 1.8e-4, "lr_floor": 0.333, "decay_frac": 0.3,
     "random_patch_frac": 0.05, "num_workers": 8, "prefetch_factor": 4,
     "ladder_every": 4, "ladder_anchors": 4, "ladder_steps": 16, "ladder_workers": 3, "lambda_ord": 0.5,
     "ladder_val_anchors": 8, "ot_coupling": True, "ema_halflife_steps": 2000.0,

@@ -10,7 +10,9 @@
 # Recipe switches:  COND_NOISE=1|0 (default 1)  FLOW_LOSS=mae|mse (default mae)  INHARM_WEIGHT=0 (default 0)
 #                   INHARM_CONFIG=<json>  (required when INHARM_WEIGHT > 0)
 # Optional:         MANIFOLD  SEED (passed as --seed; the trainer rejects it until --seed exists)  PURPOSE
-#                   EMBED_DIM FLOW_DIM FF_DIM (768 768 2048)  LR_JEPA LR_FLOW (3.0e-4 2.0e-4)  BATCH_SIZE NUM_WORKERS
+#                   EMBED_DIM FLOW_DIM FF_DIM (512 512 1152: every reference run)  LR_JEPA LR_FLOW (2.7e-4 1.8e-4)
+#                   BATCH_SIZE NUM_WORKERS. The v3 scale-up of run_v3.sh is UNTESTED and 2.08x larger: to use it set
+#                   EMBED_DIM=768 FLOW_DIM=768 FF_DIM=2048 LR_JEPA=3.0e-4 LR_FLOW=2.0e-4 explicitly.
 #                   DEVICE PYTHON (default python3)  SAO (enables the GPU lock)  LOCK_HANDLE  DRY_RUN=1
 # Example (reference recipe, aux off):   OUT_DIR=... MAX_STEPS=78416 HOURS=30 DRY_RUN=1 ./run_v3_recipe.sh
 # To start a TWIN of a live run use twin_command.py instead: it copies the live run's own flags.
@@ -24,8 +26,8 @@ HOURS="${HOURS:-}";         [ -n "$HOURS" ]     || die "set HOURS (wall-clock ca
 COND_NOISE="${COND_NOISE:-1}"
 FLOW_LOSS="${FLOW_LOSS:-mae}"
 INHARM_WEIGHT="${INHARM_WEIGHT:-0}"
-EMBED_DIM="${EMBED_DIM:-768}"; FLOW_DIM="${FLOW_DIM:-768}"; FF_DIM="${FF_DIM:-2048}"
-LR_JEPA="${LR_JEPA:-3.0e-4}";  LR_FLOW="${LR_FLOW:-2.0e-4}"
+EMBED_DIM="${EMBED_DIM:-512}"; FLOW_DIM="${FLOW_DIM:-512}"; FF_DIM="${FF_DIM:-1152}"
+LR_JEPA="${LR_JEPA:-2.7e-4}";  LR_FLOW="${LR_FLOW:-1.8e-4}"
 BATCH_SIZE="${BATCH_SIZE:-64}"; NUM_WORKERS="${NUM_WORKERS:-8}"
 DEVICE="${DEVICE:-cuda:0}"
 PYTHON="${PYTHON:-python3}"
