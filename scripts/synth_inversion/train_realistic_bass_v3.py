@@ -1,7 +1,9 @@
+from inharmonicity_target import InharmonicityExtractor
+from inharmonicity_aux_head import InharmonicityHead, masked_inharmonicity_loss
 """Joint online training of Synth-JEPA and the flow-matching inverter on the real-preset bass prior.
 
 Audio is rendered by real Surge XT in DataLoader workers (one persistent plugin per worker) from
-realistic_bass_prior.py (training split of the presets); log-mel is computed on the GPU with
+realistic_bass_prior_v3.py (training split of the presets); log-mel is computed on the GPU with
 ExactGpuMel (matches audio_utils.make_mel_spec). Both models see the same batch each step.
 
 v2 (2026-10-02 review). What changed and why:
@@ -47,18 +49,18 @@ from torch.utils.data import DataLoader, Dataset
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-import param_codec as codec  # noqa: E402
+import param_codec_v3 as codec  # noqa: E402
 from audio_utils import ExactGpuMel  # noqa: E402
-from models import build_model  # noqa: E402
-from realistic_bass_prior import MANIFOLD_PATH, RealisticBassPrior, manifold_md5  # noqa: E402
-from surge_spec import (  # noqa: E402
+from models_v3 import build_model  # noqa: E402
+from realistic_bass_prior_v3 import MANIFOLD_PATH, RealisticBassPrior, manifold_md5  # noqa: E402
+from surge_spec_v3 import (  # noqa: E402
     CAT_INDICES, CONT_INDICES, DEFAULT_PLUGIN_PATH, LP_FILTERS, NOTE_DUR_RANGE,
     NUM_PARAMS, PARAM_INDEX, WAVESHAPER_TYPES, canonicalize_vector, domain_weights,
     init_synth, render_patch, vector_to_patch,
 )
 from synth_jepa_model import SynthJEPA  # noqa: E402
-from synth_jepa_search import WelfordNormalizer  # noqa: E402
-from training_controls import (EMA, LadderDataset, ladder_validation, ordinal_loss, ot_couple,  # noqa: E402
+from synth_jepa_search_v3 import WelfordNormalizer  # noqa: E402
+from training_controls_v3 import (EMA, LadderDataset, ladder_validation, ordinal_loss, ot_couple,  # noqa: E402
                                render_ladder_set)
 
 FORMAT_VERSION = 2
@@ -107,6 +109,7 @@ class RealisticOnlineDataset(Dataset):
         self.random_patch_frac = float(random_patch_frac)
         self._synth = None
         self._prior = None
+        self._extractor = None
 
     def __len__(self):
         return self.length
@@ -115,12 +118,14 @@ class RealisticOnlineDataset(Dataset):
         if self._synth is None:
             self._synth = init_synth(self.plugin_path, verify=False)  # enums verified once in the main process
             self._prior = RealisticBassPrior(self.manifold_path, split="train")
+            self._extractor = InharmonicityExtractor()
         if self.random_patch_frac > 0.0 and np.random.rand() < self.random_patch_frac:
             patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()
         else:
             patch, vec, midi_note, note_dur = self._prior.sample_patch_and_midi()
         audio = render_patch(self._synth, patch, midi_note, note_dur)
-        return torch.from_numpy(audio), torch.from_numpy(vec)
+        inharm_res = self._extractor.process_frame(audio, midi_note=midi_note)
+        return torch.from_numpy(audio), torch.from_numpy(vec), float(inharm_res["value"]), float(inharm_res["valid"])
 
 
 def _worker_init(_worker_id):
@@ -128,9 +133,9 @@ def _worker_init(_worker_id):
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
 
-def render_fixed_set(synth, prior, n, seed):
+def render_fixed_set(synth, prior, n, seed, extractor=None):
     rng = np.random.RandomState(seed)
-    audio, vecs = [], []
+    audio, vecs, inharm, valid = [], [], [], []
     for _ in range(n):
         patch, vec, midi_note, note_dur = prior.sample_patch_and_midi(rng)
         audio.append(render_patch(synth, patch, midi_note, note_dur))
@@ -148,7 +153,7 @@ def prepare_jepa_inputs(params: torch.Tensor):
 
 def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3, loss_type="mse"):
     """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout.
-    ot=True pairs noise and targets by minibatch optimal transport (training_controls.ot_couple).
+    ot=True pairs noise and targets by minibatch optimal transport (training_controls_v3.ot_couple).
     cond_noise=True (H6): each sample's audio condition is noised to level tau (1 = clean, share clean_frac;
     otherwise tau ~ logit-normal(0, 1), Synth-JDF's time distribution) and tau is passed to the model."""
     x1 = codec.encode(params)
@@ -188,6 +193,7 @@ def validate(jepa, flow, normalizer, mel_fn, audio, params, w_enc, lambda_sig, d
         mel = mel_fn(a)
         cont, cats = prepare_jepa_inputs(p)
         lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats, sigreg_generator=gen)
+        i_loss = 0.0
         fl = flow_loss(flow, mel, p, w_enc, generator=gen)
         b = a.shape[0]
         for k, v in dict(jepa=lp + la + lambda_sig * (sa + sp), lp=lp, la=la, sig_a=sa, sig_p=sp, flow=fl).items():
@@ -214,8 +220,8 @@ def atomic_save(obj, path):
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out_dir", default="/run/media/kim/Mantu/surge_200k_models/overnight_realistic_bass_v2")
-    ap.add_argument("--manifold", default=MANIFOLD_PATH)
+    ap.add_argument("--out_dir", default="/run/media/kim/Mantu2/surge_200k_models/overnight_realistic_bass_v3")
+    ap.add_argument("--manifold", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz")
     ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
     ap.add_argument("--hours", type=float, default=8.0, help="total time budget, including resumed time")
     ap.add_argument("--max_steps", type=int, default=0, help=">0 stops after this many steps (smoke tests)")
@@ -274,7 +280,7 @@ def build_parser():
     ap.add_argument("--allow_prior_change", action="store_true", help="resume although the manifold changed")
     ap.add_argument("--purpose", default="", help="one line for run_meta.json: what question this run answers")
     ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
-    # --- accuracy controls during training (training_controls.py); all off by default ---
+    # --- accuracy controls during training (training_controls_v3.py); all off by default ---
     ap.add_argument("--ladder_every", type=int, default=0,
                     help="every N-th step is a ladder batch (bracketed minimal pairs); 0 = off")
     ap.add_argument("--ladder_anchors", type=int, default=4, help="anchors per ladder batch")
@@ -480,7 +486,7 @@ def train(args):
         log(f"Estimating mel normaliser over {args.norm_batches} batches...")
         normalizer = WelfordNormalizer()
         for _ in range(args.norm_batches):
-            aud, _ = next(batches)
+            aud, _, _, _ = next(batches)
             normalizer.update(mel_fn(aud.to(device)).cpu().numpy())
         normalizer.freeze()
         with open(os.path.join(args.out_dir, "run_meta.json"), "w") as f:
@@ -632,27 +638,37 @@ def train(args):
 
         is_ladder = ladder_batches is not None and step % args.ladder_every == args.ladder_every - 1
         if is_ladder:
+            # No inharmonicity targets for ladder batches yet
             audio, params, _axis = next(ladder_batches)
+            inharm_val = torch.zeros(audio.shape[0])
+            inharm_valid = torch.zeros(audio.shape[0])
         else:
-            audio, params = next(batches)
+            audio, params, inharm_val, inharm_valid = next(batches)
         if curr_b < audio.shape[0]:
             audio = audio[:curr_b]
             params = params[:curr_b]
+            inharm_val = inharm_val[:curr_b]
+            inharm_valid = inharm_valid[:curr_b]
         audio = audio.to(device, non_blocking=True)
         params = params.to(device, non_blocking=True)
+        inharm_val = inharm_val.to(device, non_blocking=True).float()
+        inharm_valid = inharm_valid.to(device, non_blocking=True).float()
         mel = mel_fn(audio)
 
         opt_jepa.zero_grad(set_to_none=True)
         cont, cats = prepare_jepa_inputs(params)
         lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats)
+        inharm_pred = jepa.inharmonicity_head(za)
+        i_loss, i_count = masked_inharmonicity_loss(inharm_pred, inharm_val, inharm_valid)
+
         if is_ladder:
             # no SIGReg on a ladder (not i.i.d.); ordinal loss on the audio embedding instead
             o_loss = ordinal_loss(za, args.ladder_steps)
-            j_loss = lp + la + args.lambda_ord * o_loss
+            j_loss = lp + la + args.lambda_ord * o_loss + i_loss
             run["ord"] = run.get("ord", 0.0) + float(o_loss.detach())
             run["n_ladder"] = run.get("n_ladder", 0) + 1
         else:
-            j_loss = lp + la + args.lambda_sig * (sa + sp)
+            j_loss = lp + la + args.lambda_sig * (sa + sp) + i_loss
         j_loss.backward()
         gn = nn.utils.clip_grad_norm_(jepa.parameters(), 1.0)
         if torch.isfinite(j_loss) and torch.isfinite(gn):
@@ -687,6 +703,7 @@ def train(args):
             run["r_a2p"] += float((torch.cdist(jepa.f_a2p(za), zp).argmin(dim=1) == tgt).float().mean())
             run["r_p2a"] += float((torch.cdist(jepa.f_p2a(zp), za).argmin(dim=1) == tgt).float().mean())
         run["jepa"] += float(j_loss.detach())
+        run["inharm"] = run.get("inharm", 0.0) + float(i_loss.detach())
         run["flow"] += float(f_loss.detach())
         step += 1
 
@@ -694,7 +711,7 @@ def train(args):
             k = args.log_interval_steps
             el = elapsed_prev + time.time() - start
             log(f"Step {step:7d} | {el / 3600:5.2f}h / {args.hours:.2f}h | lr x{f:.3f} | batch {curr_b:2d} | "
-                f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f} | "
+                f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f} | Aux {run['inharm'] / k:.4f} | "
                 f"in-batch R a2p {100 * run['r_a2p'] / k:5.1f}% p2a {100 * run['r_p2a'] / k:5.1f}% "
                 f"(chance {100 / curr_b:.1f}%)"
                 + (f" | ladders {run['n_ladder']:.0f} ord {run['ord'] / max(1, run['n_ladder']):.4f}"

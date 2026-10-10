@@ -1,3 +1,4 @@
+from inharmonicity_aux_head import InharmonicityHead
 """Synth-JEPA: Joint Embedding Prediction Architecture for Synthesizer Parameter Search.
 
 Reference: Hayes, Tian, Lattner, "Synth-JEPA: Joint Embedding Prediction for Renderer-Free
@@ -247,6 +248,7 @@ class SynthJEPA(nn.Module):
         in_frames: int = 81,
     ):
         super().__init__()
+        self.inharmonicity_head = InharmonicityHead(embed_dim=embed_dim)
         self.embed_dim = embed_dim
         self.audio_encoder = AudioTransformerEncoder(embed_dim=embed_dim, num_layers=num_audio_layers,
                                                      ff_dim=ff_dim, in_frames=in_frames)

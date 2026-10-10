@@ -250,6 +250,46 @@ def extract_pitch_and_envelope(y: np.ndarray, sr: int = SAMPLE_RATE) -> dict:
     }
 
 
+def export_patch_to_fxp(plugin, fxp_path: str) -> bool:
+    """Export current plugin state as a native Surge XT .fxp preset via surgepy."""
+    if not hasattr(plugin, "parameters") or not getattr(plugin, "parameters"):
+        return False
+    try:
+        import surgepy
+        s = surgepy.createSurge(SAMPLE_RATE)
+        sp_map = {}
+        for cg_idx in range(12):
+            try:
+                cg = s.getControlGroup(cg_idx)
+                for entry in cg.getEntries():
+                    if entry.getScene() in (0, 1):
+                        for p in entry.getParams():
+                            sp_map[p.getName().lower().replace('_', ' ')] = p
+            except Exception:
+                pass
+
+        for pb_name, p in plugin.parameters.items():
+            clean = pb_name
+            if clean.startswith("a_"):
+                clean = clean[2:]
+            clean = clean.replace("_", " ").lower()
+            if clean in sp_map:
+                sp_p = sp_map[clean]
+                p_min = s.getParamMin(sp_p)
+                p_max = s.getParamMax(sp_p)
+                raw = float(p.raw_value)
+                val = p_min + raw * (p_max - p_min)
+                s.setParamVal(sp_p, val)
+
+        if "scene mode" in sp_map:
+            s.setParamVal(sp_map["scene mode"], 0.0)
+        s.savePatch(fxp_path)
+        return True
+    except Exception as e:
+        warnings.warn(f"Could not export .fxp to {fxp_path}: {e}")
+        return False
+
+
 def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_user_dir: bool = False) -> None:
     """Export a matched patch for DAW workflows.
 
@@ -258,14 +298,13 @@ def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_
       2. <stem>.pedalboard_state: pedalboard raw_state blob.
       3. <stem>.vstpreset: native Steinberg VST3 preset container directly loadable
          in Bitwig, Ableton, FL Studio, Reaper, Cubase, etc.
-      4. copy_to_user_dir=True: also copies <stem>.vstpreset into
-         ~/Documents/Surge XT/Patches/AI Inversions/ (opt-in since the 2026-10-03 review: it was
-         the default, so every evaluation run wrote into the home directory and overwrote
-         same-named presets). An existing file there is never overwritten; a numbered name is used.
-         Note: a DAW's VST3 preset browser on Linux looks in ~/.vst3/presets/<vendor>/<plugin>/;
-         Surge's own patch browser lists .fxp patches. Check where your host picks these up.
+      4. <stem>.fxp: native Surge XT patch container loadable in Surge XT's preset browser.
+      5. copy_to_user_dir=True: copies <stem>.fxp and <stem>.vstpreset into
+         ~/Documents/Surge XT/Patches/AI Inversions/. An existing file there is never overwritten;
+         a numbered name is used.
     """
     import os
+    import shutil
 
     record = {"patch": describe_patch(patch)}
     if extra:
@@ -284,16 +323,26 @@ def save_patch(plugin, patch: dict, path_stem: str, extra: dict = None, copy_to_
         with open(vstpreset_path, "wb") as f:
             f.write(preset_bytes)
 
-        # 3. Copy to Surge XT DAW user directory
-        if copy_to_user_dir:
-            user_patches_dir = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
-            try:
-                os.makedirs(user_patches_dir, exist_ok=True)
-                base = os.path.splitext(os.path.basename(vstpreset_path))[0]
+    # 3. Native Surge XT .fxp patch
+    fxp_path = f"{path_stem}.fxp"
+    fxp_saved = export_patch_to_fxp(plugin, fxp_path)
+
+    # 4. Copy to Surge XT DAW user directory
+    if copy_to_user_dir:
+        user_patches_dir = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
+        try:
+            os.makedirs(user_patches_dir, exist_ok=True)
+            base = os.path.splitext(os.path.basename(vstpreset_path))[0]
+            if preset_bytes:
                 target_dest, k = os.path.join(user_patches_dir, base + ".vstpreset"), 2
                 while os.path.exists(target_dest):
                     target_dest, k = os.path.join(user_patches_dir, f"{base}_{k}.vstpreset"), k + 1
                 with open(target_dest, "wb") as f:
                     f.write(preset_bytes)
-            except Exception as e:
-                warnings.warn(f"Could not copy {vstpreset_path} to Surge XT user directory: {e}")
+            if fxp_saved and os.path.exists(fxp_path):
+                target_fxp, k = os.path.join(user_patches_dir, base + ".fxp"), 2
+                while os.path.exists(target_fxp):
+                    target_fxp, k = os.path.join(user_patches_dir, f"{base}_{k}.fxp"), k + 1
+                shutil.copy2(fxp_path, target_fxp)
+        except Exception as e:
+            warnings.warn(f"Could not copy presets to Surge XT user directory: {e}")

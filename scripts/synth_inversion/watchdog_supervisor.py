@@ -49,9 +49,18 @@ def main(argv=None):
     wd_log = open(os.path.join(args.out_dir, "watchdog.log"), "a", buffering=1)
 
     def log(msg):
+        nonlocal wd_log
         line = f"{time.strftime('[%Y-%m-%d %H:%M:%S]')} {msg}"
         print(line, flush=True)
-        wd_log.write(line + "\n")
+        try:
+            wd_log.write(line + "\n")
+            wd_log.flush()
+        except OSError:
+            try:
+                wd_log = open(os.path.join(args.out_dir, "watchdog.log"), "a", buffering=1)
+                wd_log.write(line + "\n")
+            except OSError:
+                pass
 
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)

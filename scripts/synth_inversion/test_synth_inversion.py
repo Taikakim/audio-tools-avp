@@ -732,6 +732,21 @@ def test_save_patch_user_dir_is_opt_in_and_never_overwrites(tmp_path, monkeypatc
     assert sorted(p.name for p in user.iterdir()) == ["a.vstpreset", "a_2.vstpreset"]
 
 
+def test_save_patch_exports_fxp_when_parameters_present(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    synth = FakeSurge()
+    synth.preset_data = b"VST3preset"
+    # Populate at least one parameter so export_patch_to_fxp runs
+    synth.parameters["a_osc_1_pitch"].raw_value = 0.50
+    patch = surge_spec.draw_patch(5000)
+    audio_utils.save_patch(synth, patch, str(tmp_path / "test_patch"), copy_to_user_dir=True)
+    assert (tmp_path / "test_patch.vstpreset").exists()
+    assert (tmp_path / "test_patch.fxp").exists()
+    user = tmp_path / "home" / "Documents" / "Surge XT" / "Patches" / "AI Inversions"
+    assert (user / "test_patch.vstpreset").exists()
+    assert (user / "test_patch.fxp").exists()
+
+
 def test_envelope_suggestions_use_surge_log_scales():
     import math
     from envelope_extractor import profile_note_envelope
@@ -819,6 +834,31 @@ def test_139_enum_calibration_and_render_contract():
         parameters = {"a_osc_1_type": None}
     with pytest.raises(RuntimeError, match="not exposed"):
         s139.verify_param_names(Missing())
+
+
+def test_draw_patch_139_oscillator_sanity_check():
+    import surge_139_spec as s139
+
+    class Plug:
+        parameters = _P139()
+    tables = s139.calibrate_enums(Plug())
+
+    # Draw 50 patches and verify harmonic constraints when modulation is inactive
+    for seed in range(50):
+        patch = s139.draw_patch_139(seed, tables)
+        fm = patch.get("a_fm_depth", 0.0) > 0.05
+        sync = any(patch.get(f"a_osc_{o}_sync", 0.0) > 0.05 for o in (1, 2, 3))
+        rm = (patch.get("a_ring_modulation_1x2_volume", 0.0) > 0.05) or (patch.get("a_ring_modulation_2x3_volume", 0.0) > 0.05)
+        if not (fm or sync or rm):
+            assert patch["a_osc_1_pitch"] == 0.50
+            assert patch["a_osc_1_octave"] == 0.50
+            assert patch["a_osc_2_octave"] in [0.1667, 0.3333, 0.50, 0.6667]
+            assert patch["a_osc_3_octave"] in [0.1667, 0.3333, 0.50, 0.6667]
+            for osc in (2, 3):
+                p = patch[f"a_osc_{osc}_pitch"]
+                is_unison_detuned = abs(p - 0.50) <= 0.02
+                is_fourth_fifth = any(abs(p - target) < 1e-3 for target in [0.0, 0.1429, 0.8571, 1.0])
+                assert is_unison_detuned or is_fourth_fifth, f"Osc {osc} pitch {p} is clashing/out-of-tune"
 
 
 def test_train_synth_jepa_139_smoke(tmp_path, monkeypatch):

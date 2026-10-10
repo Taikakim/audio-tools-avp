@@ -20,23 +20,28 @@ from scipy.signal import butter, sosfilt
 
 sys.path.insert(0, "/home/kim/Projects/SAO/stable-audio-tools/scripts/synth_inversion")
 from models import load_inverter
-from surge_spec import init_synth, apply_patch, DEFAULT_PLUGIN_PATH, SAMPLE_RATE, AUDIO_LEN
+from surge_spec import init_synth, apply_patch, flush_synth, DEFAULT_PLUGIN_PATH, SAMPLE_RATE, AUDIO_LEN
 from audio_utils import make_mel_spec, save_patch, extract_pitch_and_envelope
 from inference import predict_and_rerank_candidates
 from refine import refine_patch_phrase
 
-OUT_DIR = "/run/media/kim/Mantu/surge_200k_models/real_stems_eval"
+def resolve_mantu(p):
+    if not p:
+        return p
+    p_str = str(p)
+    if "/run/media/kim/Mantu/" in p_str or p_str == "/run/media/kim/Mantu":
+        p2 = p_str.replace("/run/media/kim/Mantu", "/run/media/kim/Mantu2", 1)
+        if os.path.exists(p2) or not os.path.exists(p_str):
+            return p2
+    return p_str
+
+OUT_DIR = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval")
 CLIPS_DIR = os.path.join(OUT_DIR, "audio")
 MIDI_DIR = os.path.join(OUT_DIR, "midi")
 PRESETS_DIR = os.path.join(OUT_DIR, "vstpresets")
 DAW_DIR = os.path.expanduser("~/Documents/Surge XT/Patches/AI Inversions")
 MIR_PYTHON = "/home/kim/Projects/mir/mir/bin/python"
 MIR_PIPELINE = "/home/kim/Projects/mir/src/bass_midi_pipeline.py"
-
-os.makedirs(CLIPS_DIR, exist_ok=True)
-os.makedirs(MIDI_DIR, exist_ok=True)
-os.makedirs(PRESETS_DIR, exist_ok=True)
-os.makedirs(DAW_DIR, exist_ok=True)
 
 STEM_CATALOG = [
     # 1. Classic Studio Multitrack Stems (Summamutikka & Aavepyörä)
@@ -272,16 +277,28 @@ def find_active_bass_phrase(y, sr, bpm, bars=4):
 
 
 def load_pedalboard_events_from_midi(midi_path, max_dur=None):
-    """Parse MIDI file and convert to list of pedalboard-compatible mido Messages with absolute seconds."""
+    """Parse MIDI file and convert to list of pedalboard-compatible mido Messages with absolute seconds.
+    Guarantees that every opened note receives an explicit note_off before max_dur so no voices hang.
+    """
     mid = mido.MidiFile(midi_path)
     events = []
     t = 0.0
+    active_notes = {}
     for msg in mid:
         t += msg.time
-        if max_dur is not None and t > max_dur:
+        if max_dur is not None and t >= max_dur:
             break
-        if msg.type in ('note_on', 'note_off'):
-            events.append(mido.Message(msg.type, note=msg.note, velocity=msg.velocity, time=t))
+        if msg.type == 'note_on' and msg.velocity > 0:
+            events.append(mido.Message('note_on', note=msg.note, velocity=msg.velocity, time=t))
+            active_notes[msg.note] = t
+        elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+            events.append(mido.Message('note_off', note=msg.note, velocity=0, time=t))
+            active_notes.pop(msg.note, None)
+
+    cutoff_time = max_dur - 0.005 if max_dur is not None else t
+    for note in list(active_notes.keys()):
+        events.append(mido.Message('note_off', note=note, velocity=0, time=cutoff_time))
+
     events.sort(key=lambda m: m.time)
     return events
 
@@ -305,6 +322,9 @@ def main():
     ap.add_argument("--no_user_copy", action="store_true", help="do not copy presets into the Surge user folder")
     ap.add_argument("--stems", default="", help="comma-separated stem ids to run (default: all)")
     args = ap.parse_args()
+    args.out_dir = resolve_mantu(args.out_dir)
+    args.flow_ckpt = resolve_mantu(args.flow_ckpt)
+    args.muscriptor_midi_dir = resolve_mantu(args.muscriptor_midi_dir)
     OUT_DIR = args.out_dir
     CLIPS_DIR, MIDI_DIR, PRESETS_DIR = (os.path.join(OUT_DIR, d) for d in ("audio", "midi", "vstpresets"))
     for d in (CLIPS_DIR, MIDI_DIR, PRESETS_DIR):
@@ -330,7 +350,7 @@ def main():
             continue
         stem_id = item["id"]
         name = item["name"]
-        path = item["path"]
+        path = resolve_mantu(item["path"])
         bpm = item["bpm"]
         style = item["style"]
         is_demucs = item.get("is_demucs", False)
@@ -438,13 +458,14 @@ def main():
                           if args.refine_midi == "muscriptor" and os.path.exists(mu_midi) else events)
             if ref_events:
                 def render_phrase(patch, _ev=ref_events):
+                    flush_synth(synth)
                     apply_patch(synth, patch)
-                    synth.reset()
                     a = synth.process(_ev, duration=phrase_dur, sample_rate=SAMPLE_RATE, num_channels=2).mean(axis=0)
                     return (a / (np.max(np.abs(a)) + 1e-7)).astype(np.float32)
                 t1 = time.time()
                 p_flow = p
                 p, j1, j0, n_r, _ = refine_patch_phrase(render_phrase, p_flow, gt_mono_chunk, fit_fraction=1.0)
+                flush_synth(synth)
                 save_patch(synth, p_flow, os.path.join(PRESETS_DIR, f"Inverted_{stem_id}_flow_unrefined"))
                 refine_info = {"objective": [round(j0, 3), round(j1, 3)], "renders": n_r,
                                "seconds": round(time.time() - t1, 1),
@@ -454,12 +475,13 @@ def main():
         mu_play = os.path.join(args.muscriptor_midi_dir, f"{stem_id}_muscriptor.mid")
         if args.playback_midi == "muscriptor" and os.path.exists(mu_play):
             events = load_pedalboard_events_from_midi(mu_play, max_dur=phrase_dur)
+        flush_synth(synth)
         apply_patch(synth, p)
-        synth.reset()
         if events:
             pred_phrase = synth.process(events, duration=phrase_dur, sample_rate=SAMPLE_RATE, num_channels=2)
         else:
             pred_phrase = np.zeros_like(gt_norm)
+        flush_synth(synth)
 
         pred_norm = (pred_phrase / (np.max(np.abs(pred_phrase)) + 1e-7)).astype(np.float32)
 

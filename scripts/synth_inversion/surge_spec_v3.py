@@ -76,6 +76,11 @@ PARAM_NAMES = [
     "chorus_mix",       # 20
     "delay_mix",        # 21
     "delay_fb",         # 22
+    "osc_1_width_2", "osc_2_shape", "osc_2_width_1", "osc_2_width_2", "osc_3_shape", "osc_3_width_1", "osc_3_width_2",
+    "osc_1_octave", "osc_2_octave", "osc_3_octave", "noise_color",
+    "osc_1_volume", "osc_2_volume", "osc_3_volume", "ring_1x2_volume", "ring_2x3_volume", "noise_volume",
+    "filter_balance", "filter_configuration", "fm_routing",
+    "filter_2_type", "filter_2_cutoff", "filter_2_resonance", "filter_2_keytrack", "filter_2_feg_amount"
 ]
 NUM_PARAMS = len(PARAM_NAMES)
 PARAM_INDEX = {n: i for i, n in enumerate(PARAM_NAMES)}
@@ -83,7 +88,7 @@ PARAM_INDEX = {n: i for i, n in enumerate(PARAM_NAMES)}
 # Categorical parameters have no meaningful order, so they must be learned as classes,
 # not regressed as numbers. The h5 keeps the legacy ordinal storage for compatibility;
 # param_codec.py converts at train / inference time.
-CATEGORICAL = {"filter_type": len(LP_FILTERS), "unison": 2, "waveshaper_type": len(WAVESHAPER_TYPES)}
+CATEGORICAL = {"filter_type": len(LP_FILTERS), "unison": 2, "waveshaper_type": len(WAVESHAPER_TYPES), "filter_configuration": 7, "fm_routing": 4, "filter_2_type": len(LP_FILTERS)}
 CAT_INDICES = [(PARAM_INDEX[n], k) for n, k in CATEGORICAL.items()]
 CONT_INDICES = [i for i, n in enumerate(PARAM_NAMES) if n not in CATEGORICAL]
 
@@ -185,6 +190,31 @@ def draw_patch(seed: int, note_dur_range=NOTE_DUR_RANGE) -> dict:
         delay_mix=delay_mix,
         delay_fb=delay_fb,
         note_dur=note_dur,
+        osc_1_width_2=float(np.random.uniform(0.0, 1.0)),
+        osc_2_shape=float(np.random.uniform(0.0, 1.0)),
+        osc_2_width_1=float(np.random.uniform(0.0, 1.0)),
+        osc_2_width_2=float(np.random.uniform(0.0, 1.0)),
+        osc_3_shape=float(np.random.uniform(0.0, 1.0)),
+        osc_3_width_1=float(np.random.uniform(0.0, 1.0)),
+        osc_3_width_2=float(np.random.uniform(0.0, 1.0)),
+        osc_1_octave=float(np.random.uniform(0.0, 1.0)),
+        osc_2_octave=float(np.random.uniform(0.0, 1.0)),
+        osc_3_octave=float(np.random.uniform(0.0, 1.0)),
+        noise_color=float(np.random.uniform(0.0, 1.0)),
+        osc_1_volume=float(np.random.uniform(0.0, 1.0)),
+        osc_2_volume=float(np.random.uniform(0.0, 1.0)),
+        osc_3_volume=float(np.random.uniform(0.0, 1.0)),
+        ring_1x2_volume=float(np.random.uniform(0.0, 1.0)),
+        ring_2x3_volume=float(np.random.uniform(0.0, 1.0)),
+        noise_volume=float(np.random.uniform(0.0, 0.25)),
+        filter_balance=float(np.random.uniform(0.0, 1.0)),
+        filter_configuration=int(np.random.randint(0, 7)),
+        fm_routing=int(np.random.randint(0, 4)),
+        filter_2_type=int(np.random.randint(0, len(LP_FILTERS))),
+        filter_2_cutoff=float(np.random.uniform(0.0, 1.0)),
+        filter_2_resonance=float(np.random.uniform(0.0, 1.0)),
+        filter_2_keytrack=float(np.random.uniform(0.0, 1.0)),
+        filter_2_feg_amount=float(np.random.uniform(0.0, 1.0)),
     )
 
 
@@ -199,6 +229,13 @@ CONT_BOUNDS = {
     "resonance": (0.0, 0.95), "keytrack": (0.0, 1.0), "feg_amount": (0.2, 0.95), "feg_decay": (0.03, 1.0),
     "feg_sustain": (0.0, 0.60), "aeg_decay": (0.05, 0.65), "aeg_sustain": (0.0, 0.80), "aeg_release": (0.01, 0.40),
     "drive": (0.0, 1.0), "chorus_mix": (0.0, 0.60), "delay_mix": (0.0, 0.45), "delay_fb": (0.0, 0.50),
+    "osc_1_width_2": (0.0, 1.0), "osc_2_shape": (0.0, 1.0), "osc_2_width_1": (0.0, 1.0), "osc_2_width_2": (0.0, 1.0),
+    "osc_3_shape": (0.0, 1.0), "osc_3_width_1": (0.0, 1.0), "osc_3_width_2": (0.0, 1.0),
+    "osc_1_octave": (0.0, 1.0), "osc_2_octave": (0.0, 1.0), "osc_3_octave": (0.0, 1.0), "noise_color": (0.0, 1.0),
+    "osc_1_volume": (0.0, 1.0), "osc_2_volume": (0.0, 1.0), "osc_3_volume": (0.0, 1.0),
+    "ring_1x2_volume": (0.0, 1.0), "ring_2x3_volume": (0.0, 1.0), "noise_volume": (0.0, 0.25),
+    "filter_balance": (0.0, 1.0), "filter_2_cutoff": (0.0, 1.0), "filter_2_resonance": (0.0, 1.0),
+    "filter_2_keytrack": (0.0, 1.0), "filter_2_feg_amount": (0.0, 1.0)
 }
 
 
@@ -241,6 +278,14 @@ def patch_to_vector(patch: dict) -> np.ndarray:
         patch["chorus_mix"],
         patch["delay_mix"],
         patch["delay_fb"],
+        patch["osc_1_width_2"], patch["osc_2_shape"], patch["osc_2_width_1"], patch["osc_2_width_2"],
+        patch["osc_3_shape"], patch["osc_3_width_1"], patch["osc_3_width_2"],
+        patch["osc_1_octave"], patch["osc_2_octave"], patch["osc_3_octave"], patch["noise_color"],
+        patch["osc_1_volume"], patch["osc_2_volume"], patch["osc_3_volume"],
+        patch["ring_1x2_volume"], patch["ring_2x3_volume"], patch["noise_volume"],
+        patch["filter_balance"], patch["filter_configuration"] / 6.0, patch["fm_routing"] / 3.0,
+        patch["filter_2_type"] / (len(LP_FILTERS) - 1), patch["filter_2_cutoff"], patch["filter_2_resonance"],
+        patch["filter_2_keytrack"], patch["filter_2_feg_amount"]
     ], dtype=np.float32)
 
 
@@ -281,6 +326,31 @@ def vector_to_patch(p) -> dict:
         chorus_mix=float(p[20]),
         delay_mix=float(p[21]),
         delay_fb=float(p[22]),
+        osc_1_width_2=float(p[23]),
+        osc_2_shape=float(p[24]),
+        osc_2_width_1=float(p[25]),
+        osc_2_width_2=float(p[26]),
+        osc_3_shape=float(p[27]),
+        osc_3_width_1=float(p[28]),
+        osc_3_width_2=float(p[29]),
+        osc_1_octave=float(p[30]),
+        osc_2_octave=float(p[31]),
+        osc_3_octave=float(p[32]),
+        noise_color=float(p[33]),
+        osc_1_volume=float(p[34]),
+        osc_2_volume=float(p[35]),
+        osc_3_volume=float(p[36]),
+        ring_1x2_volume=float(p[37]),
+        ring_2x3_volume=float(p[38]),
+        noise_volume=float(p[39]),
+        filter_balance=float(p[40]),
+        filter_configuration=ordinal_to_class(p[41], 7),
+        fm_routing=ordinal_to_class(p[42], 4),
+        filter_2_type=ordinal_to_class(p[43], len(LP_FILTERS)),
+        filter_2_cutoff=float(p[44]),
+        filter_2_resonance=float(p[45]),
+        filter_2_keytrack=float(p[46]),
+        filter_2_feg_amount=float(p[47]),
     )
 
 
@@ -385,6 +455,31 @@ def apply_patch(plugin, patch: dict) -> None:
     P["a_amp_eg_release"].raw_value = patch["aeg_release"]
     P["a_waveshaper_type"].raw_value = WAVESHAPER_TYPES[patch["ws_idx"]][1]
     P["a_waveshaper_drive"].raw_value = patch["drive_raw"]
+    P["a_osc_1_width_2"].raw_value = patch["osc_1_width_2"]
+    P["a_osc_2_shape"].raw_value = patch["osc_2_shape"]
+    P["a_osc_2_width_1"].raw_value = patch["osc_2_width_1"]
+    P["a_osc_2_width_2"].raw_value = patch["osc_2_width_2"]
+    P["a_osc_3_shape"].raw_value = patch["osc_3_shape"]
+    P["a_osc_3_width_1"].raw_value = patch["osc_3_width_1"]
+    P["a_osc_3_width_2"].raw_value = patch["osc_3_width_2"]
+    P["a_osc_1_octave"].raw_value = patch["osc_1_octave"]
+    P["a_osc_2_octave"].raw_value = patch["osc_2_octave"]
+    P["a_osc_3_octave"].raw_value = patch["osc_3_octave"]
+    P["a_noise_color"].raw_value = patch["noise_color"]
+    P["a_osc_1_volume"].raw_value = patch["osc_1_volume"]
+    P["a_osc_2_volume"].raw_value = patch["osc_2_volume"]
+    P["a_osc_3_volume"].raw_value = patch["osc_3_volume"]
+    P["a_ring_modulation_1x2_volume"].raw_value = patch["ring_1x2_volume"]
+    P["a_ring_modulation_2x3_volume"].raw_value = patch["ring_2x3_volume"]
+    P["a_noise_volume"].raw_value = patch["noise_volume"]
+    P["a_filter_balance"].raw_value = patch["filter_balance"]
+    P["a_filter_configuration"].raw_value = patch["filter_configuration"] / 6.0
+    P["a_fm_routing"].raw_value = patch["fm_routing"] / 3.0
+    P["a_filter_2_type"].raw_value = LP_FILTERS[patch["filter_2_type"]][1]
+    P["a_filter_2_cutoff"].raw_value = patch["filter_2_cutoff"]
+    P["a_filter_2_resonance"].raw_value = patch["filter_2_resonance"]
+    P["a_filter_2_keytrack"].raw_value = patch["filter_2_keytrack"]
+    P["a_filter_2_feg_mod_amount"].raw_value = patch["filter_2_feg_amount"]
     # FX are rendered OFF unless FX_RENDER_ENABLED. Surge keeps hidden chorus/delay state across
     # renders: once ANY patch with chorus or delay > 0 has played in an instance, every later render
     # in that instance comes out different, even with mix/feedback back at 0, after plugin.reset() and

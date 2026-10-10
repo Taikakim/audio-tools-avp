@@ -204,7 +204,10 @@ def cat_indices(tables) -> List[Tuple[int, int]]:
 
 def draw_patch_139(seed: int, tables) -> dict:
     """Draw a random 139-parameter patch from the uniform prior. Categoricals are stored as
-    class / (n - 1), continuous parameters as their raw value."""
+    class / (n - 1), continuous parameters as their raw value.
+    Enforces musical tuning sanity check: oscillators must be in unison, octave, or spaced by a
+    fourth/fifth in rare circumstances, with detune in cents only, unless FM, Sync, or RM is active.
+    """
     rng = np.random.default_rng(seed)
     patch = {}
     for name in PARAM_NAMES:
@@ -216,6 +219,37 @@ def draw_patch_139(seed: int, tables) -> dict:
     patch["midi_note"] = int(rng.integers(24, 96))
     patch["note_dur"] = float(rng.uniform(0.2, 2.5))
     patch["fx_bypass"] = True
+
+    # Oscillator Tuning Sanity Check:
+    # If modulation (FM, Sync, RM) is active, continuous frequency offsets create complex timbres/sidebands.
+    # If modulation is inactive, arbitrary fractional semitone pitch offsets cause dissonant, clashing drones.
+    fm_active = patch.get("a_fm_depth", 0.0) > 0.05
+    sync_active = any(patch.get(f"a_osc_{o}_sync", 0.0) > 0.05 for o in (1, 2, 3))
+    rm_active = (patch.get("a_ring_modulation_1x2_volume", 0.0) > 0.05) or (patch.get("a_ring_modulation_2x3_volume", 0.0) > 0.05)
+
+    if not (fm_active or sync_active or rm_active):
+        # 1. Primary oscillator in tune at reference octave
+        patch["a_osc_1_pitch"] = 0.50  # 0.00 semitones
+        patch["a_osc_1_octave"] = 0.50  # 0 octaves
+
+        # 2. Discrete integer octaves for osc 2 & 3: -2, -1, 0, +1
+        octave_choices = [0.1667, 0.3333, 0.50, 0.6667]
+        patch["a_osc_2_octave"] = float(rng.choice(octave_choices))
+        patch["a_osc_3_octave"] = float(rng.choice(octave_choices))
+
+        # 3. Secondary oscillator pitch: unison with small cents detune (>90%), or rare fourth/fifth (<10%)
+        # Semitone step in Surge XT pitch is 1/14 (~0.0714). Detune of +-15 cents is +-0.01.
+        for osc in (2, 3):
+            p_key = f"a_osc_{osc}_pitch"
+            if rng.random() < 0.10:
+                # Rare fourth/fifth intervals: -7 st (0.0), -5 st (0.1429), +5 st (0.8571), +7 st (1.0)
+                interval_raw = float(rng.choice([0.0, 0.1429, 0.8571, 1.0]))
+                patch[p_key] = interval_raw
+            else:
+                # Unison with detune in cents only (+-20 cents)
+                detune_cents_raw = float(rng.uniform(-0.015, 0.015))
+                patch[p_key] = float(np.clip(0.50 + detune_cents_raw, 0.0, 1.0))
+
     return patch
 
 
