@@ -167,6 +167,9 @@ located: the refine objective (`mss_ref + 10 * (1 - env cos)`, mean-seeking), av
 Bass fundamentals are 41.2 to 146.8 Hz (MIDI 28 to 50), so 1 to 3.4 bins; harmonics are unresolved and a resonance narrower than about 90 Hz cannot
 be told from a wider one. A 30 ms attack spans about 3 frames. Changing the pooling does not fix this. A long-window branch and a short-window attack branch
 are missing from the brief. [V for the parameters, I for the consequence]
+**Addendum (October 11, 2026, measured):** with torchaudio's Slaney filterbank (which should match, but is not, `ExactGpuMel`), 28 of the 128 bands are fed by at most one FFT bin, so the lowest bands are
+not independent measurements, and the first band with two or more bins starts near 100 Hz. A short branch of `n_fft` 512 with 64 bands from 20 Hz would have 13 such bands. The layouts in
+`frontend_v4.py` (32 bands from 100 Hz at `n_fft` 512; 96 bands from 30 Hz at `n_fft` 4096) have none. [R]
 
 ### B5. The section 3.1 sketch uses the wrong time axis
 At a 10 ms hop, 81 frames cover 0.8 s: frames 0 to 8 are 0 to 80 ms, and frames 25 to 80 are 250 to 800 ms (the brief says 0 to 40 ms and 200 to 800 ms).
@@ -177,6 +180,9 @@ defaults to `batch_first=False`. [V for the pipeline (`models_v3.py:13-38`), I f
 The flow's own `AudioEncoder` (conv plus `AdaptiveAvgPool2d((1,1))`, `models_v3.py:13-38`, used at `:146` and `:170-174`) does lose *when* things
 happen. 3x3 convolutions can still detect local slopes, so the pooled vector carries a decay amount. The Synth-JEPA audio encoder is a different
 module with positional tokens and a CLS (`synth_jepa_model.py:36-91`), and the flow does not use its `za`. [V] The brief never mentions the JEPA.
+**Addendum (October 11, 2026, measured on a stand-in synth, not Surge):** on a toy task the pooled v3 encoder reaches held-out R-squared 0.96 on amplitude decay and 0.89 on filter-envelope decay, so "cannot perceive" is
+too strong. Temporal encoders add about 0.02 mean R-squared, mostly on filter-envelope decay (0.89 to 0.95), and nothing on attack time (0.956 to 0.962), for 7 times the encoder FLOPs. Branch `feature/v4-components`,
+`scripts/synth_inversion/V4_COMPONENTS.md`. The research report's "one-module swap" for attentive pooling does not hold for this encoder either: its time axis has 6 positions after the strides. [R]
 
 ### B7. Enveloped sync and FM are modulation routings, not parameters (section 2.5)
 v3 renders through Pedalboard `plugin.parameters` (`surge_spec_v3.py:438-482`) and has no routing setter. [V] A surgepy wrapper with
