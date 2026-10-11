@@ -16,7 +16,7 @@ and worth doing, and its first stage costs no GPU time.
 ## Expected benefit per item (estimates; nothing here was measured)
 | Item | Expected benefit | Cost | Main risk |
 |---|---|---|---|
-| Attack and sustain aware conditioning with a better spectrogram (B4, B5, B6) | Medium to high, **if** in-distribution decay and attack errors are large | One training run per variant | The cause may be the FX gap (B2), not the encoder |
+| Attack and sustain aware conditioning with a better spectrogram (B4, B5, B6) | Modest on the toy test (+0.02 mean R-squared, mostly filter-envelope decay, none on attack; stand-in synth, not Surge); unknown on Surge. Larger only **if** in-distribution decay and filter-envelope errors are large | One training run per variant | The cause may be the FX gap (B2), not the encoder |
 | Two-anchor and contour terms in rerank and refine | Medium | Low, no retraining | Metrics agree with humans only about 0.44 to 0.47 (B14) |
 | Enveloped sync and FM (new parameters, surgepy backend) | High artistic value for goa and acid | High: backend, prior, retrain (B7, B10) | Identifiability; no like-for-like comparison with v3 |
 | Prominence loss as written | Low | Medium | Measures harmonic-to-valley contrast (B12) |
@@ -36,7 +36,7 @@ and worth doing, and its first stage costs no GPU time.
   (b) Tag the 24 stems FX or no FX and compare errors. (c) Run candidate metrics and features through `timbre_alignment_check.py` and the three sweep probes in `V4_RESEARCH_SPEC.md` section 4.
   (d) Blind A/B on the harmonic-snapped renders that `render_muscriptor_top3_harmonic.py` already produces.
 - **Stage 1, inference only.** Two-anchor and contour terms in rerank and refine. Gate: blind A/B on the 24 stems, several flow seeds per stem, paired comparison.
-- **Stage 2, one training change.** Two-window spectrogram front end plus attack and sustain pooling in the flow's encoder; parameters and prior unchanged; compare with A0 at equal steps.
+- **Stage 2, one training change.** Two-window spectrogram front end plus attack and sustain pooling in the flow's encoder; parameters and prior unchanged; compare with A0 at equal steps. Implemented and unit-tested (not trained on Surge data) on branch `feature/v4-components`: `models_v4.py`, `frontend_v4.py`, `apply_flow_encoder_patch_v4.py`; see its `V4_COMPONENTS.md` for the stand-in results and limits.
 - **Stage 3.** surgepy backend with an equivalence test against Pedalboard, then enveloped sync and FM with a defined prior. Only if Stage 0 shows static sync and FM causing the artifact
   (use the inharmonicity or sideband measure).
 - **Stage 4, optional.** A short rendered-reward fine-tuning stage, if Stage 1 shows the sampler, not the search, is the limit.
