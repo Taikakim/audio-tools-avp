@@ -100,7 +100,7 @@ class LadderDataset(Dataset):
                 torch.tensor(axis_ids))
 
     def __getitem__(self, idx):
-        from realistic_bass_prior import RealisticBassPrior
+        from realistic_bass_prior_v3 import RealisticBassPrior
         from surge_spec_v3 import init_synth
         if self._synth is None:
             self._synth = init_synth(self.plugin_path, verify=False)

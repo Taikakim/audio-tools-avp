@@ -176,15 +176,25 @@ class SynthJEPASearcher:
 
     def score_candidates(self, za_target: torch.Tensor, cont: torch.Tensor, cats: List[torch.Tensor],
                          env_vals: Optional[torch.Tensor] = None, env_mask: Optional[torch.Tensor] = None,
-                         envelope_weight: float = 0.0) -> torch.Tensor:
+                         envelope_weight: float = 0.0,
+                         inharm_target: float = None, inharm_weight: float = 0.0) -> torch.Tensor:
         """D_JEPA(y*, x) = MSE(z_a*, f_p->a(E_p(x))) per candidate (Eq. 4). Counts evaluations."""
         self.n_evals += cont.shape[0]
         z_hat_a = self.model.predict_audio_latent(self.model.encode_params(cont, self._onehots(cats)))
         d_jepa = F.mse_loss(z_hat_a, za_target.expand_as(z_hat_a), reduction="none").mean(dim=-1)
+        
+        loss = d_jepa
         if envelope_weight > 0.0 and env_mask is not None and env_mask.any():
             env_loss = torch.sum(env_mask * (cont - env_vals.expand_as(cont)) ** 2, dim=-1)
-            return d_jepa + envelope_weight * env_loss
-        return d_jepa
+            loss = loss + envelope_weight * env_loss
+            
+        if inharm_weight > 0.0 and inharm_target is not None:
+            if hasattr(self.model, "inharmonicity_head"):
+                pred_inharm = self.model.inharmonicity_head(z_hat_a).squeeze(-1)
+                i_loss = (pred_inharm - inharm_target) ** 2
+                loss = loss + inharm_weight * i_loss
+                
+        return loss
 
     @torch.no_grad()
     def encode_target(self, mel: torch.Tensor) -> torch.Tensor:
@@ -195,7 +205,8 @@ class SynthJEPASearcher:
     # ------------------------------------------------------------------ search
     def search(self, target_mel: torch.Tensor, midi_note: Optional[int] = None,
                total_eval_budget: int = 2048, pop_size: int = 32, n_refine: int = 8,
-               envelope_target: Optional[dict] = None, envelope_weight: float = 0.0) -> dict:
+               envelope_target: Optional[dict] = None, envelope_weight: float = 0.0,
+               inharm_target: float = None, inharm_weight: float = 0.0) -> dict:
         """Returns {'patch', 'vector' (23-d), 'd_jepa' (final objective), 'n_evals'}."""
         self.n_evals = 0
         self._note_value = (None if midi_note is None else
@@ -234,7 +245,7 @@ class SynthJEPASearcher:
             cont_pop[:n_env] = env_seeded
         cont_pop = self._constrain(cont_pop, cats_pop)
         with torch.no_grad():
-            scores = self.score_candidates(za_target, cont_pop, cats_pop, env_vals, env_mask, envelope_weight)
+            scores = self.score_candidates(za_target, cont_pop, cats_pop, env_vals, env_mask, envelope_weight, inharm_target, inharm_weight)
 
         mu_cr, mu_f, c = 0.5, 0.5, 0.1
         p_best_count = max(2, int(round(0.05 * pop_size)))
@@ -267,7 +278,7 @@ class SynthJEPASearcher:
             u_cont = self._constrain(u_cont, u_cats)
 
             with torch.no_grad():
-                u_scores = self.score_candidates(za_target, u_cont, u_cats, env_vals, env_mask, envelope_weight)
+                u_scores = self.score_candidates(za_target, u_cont, u_cats, env_vals, env_mask, envelope_weight, inharm_target, inharm_weight)
             better = u_scores < scores
             cont_pop[better] = u_cont[better]
             for j in range(len(self.cat_sizes)):
@@ -295,14 +306,14 @@ class SynthJEPASearcher:
                 g["lr"] = 0.1 * 0.5 * (1.0 + math.cos(math.pi * step / total_steps))
             opt.zero_grad()
             self.score_candidates(za_target, self._constrain(active, active_cats), active_cats,
-                                  env_vals, env_mask, envelope_weight).sum().backward()
+                                  env_vals, env_mask, envelope_weight, inharm_target, inharm_weight).sum().backward()
             opt.step()
             with torch.no_grad():
                 active.copy_(self._constrain(active, active_cats))
 
             if step in prune_at and active.shape[0] > 1:
                 with torch.no_grad():
-                    cur = self.score_candidates(za_target, active, active_cats, env_vals, env_mask, envelope_weight)
+                    cur = self.score_candidates(za_target, active, active_cats, env_vals, env_mask, envelope_weight, inharm_target, inharm_weight)
                 keep = torch.topk(cur, max(1, active.shape[0] // 2), largest=False).indices
                 state = opt.state[active]
                 new_active = active.detach()[keep].clone().requires_grad_(True)
@@ -318,7 +329,7 @@ class SynthJEPASearcher:
                 active_cats = [c_[keep] for c_ in active_cats]
 
         with torch.no_grad():
-            final_scores = self.score_candidates(za_target, active, active_cats, env_vals, env_mask, envelope_weight)
+            final_scores = self.score_candidates(za_target, active, active_cats, env_vals, env_mask, envelope_weight, inharm_target, inharm_weight)
         b = int(torch.argmin(final_scores))
         vec = np.zeros(NUM_PARAMS, dtype=np.float32)
         vec[CONT_INDICES] = (active[b].detach().cpu().numpy() + 1.0) / 2.0

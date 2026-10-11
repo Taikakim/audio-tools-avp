@@ -1,4 +1,5 @@
-from inharmonicity_target import InharmonicityExtractor
+import json
+from inharmonicity_target import InharmonicityConfig, InharmonicityExtractor
 from inharmonicity_aux_head import InharmonicityHead, masked_inharmonicity_loss
 """Joint online training of Synth-JEPA and the flow-matching inverter on the real-preset bass prior.
 
@@ -120,7 +121,6 @@ class RealisticOnlineDataset(Dataset):
             self._synth = init_synth(self.plugin_path, verify=False)  # enums verified once in the main process
             self._prior = RealisticBassPrior(self.manifold_path, split="train")
             if self.inharm_cfg is not None:
-                from inharmonicity_target import InharmonicityExtractor
                 self._extractor = InharmonicityExtractor(self.inharm_cfg)
         if self.random_patch_frac > 0.0 and np.random.rand() < self.random_patch_frac:
             patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()
@@ -139,15 +139,71 @@ class RealisticOnlineDataset(Dataset):
 def _worker_init(_worker_id):
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # the main process handles Ctrl-C / SIGTERM
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        import numpy as np
+        import random
+        seed = worker_info.seed % (2**32 - 1)
+        np.random.seed(seed)
+        random.seed(seed)
 
+
+def validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device):
+    import json
+    import numpy as np
+    from sklearn.metrics import r2_score
+    from inharmonicity_aux_head import masked_inharmonicity_loss
+    with open("scripts/synth_inversion/label_stats.json", "r") as f:
+        stats = json.load(f)
+        
+    jepa.eval()
+    out = {}
+    with torch.no_grad():
+        for split_name, (audio, vecs, target, valid) in val_sets.items():
+            if target is None: continue
+            a = audio.to(device)
+            mel = mel_fn(a)
+            za = jepa.encode_audio(normalizer.normalize(mel))
+            pred = jepa.inharmonicity_head(za).squeeze(-1)
+            
+            target = target.to(device)
+            valid_mask = valid.to(device)
+            
+            mse, n = masked_inharmonicity_loss(pred, target, valid_mask)
+            
+            v = valid_mask != 0
+            p_val = pred[v].cpu().numpy()
+            t_val = target[v].cpu().numpy()
+            r2 = r2_score(t_val, p_val) if len(t_val) > 1 else float("nan")
+            
+            mean_key = "train" if "train" in split_name else "val"
+            baseline_mean = stats[mean_key]["pooled_mean"]
+            baseline_mse = float(np.mean((t_val - baseline_mean)**2)) if len(t_val) > 0 else 0.0
+            
+            out[split_name] = {"mse": float(mse.detach()), "r2": float(r2), "baseline_mse": baseline_mse}
+            
+    jepa.train()
+    return out
 
 def render_fixed_set(synth, prior, n, seed, extractor=None):
     rng = np.random.RandomState(seed)
     audio, vecs, inharm, valid = [], [], [], []
     for _ in range(n):
         patch, vec, midi_note, note_dur = prior.sample_patch_and_midi(rng)
-        audio.append(render_patch(synth, patch, midi_note, note_dur))
+        a = render_patch(synth, patch, midi_note, note_dur)
+        audio.append(a)
         vecs.append(vec)
+        if extractor is not None:
+            res = extractor.process_phrase(a, midi_note)
+            if res["valid"]:
+                inharm.append(res["value"])
+                valid.append(1.0)
+            else:
+                inharm.append(0.0)
+                valid.append(0.0)
+    
+    if extractor is not None:
+        return torch.from_numpy(np.stack(audio)), torch.from_numpy(np.stack(vecs)), torch.tensor(inharm, dtype=torch.float32), torch.tensor(valid, dtype=torch.float32)
     return torch.from_numpy(np.stack(audio)), torch.from_numpy(np.stack(vecs))
 
 
@@ -201,7 +257,7 @@ def validate(jepa, flow, normalizer, mel_fn, audio, params, w_enc, lambda_sig, d
         mel = mel_fn(a)
         cont, cats = prepare_jepa_inputs(p)
         lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats, sigreg_generator=gen)
-        i_loss = 0.0
+        i_loss = torch.zeros((), device=device)
         fl = flow_loss(flow, mel, p, w_enc, generator=gen)
         b = a.shape[0]
         for k, v in dict(jepa=lp + la + lambda_sig * (sa + sp), lp=lp, la=la, sig_a=sa, sig_p=sp, flow=fl).items():
@@ -232,6 +288,7 @@ def build_parser():
     ap.add_argument("--manifold", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz")
     ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
     ap.add_argument("--hours", type=float, default=8.0, help="total time budget, including resumed time")
+    ap.add_argument("--seed", type=int, default=None, help="seed for torch, numpy, random, and dataloader workers")
     ap.add_argument("--max_steps", type=int, default=0, help=">0 stops after this many steps (smoke tests)")
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--min_batch_size", type=int, default=2, help="minimum batch size when decaying batch size")
@@ -315,12 +372,19 @@ def build_parser():
 
 
 def train(args):
+    if args.seed is not None:
+        import numpy as np
+        import random
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        
     inharm_cfg = None
     if args.inharm_weight > 0:
         if not args.inharm_config:
             print("error: --inharm_weight > 0 requires --inharm_config")
             sys.exit(2)
-        from inharmonicity_target import InharmonicityConfig
+        from inharmonicity_target import InharmonicityConfig, InharmonicityExtractor
         inharm_cfg = InharmonicityConfig.from_json(args.inharm_config)
 
     global _STOP_REQUESTED
@@ -354,6 +418,16 @@ def train(args):
     if args.inharm_weight > 0:
         jepa_kwargs["inharmonicity_head"] = True
     jepa = SynthJEPA(**jepa_kwargs).to(device)
+    
+    if args.inharm_weight > 0:
+        import math
+        with open("scripts/synth_inversion/label_stats.json", "r") as f:
+            stats = json.load(f)
+        train_mean = stats["train"]["pooled_mean"]
+        # Softplus(bias) = train_mean => exp(bias) = exp(train_mean) - 1
+        bias_val = math.log(math.exp(train_mean) - 1.0)
+        with torch.no_grad():
+            jepa.inharmonicity_head.net[-2].bias.fill_(bias_val)
     FLOW_KWARGS["hidden_dim"] = args.flow_dim
     flow = build_model(**FLOW_KWARGS, cond_noise=args.cond_noise).to(device)
 
@@ -441,9 +515,10 @@ def train(args):
 
     # Fixed validation sets (main-process synth; verifies the enum mapping once)
     synth = init_synth(args.plugin, verify=True)
+    extractor = InharmonicityExtractor(inharm_cfg) if args.inharm_weight > 0 else None
     t0 = time.time()
-    val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1),
-                "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2)}
+    val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1, extractor=extractor if args.inharm_weight > 0 else None),
+                "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2, extractor=extractor if args.inharm_weight > 0 else None)}
     log(f"Rendered fixed validation sets ({args.val_size} notes each) in {time.time() - t0:.1f}s")
     ladder_val_set = None
     if args.ladder_val_anchors > 0:
@@ -488,17 +563,12 @@ def train(args):
         if ckpt["prior_md5"] != prior_md5 and not args.allow_prior_change:
             raise SystemExit(f"{ckpt_target} was trained on a different manifold (md5 {ckpt['prior_md5'][:10]}); "
                              "use a new --out_dir, or --allow_prior_change to continue anyway.")
-        res = jepa.load_state_dict(ckpt["jepa_state_dict"], strict=False)
-        if res.missing_keys:
-            if all(k.startswith("inharmonicity_head") for k in res.missing_keys):
-                log(f"Resuming from a checkpoint without inharmonicity_head; head will be randomly initialized.")
-            else:
-                raise SystemExit(f"Unexpected missing keys in JEPA: {res.missing_keys}")
-        if res.unexpected_keys:
-            if all(k.startswith("inharmonicity_head") for k in res.unexpected_keys):
-                log(f"Resuming from a checkpoint with inharmonicity_head into a model without it; head weights ignored.")
-            else:
-                raise SystemExit(f"Unexpected extra keys in JEPA: {res.unexpected_keys}")
+        ckpt_head_state = any(k.startswith("inharmonicity_head") for k in ckpt["jepa_state_dict"].keys())
+        run_head_state = args.inharm_weight > 0
+        if ckpt_head_state != run_head_state:
+            print("Cannot resume across a head on/off change (D8).")
+            sys.exit(2)
+        jepa.load_state_dict(ckpt["jepa_state_dict"])
         flow.load_state_dict(ckpt["flow_state_dict"])
         opt_jepa.load_state_dict(ckpt["opt_jepa"])
         opt_flow.load_state_dict(ckpt["opt_flow"])
@@ -592,8 +662,15 @@ def train(args):
                 res = res_sf
             else:
                 def run_val():
-                    return {name: validate(jepa, flow, normalizer, mel_fn, a, p, w_enc, args.lambda_sig, device)
-                            for name, (a, p) in val_sets.items()}
+                    r = {name: validate(jepa, flow, normalizer, mel_fn, a, p, w_enc, args.lambda_sig, device)
+                            for name, (a, p, *_) in val_sets.items()}
+                    if args.inharm_weight > 0:
+                        aux = validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device)
+                        for name in r:
+                            r[name]["aux_mse"] = aux[name]["mse"]
+                            r[name]["aux_r2"] = aux[name]["r2"]
+                            r[name]["aux_baseline_mse"] = aux[name]["baseline_mse"]
+                    return r
                 if kind == "ema":
                     with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
                         res = run_val()
@@ -694,7 +771,7 @@ def train(args):
             i_loss, i_count = masked_inharmonicity_loss(inharm_pred, inharm_val, inharm_valid)
             i_loss = args.inharm_weight * i_loss
         else:
-            i_loss = 0.0
+            i_loss = torch.zeros((), device=device)
 
         if is_ladder:
             # no SIGReg on a ladder (not i.i.d.); ordinal loss on the audio embedding instead
@@ -760,11 +837,18 @@ def train(args):
             if hasattr(opt_flow, "eval"):
                 opt_flow.eval()
             res = {name: validate(jepa, flow, normalizer, mel_fn, a, p, w_enc, args.lambda_sig, device)
-                   for name, (a, p) in val_sets.items()}
+                   for name, (a, p, *_) in val_sets.items()}
+            if args.inharm_weight > 0:
+                aux = validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device)
+                for name in res:
+                    res[name]["aux_mse"] = aux[name]["mse"]
+                    res[name]["aux_r2"] = aux[name]["r2"]
+                    res[name]["aux_baseline_mse"] = aux[name]["baseline_mse"]
             h, tr = res["heldout"], res["trainpresets"]
+            aux_str = f" | AUX held-out MSE {h['aux_mse']:.5f} (baseline {h['aux_baseline_mse']:.5f}) R^2 {h['aux_r2']:.4f}" if "aux_mse" in h else ""
             log(f"VAL step {step} | held-out presets: JEPA {h['jepa']:.4f} flow {h['flow']:.4f} "
                 f"R a2p {100 * h['r_a2p']:.1f}% p2a {100 * h['r_p2a']:.1f}% (chance {100 * h['chance']:.2f}%) | "
-                f"train presets: JEPA {tr['jepa']:.4f} flow {tr['flow']:.4f} | gap {h['jepa'] - tr['jepa']:+.4f}")
+                f"train presets: JEPA {tr['jepa']:.4f} flow {tr['flow']:.4f} | gap {h['jepa'] - tr['jepa']:+.4f}{aux_str}")
             with open(os.path.join(args.out_dir, "val.jsonl"), "a") as fh:
                 fh.write(json.dumps({"step": step, "time": time.time(), **{f"{n}/{k}": v for n, r in res.items()
                                                                            for k, v in r.items()}}) + "\n")

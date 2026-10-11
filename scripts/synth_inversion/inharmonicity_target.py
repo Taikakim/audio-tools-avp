@@ -262,25 +262,37 @@ def note_windows(spans, cfg):
 
 def pool_note_results(results, cfg):
     valid_vals = [r["value"] for r in results if r is not None and r.get("valid")]
-    if len(valid_vals) < cfg.min_valid_windows:
-        return {
-            "valid": False, 
-            "value": float("nan"), 
-            "rejection_reason": Reason.TOO_FEW_VALID_WINDOWS,
-            "all_rejection_reasons": [Reason.TOO_FEW_VALID_WINDOWS],
-            "n_valid_windows": len(valid_vals)
-        }
+    reasons = [r["rejection_reason"] for r in results if r is not None and not r.get("valid") and r.get("rejection_reason")]
+    n_valid = len(valid_vals)
+    valid = n_valid >= cfg.min_valid_windows
+    
     return {
-        "valid": True,
-        "value": float(np.mean(valid_vals)),
-        "rejection_reason": None,
-        "all_rejection_reasons": [],
-        "n_valid_windows": len(valid_vals)
+        "value": float(sum(valid_vals) / n_valid) if valid else float("nan"),
+        "valid": valid,
+        "rejection_reason": None if valid else Reason.TOO_FEW_VALID_WINDOWS,
+        "all_rejection_reasons": reasons if valid else reasons + [Reason.TOO_FEW_VALID_WINDOWS],
+        "fundamental_hz": None,
+        "fundamental_source": "per_note_midi",
+        "analysis_configuration_id": cfg.config_id(),
+        "coverage_diagnostics": {
+            "input_peak_count": None,
+            "selected_peak_count": None,
+            "total_peak_energy": None,
+            "selected_peak_energy": None,
+            "selected_energy_fraction": None,
+            "excluded_energy_fraction": None,
+            "first_selected_hz": None,
+            "level_change_db": None,
+            "tolerance": cfg.tolerance,
+            "max_harmonics": cfg.max_harmonics
+        },
+        "n_valid_windows": n_valid,
+        "window_results": results
     }
 
 def to_training_pair(result):
     if result["valid"]:
-        if not np.isfinite(result["value"]):
+        if not __import__('numpy').isfinite(result["value"]):
             raise ValueError("Valid result with non-finite value")
         return (result["value"], 1.0)
     return (0.0, 0.0)
