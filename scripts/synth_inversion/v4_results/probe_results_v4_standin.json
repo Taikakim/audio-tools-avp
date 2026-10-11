@@ -1,0 +1,161 @@
+{
+  "label": "stand-in synth, NOT Surge",
+  "sweeps": {
+    "attack": {
+      "control": "attack_s",
+      "distance": {
+        "logmel_l1": [
+          1.0,
+          1.0
+        ],
+        "mss_l1": [
+          1.0,
+          1.0
+        ],
+        "two_anchor": [
+          1.0,
+          1.0
+        ],
+        "harmonic_env": [
+          1.0,
+          1.0
+        ]
+      },
+      "descriptor": [
+        "log_attack_time",
+        [
+          0.8189626056156052,
+          0.3555285645684319
+        ]
+      ]
+    },
+    "decay": {
+      "control": "amp_decay_s",
+      "distance": {
+        "logmel_l1": [
+          1.0,
+          1.0
+        ],
+        "mss_l1": [
+          1.0,
+          1.0
+        ],
+        "two_anchor": [
+          1.0,
+          1.0
+        ],
+        "harmonic_env": [
+          0.5714285714285716,
+          0.39285714285714296
+        ]
+      },
+      "descriptor": [
+        "early_decay_db_per_s",
+        [
+          0.9955357142857143,
+          0.9642857142857145
+        ]
+      ]
+    },
+    "filt_env": {
+      "control": "fc_decay_s",
+      "distance": {
+        "logmel_l1": [
+          1.0,
+          1.0
+        ],
+        "mss_l1": [
+          1.0,
+          1.0
+        ],
+        "two_anchor": [
+          1.0,
+          1.0
+        ],
+        "harmonic_env": [
+          1.0,
+          1.0
+        ]
+      },
+      "descriptor": null
+    },
+    "reso": {
+      "control": "q",
+      "distance": {
+        "logmel_l1": [
+          1.0,
+          1.0
+        ],
+        "mss_l1": [
+          1.0,
+          1.0
+        ],
+        "two_anchor": [
+          1.0,
+          1.0
+        ],
+        "harmonic_env": [
+          0.9553571428571429,
+          0.8571428571428572
+        ]
+      },
+      "descriptor": [
+        "resonance_height",
+        [
+          1.0,
+          1.0
+        ]
+      ]
+    },
+    "fm": {
+      "control": "fm_depth",
+      "distance": {
+        "logmel_l1": [
+          1.0,
+          1.0
+        ],
+        "mss_l1": [
+          1.0,
+          1.0
+        ],
+        "two_anchor": [
+          0.9857142857142858,
+          0.942857142857143
+        ],
+        "harmonic_env": [
+          1.0,
+          1.0
+        ]
+      },
+      "descriptor": [
+        "comb_residual",
+        [
+          1.0,
+          1.0
+        ]
+      ]
+    }
+  },
+  "nuisance": {
+    "logmel_l1": {
+      "shift10": 2.062093143457973,
+      "shift20": 2.3581486796736284,
+      "room": 0.6504801007289023
+    },
+    "mss_l1": {
+      "shift10": 1.4450094373730493,
+      "shift20": 1.8897287658553434,
+      "room": 0.6219427315548605
+    },
+    "two_anchor": {
+      "shift10": 0.11589071183813286,
+      "shift20": 0.25534097915282017,
+      "room": 0.4879892020094074
+    },
+    "harmonic_env": {
+      "shift10": 0.10233326300331962,
+      "shift20": 0.2139189088128422,
+      "room": 2.4345441612152268
+    }
+  }
+}
