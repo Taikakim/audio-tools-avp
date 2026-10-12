@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Bounded onset snapping: align a MIDI note onset with the true onset in a rendered clip or a stem.
 
 Why (review B13, research Q3): attack descriptors and two-anchor windows are measured from the onset. MIDI onsets

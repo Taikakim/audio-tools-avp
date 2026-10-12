@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-12)
 """Blind, reference-conditioned A/B listening test for inversion systems (EVAL_PARADIGM_V4.md, tier T3).
 
 Why: every automatic real-stem metric we use (MSS, wMFCC, envelope cosine, the reranker's composite) is unvalidated

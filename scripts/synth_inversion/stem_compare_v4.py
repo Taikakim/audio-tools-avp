@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-12)
 """Paired comparison of inversion systems on the REAL stems, with a dev/test split for anything chosen by score.
 
 Why (EVAL_PARADIGM_V4.md, tier T2): real stems are the end task, but there are only ~24 of them, every system is

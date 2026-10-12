@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Audio-domain objectives for INFERENCE-TIME reranking and refinement (not for training; review B1).
 
 Surge XT is not differentiable, so these never need a gradient. They plug into `refine_v3.Refiner` (its `objective`)

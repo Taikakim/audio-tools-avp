@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Probe harness for candidate metrics and descriptors (research spec section 4). Prints and saves a table.
 
 For each sweep, one control varies while the others stay fixed. Two kinds of rows:

@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Objective "buzz" measures for sync, FM and detune (research Q9; review B9, B15).
 
 Brief section 5 item 3 ("zero unmodulated sync/FM buzz") is a listening criterion. These are numpy measures that

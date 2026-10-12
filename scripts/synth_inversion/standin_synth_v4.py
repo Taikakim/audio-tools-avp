@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Stand-in subtractive bass synth for CPU tests and probes. NOT Surge XT.
 
 Why it exists: the v4 components (onset alignment, transient descriptors, resonance card, buzz measures,

@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-12)
 """Per-item re-evaluation of trained Synth-JEPA + flow runs on fixed held-out sets (EVAL_PARADIGM_V4.md, tier T1).
 
 Why: the trainer logs ONE number per metric per validation (val_kinds.jsonl), so two runs can only be compared by

@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Temporal conditioning for the flow inverter (research Q5; review B5, B6).
 
 The v3 flow condition is ONE vector from `models_v3.AudioEncoder`: four stride-2 convolutions (time 81 -> 41 -> 21 ->

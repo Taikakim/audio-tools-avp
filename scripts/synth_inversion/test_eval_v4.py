@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-12)
 """Tests for the v4 evaluation tools (eval_stats_v4, heldout_eval_v4, compare_runs_v4, stem_compare_v4,
 listening_ab_v4). CPU only, no Surge: rendering is the only part not exercised.
 

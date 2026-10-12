@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """CPU tests for the v4 components. No Surge, no Essentia, no GPU. Run from scripts/synth_inversion:
 
     python -m pytest test_v4_components.py -q

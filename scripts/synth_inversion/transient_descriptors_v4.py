@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Attack and decay descriptors measured from an onset (research Q3; review B13, B15).
 
 All numpy. Call `snap_onset` first (onset_alignment_v4) and pass its onset, or pass 0.0 for a note that starts at

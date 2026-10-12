@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-12)
 """Paired, preset-clustered comparison of runs scored by heldout_eval_v4.py, against a PRE-REGISTERED plan.
 
 Why: see EVAL_PARADIGM_V4.md. In short, every contrast is computed on the same held-out items (paired), its

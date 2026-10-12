@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-12)
 """Statistics for comparing inverter runs on SHARED evaluation items (EVAL_PARADIGM_V4.md).
 
 Why this exists: the A1/A2/A3 report (V4_EXPERIMENT_REPORT.md) read single-run, single-checkpoint differences of

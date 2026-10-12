@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """UNTESTED here (no Surge or surgepy on the laptop). Read-only discovery for the installed Surge build; run on the training
 machine:    python enumerate_surge_v4.py --out surge_v4_enumeration.json
 
