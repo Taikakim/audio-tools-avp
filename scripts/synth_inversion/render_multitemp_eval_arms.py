@@ -317,17 +317,30 @@ def render_arm(arm_dir: str, out_dir: str, midi_dir: str, temps: list, stem_filt
     print("=" * 80)
 
 
+def resolve_arm_dir(base_dir: str, arm: str) -> str:
+    candidates = [
+        os.path.join(base_dir, f"real_bass_v3_{arm}_seeded"),
+        os.path.join(base_dir, f"real_bass_v3_{arm}_prime"),
+        os.path.join(base_dir, f"real_bass_v3_{arm}"),
+        os.path.join(base_dir, arm)
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and os.path.exists(os.path.join(c, "run_meta.json")):
+            return c
+    return os.path.join(base_dir, f"real_bass_v3_{arm}")
+
+
 def render_arm_isolated(arm: str, base_dir: str, midi_dir: str, temps: list, stem_filter=None):
     from invert_stem_collection_v3_cpu import STEM_CATALOG
     stems = STEM_CATALOG
     if stem_filter:
         stems = [s for s in STEM_CATALOG if stem_filter in s["id"]]
 
+    arm_dir = resolve_arm_dir(base_dir, arm)
     print("=" * 80)
-    print(f"RUNNING ISOLATED RENDER FOR ARM {arm.upper()} ({len(stems)} stems)")
+    print(f"RUNNING ISOLATED RENDER FOR ARM {arm.upper()} -> {os.path.basename(arm_dir)} ({len(stems)} stems)")
     print("=" * 80)
 
-    arm_dir = os.path.join(base_dir, f"real_bass_v3_{arm}")
     audio_dir = os.path.join(arm_dir, "eval_cpu_muscriptor_temps", "audio")
 
     for idx, s in enumerate(stems):
@@ -375,7 +388,7 @@ def main():
 
     if args.worker:
         for arm in args.arms:
-            arm_dir = os.path.join(args.base_dir, f"real_bass_v3_{arm}")
+            arm_dir = resolve_arm_dir(args.base_dir, arm)
             out_dir = os.path.join(arm_dir, "eval_cpu_muscriptor_temps")
             render_arm(arm_dir, out_dir, args.midi_dir, args.temps, stem_filter=args.stem)
     else:
