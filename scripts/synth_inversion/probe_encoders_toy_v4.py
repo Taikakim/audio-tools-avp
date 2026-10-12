@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """TOY probe: can the temporal encoders learn attack and decay controls that the pooled v3 encoder has to squeeze?
 
 Trains each encoder (the v3 conv + global-average-pool `AudioEncoder`, and the three v4 pools) with the same small head to

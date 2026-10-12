@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Adds --flow_encoder / --flow_film to train_realistic_bass_v3.py so a v4 flow can be trained (Stage 2). Stdlib only.
 
     python apply_flow_encoder_patch_v4.py --check     # report what would change, write nothing

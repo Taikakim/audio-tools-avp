@@ -1,0 +1,50 @@
+{
+  "name": "v4 A-series: inharmonicity aux head (JEPA) and temporal ASP flow encoder, A1 / A2 / A3 (+ A0 when trained)",
+  "notes": [
+    "Written before re-scoring. JEPA and flow are trained by separate optimisers on separate losses, and the flow is not conditioned on the JEPA (train_realistic_bass_v3.py), so each run informs two independent contrasts.",
+    "JEPA metrics: A1 and A3 have the same JEPA configuration (aux head, weight 100), so they are the JEPA replicate pair; A1 stopped at 11570 of 12000 steps, which makes the gauge slightly conservative.",
+    "Flow metrics: A2 and A3 have the same flow configuration (temporal_asp), so they are the flow replicate pair.",
+    "When A0 (conv flow, no aux head, seeded) exists, add it to b of aux_head and to b of temporal_asp, and add [A0, A2] to the jepa replicates and [A0, A1] to the flow replicates.",
+    "Primary metrics carry the Holm correction; secondary metrics are descriptive.",
+    "min_effect values are the smallest differences we would act on; they are not derived from these runs."
+  ],
+  "set": "extra",
+  "ladder_set": "ladders_extra",
+  "kinds": ["ema", "online"],
+  "alpha": 0.05,
+  "n_boot": 10000,
+  "contrasts": [
+    {
+      "name": "aux_head",
+      "module": "jepa",
+      "a": ["A1", "A3"],
+      "b": ["A2"],
+      "primary": ["mrr_a2p", "mrr_p2a"],
+      "secondary": ["hit_a2p", "hit_p2a", "top5_a2p", "top5_p2a", "ladder_jepa_rho"]
+    },
+    {
+      "name": "temporal_asp",
+      "module": "flow",
+      "a": ["A2", "A3"],
+      "b": ["A1"],
+      "primary": ["flow_mse", "param_mae"],
+      "secondary": ["flow_mae", "cat_acc", "ladder_flow_rho", "ladder_flow_rho:cutoff_low", "ladder_flow_rho:aeg_sustain",
+                    "ladder_flow_rho:feg_amount", "ladder_flow_rho:aeg_decay", "param_err:cutoff", "param_err:resonance",
+                    "param_err:feg_amount", "param_err:feg_decay", "param_err:aeg_decay", "param_err:aeg_sustain"]
+    }
+  ],
+  "replicates": {
+    "jepa": [["A1", "A3"]],
+    "flow": [["A2", "A3"]]
+  },
+  "min_effect": {
+    "mrr_a2p": 0.01,
+    "mrr_p2a": 0.01,
+    "hit_a2p": 0.02,
+    "hit_p2a": 0.02,
+    "flow_mse": 0.005,
+    "param_mae": 0.005,
+    "ladder_flow_rho": 0.03,
+    "ladder_jepa_rho": 0.03
+  }
+}

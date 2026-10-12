@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Inference-time scoring of rendered candidates with the v4 measures (Stage 1 of the plan; review B1).
 
 Glue only: `inference_v3.predict_and_rerank_candidates` renders flow candidates and scores them; this adds the v4

@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Dual-resolution log-mel front end (research Q4; review B4). NOT wired into the trainer.
 
 Why: the v3 front end is n_fft 1024, hop 441, 128 mel bands from 20 Hz. Bins are 43 Hz wide, so the lowest bands are not

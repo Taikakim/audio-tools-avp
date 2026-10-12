@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Does the existing `refine_v3.Refiner` work with the v4 objectives, and what does it recover on a stand-in synth?
 
 The Refiner looks up the module-level `objective(cand, target, env_weight)` at call time, so a different objective is a one-line

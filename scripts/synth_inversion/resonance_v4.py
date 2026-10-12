@@ -1,3 +1,4 @@
+# Owner: KUANG (created 2026-10-11)
 """Resonance, centre frequency and bandwidth from a harmonic tone (research Q2; review B12).
 
 Problem: a bass note has harmonics every f0 = 41 to 147 Hz. A filter resonance narrower than that spacing is
