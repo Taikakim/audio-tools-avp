@@ -55,3 +55,14 @@ Guidance for Claude Code when working in the **audio-tools-AVP** fork of
 - Branch discipline: LatCH work has lived on `latch-rms-control`; merge to `main` and note
   it in `WORKLOG.md` so SA3 (which mirrors the LatCH model) stays in sync.
 - When staging files for commit, stage only your own — leave unrelated working-tree changes.
+
+## Synth inversion / Synth-JEPA (experimental, planned GUI component)
+
+`scripts/synth_inversion/` — Surge XT 1.3.4 patch inversion (ResMLP, OT-CFM flow, Synth-JEPA arXiv:2609.31024) plus
+the v4 components and eval paradigm. Added 2026-10-12 from Antigravity/KUANG's work; owner WINTERMUTE.
+- **Start at** `scripts/synth_inversion/README.md`, then `V4_COMPONENTS.md`, `EVAL_PARADIGM_V4.md`, `V4_EXPERIMENT_REPORT.md`. Map: `SAO/ARCHITECTURE.md` §G.
+- Run scripts **from that directory** (they import each other by module name). Training venv: `stable-audio-3/.venv`; dataset generation / Surge: `synth_env` (pedalboard). Eval scripts need torch AND pedalboard in one venv.
+- Tests need no Surge or GPU: `python -m pytest -q test_synth_inversion.py test_v4_components.py`.
+- **Evidence rule:** the v4 [R] results are on a stand-in synth, not Surge; the v1 reports were invalidated (see `docs/synth_inversion_reports/WALKTHROUGH.md`). Compare runs with the paired, replicate-gated tools, not single-run numbers.
+- Branches: `fix/inharmonicity-aux` (current), `feature/v4-components`, `feature/v4-eval-paradigm`. Interfaces are not frozen.
+- Optimizer details for `ModularOptimizer` / `FusionOpt`: `fusion-optimiser/docs/MANUAL.md` (branch `docs/manual`, option-by-option).
