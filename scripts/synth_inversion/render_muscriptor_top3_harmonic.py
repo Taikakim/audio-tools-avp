@@ -31,52 +31,26 @@ from invert_stem_collection_v3_cpu import (
     STEM_CATALOG, resolve_mantu, find_active_bass_phrase, load_pedalboard_events_from_midi
 )
 
-RATIO_PRESETS = {
-    "1:1": {"osc_1_octave": 0.5, "osc_2_octave": 0.5, "osc_2_pitch_raw": 0.5, "semitones": 0.0},
-    "2:1": {"osc_1_octave": 0.5, "osc_2_octave": 0.66667, "osc_2_pitch_raw": 0.5, "semitones": 12.0},
-    "1:2": {"osc_1_octave": 0.5, "osc_2_octave": 0.33333, "osc_2_pitch_raw": 0.5, "semitones": -12.0},
-    "1:3": {"osc_1_octave": 0.5, "osc_2_octave": 0.33333, "osc_2_pitch_raw": 0.0, "semitones": -19.0},
-}
+from musical_snapping import apply_musical_snapping
 
 def snap_to_harmonic_ratio(patch: dict) -> tuple:
-    """Return a modified copy of patch with oscillator ratios locked to {2:1, 1:1, 1:2, 1:3}
-    and unmodulated static sync/FM/ring mod zeroed."""
-    p = dict(patch)
-    # Osc 1 is fundamental: lock to 0.5 (octave 0)
-    p["osc_1_octave"] = 0.5
-
-    # Estimate current relative semitone offset of Osc 2
-    # osc_octave: 0.0=-3, 0.5=0, 1.0=+3 => octave = (raw - 0.5) * 6
-    pred_oct_2 = (float(p.get("osc_2_octave", 0.5)) - 0.5) * 6.0
-    pred_semi = pred_oct_2 * 12.0
-
-    # Find closest ratio
-    best_name = "1:1"
-    min_dist = float("inf")
-    for name, r in RATIO_PRESETS.items():
-        dist = abs(pred_semi - r["semitones"])
-        if dist < min_dist:
-            min_dist = dist
-            best_name = name
-
-    target = RATIO_PRESETS[best_name]
-    p["osc_2_octave"] = target["osc_2_octave"]
-    p["osc_2_pitch_raw"] = target["osc_2_pitch_raw"]
-    p["harmonic_ratio"] = best_name
-
-    # Tame unmodulated static sync, FM depth, and ring modulation to avoid harsh non-musical wash
-    p["sync"] = 0.0
-    p["fm_depth"] = 0.0
-    p["ring_1x2_volume"] = 0.0
-    p["ring_2x3_volume"] = 0.0
-
-    return p, best_name
+    """Return a modified copy of patch with musical harmonic snapping applied:
+    RM ratios locked to integer octaves, FM ratios locked to whole/5th/4th,
+    sync coupled with FEG and sustain=0% unless exact octave."""
+    p, report = apply_musical_snapping(patch)
+    mode_str = ", ".join(f"{k}={v}" for k, v in report.items()) if report else "clean"
+    p["harmonic_ratio"] = mode_str
+    return p, mode_str
 
 
 def apply_patch_with_pitch(synth, p: dict):
     apply_patch(synth, p)
     if "osc_2_pitch_raw" in p and "a_osc_2_pitch" in synth.parameters:
         synth.parameters["a_osc_2_pitch"].raw_value = p["osc_2_pitch_raw"]
+    if "osc_3_pitch_raw" in p and "a_osc_3_pitch" in synth.parameters:
+        synth.parameters["a_osc_3_pitch"].raw_value = p["osc_3_pitch_raw"]
+    if p.get("sync_static_floor") == 0.0 and "a_osc_1_sync" in synth.parameters:
+        synth.parameters["a_osc_1_sync"].raw_value = 0.0
 
 
 def main():

@@ -45,14 +45,15 @@ def vectors_to_patches(vecs_one_input):
     return [vector_to_patch(v) for v in np.atleast_2d(vecs_one_input)]
 
 
-def predict_vectors_pinned(model, mel, midi_note, n_draws=20, steps=25, seed=42):
+def predict_vectors_pinned(model, mel, midi_note, n_draws=20, steps=25, seed=42, tau=None):
     """Predict vectors with coordinate 0 (midi_note) pinned to target_midi along the ODE path."""
     from surge_spec_v3 import NOTE_LOW, NOTE_HIGH
     device = next(model.parameters()).device
     mel = mel.to(device)
     target_norm_midi = float(np.clip((midi_note - NOTE_LOW) / (NOTE_HIGH - NOTE_LOW), 0.0, 1.0))
     with torch.no_grad():
-        tau = getattr(model, "default_tau", 1.0)
+        if tau is None:
+            tau = getattr(model, "default_tau", 1.0)
         tau_t = None
         gen = torch.Generator(device=device).manual_seed(seed)
         if getattr(model, "cond_noise", False):
@@ -104,7 +105,7 @@ def predict_and_rerank_candidates(
     model, synth, target_audio, mel, midi_note, note_dur,
     n_candidates=20, steps=25, seed=42,
     weight_stft=1.0, weight_pitch=3.0, weight_sub=4.0, weight_env=2.0, weight_richness=1.0,
-    weight_stereo=1.5, weight_mod=0.1, weight_contour=1.5, pin_pitch=True
+    weight_stereo=1.5, weight_mod=0.1, weight_contour=1.5, pin_pitch=True, tau=None
 ):
     """Generate n_candidates with the Flow model (with pitch-locking), render each in Surge XT,
     extract acoustic descriptors (F0, sub-octave power, bin energy contours, envelope duration, centroid, harmonics, stereo width, beating speed),
@@ -129,7 +130,7 @@ def predict_and_rerank_candidates(
     t_sub = get_sub_ratio(target_audio)
 
     if pin_pitch and is_flow(model):
-        vecs = predict_vectors_pinned(model, mel, midi_note=midi_note, n_draws=n_candidates, steps=steps, seed=seed)
+        vecs = predict_vectors_pinned(model, mel, midi_note=midi_note, n_draws=n_candidates, steps=steps, seed=seed, tau=tau)
         candidates = vectors_to_patches(vecs)
     else:
         vecs, _ = predict_vectors(model, mel, n_draws=n_candidates, steps=steps, seed=seed)

@@ -153,7 +153,8 @@ def validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device):
     import numpy as np
     from sklearn.metrics import r2_score
     from inharmonicity_aux_head import masked_inharmonicity_loss
-    with open("scripts/synth_inversion/label_stats.json", "r") as f:
+    stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_stats.json")
+    with open(stats_path, "r") as f:
         stats = json.load(f)
         
     jepa.eval()
@@ -324,6 +325,9 @@ def build_parser():
     ap.add_argument("--fusion_components", default="shampoo,sf,normuon,ns5,mona",
                     help="comma-separated list of FusionOpt components to enable")
     ap.add_argument("--flow_dim", type=int, default=512, help="Flow hidden dim")
+    ap.add_argument("--flow_encoder", default="conv", choices=("conv", "temporal_asp", "temporal_segments", "temporal_queries"),
+                    help="flow audio encoder: conv = the v3 pooled encoder (default, unchanged); temporal_* = models_v4 (keeps the time axis)")
+    ap.add_argument("--flow_film", action="store_true", help="per-block FiLM from the audio embedding (models_v4)")
     ap.add_argument("--embed_dim", type=int, default=512, help="JEPA embedding dimension (default: 512)")
     ap.add_argument("--ff_dim", type=int, default=1152,
                     help="feedforward dimension for JEPA (1152 matches ~53M paper size, 1024 is default ~50M)")
@@ -421,15 +425,22 @@ def train(args):
     
     if args.inharm_weight > 0:
         import math
-        with open("scripts/synth_inversion/label_stats.json", "r") as f:
+        stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_stats.json")
+        with open(stats_path, "r") as f:
             stats = json.load(f)
         train_mean = stats["train"]["pooled_mean"]
         # Softplus(bias) = train_mean => exp(bias) = exp(train_mean) - 1
         bias_val = math.log(math.exp(train_mean) - 1.0)
         with torch.no_grad():
             jepa.inharmonicity_head.net[-2].bias.fill_(bias_val)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
     FLOW_KWARGS["hidden_dim"] = args.flow_dim
-    flow = build_model(**FLOW_KWARGS, cond_noise=args.cond_noise).to(device)
+    if args.flow_encoder == "conv" and not args.flow_film:
+        flow = build_model(**FLOW_KWARGS, cond_noise=args.cond_noise).to(device)
+    else:
+        from models_v4 import build_model_v4  # a v4 flow has different encoder keys: use a new --out_dir
+        flow = build_model_v4(**FLOW_KWARGS, cond_noise=args.cond_noise, encoder=args.flow_encoder, film=args.flow_film).to(device)
 
     if args.optimizer == "modular":
         from stable_audio_tools.training.modular_opt import (
@@ -712,7 +723,7 @@ def train(args):
 
     while not _STOP_REQUESTED:
         elapsed = elapsed_prev + time.time() - start
-        if elapsed >= total_s or (args.max_steps and step >= args.max_steps):
+        if (args.max_steps and step >= args.max_steps) or (not args.max_steps and elapsed >= total_s):
             break
         if args.optimizer == "adamw":
             f = lr_factor(step, elapsed / total_s, args.warmup_steps, args.decay_frac)

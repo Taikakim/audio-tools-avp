@@ -29,6 +29,8 @@ LR_JEPA="${LR_JEPA:-3.0e-4}";  LR_FLOW="${LR_FLOW:-2.0e-4}"
 BATCH_SIZE="${BATCH_SIZE:-64}"; NUM_WORKERS="${NUM_WORKERS:-8}"
 DEVICE="${DEVICE:-cuda:0}"
 PYTHON="${PYTHON:-python3}"
+FLOW_ENCODER="${FLOW_ENCODER:-conv}"
+FLOW_FILM="${FLOW_FILM:-0}"
 case "$COND_NOISE" in 0|1) ;; *) die "COND_NOISE must be 0 or 1";; esac
 case "$FLOW_LOSS" in mae|mse) ;; *) die "FLOW_LOSS must be mae or mse";; esac
 awk -v w="$INHARM_WEIGHT" 'BEGIN{ exit !(w ~ /^[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$/) }' || die "INHARM_WEIGHT must be a non-negative number"
@@ -53,7 +55,10 @@ CMD=( "$PYTHON" "$HERE/train_realistic_bass_v3.py"
 [ -n "${MANIFOLD:-}" ]      && CMD+=( --manifold "$MANIFOLD" )
 [ -n "${SEED:-}" ]          && CMD+=( --seed "$SEED" )
 [ "$USE_AUX" = 1 ]          && CMD+=( --inharm_weight "$INHARM_WEIGHT" --inharm_config "$INHARM_CONFIG" )
+[ "$FLOW_ENCODER" != "conv" ] && CMD+=( --flow_encoder "$FLOW_ENCODER" )
+[ "$FLOW_FILM" = 1 ]          && CMD+=( --flow_film )
 CMD+=( --purpose "$PURPOSE" )
+CMD+=( "$@" )
 
 print_cmd() { printf '%q' "${CMD[0]}"; local t; for t in "${CMD[@]:1}"; do case "$t" in --*) printf ' \\\n  %q' "$t";; *) printf ' %q' "$t";; esac; done; printf '\n'; }
 
