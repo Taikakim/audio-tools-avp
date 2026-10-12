@@ -37,6 +37,8 @@ def midi_events(path, dur):
         t += msg.time
         if t > dur:
             break
+        if getattr(msg, 'channel', 0) == 9:
+            continue
         if msg.type in ("note_on", "note_off"):
             ev.append(mido.Message(msg.type, note=msg.note, velocity=msg.velocity, time=t))
     return sorted(ev, key=lambda m: m.time)

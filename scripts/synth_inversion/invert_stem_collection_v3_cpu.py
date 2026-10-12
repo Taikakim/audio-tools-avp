@@ -288,6 +288,9 @@ def load_pedalboard_events_from_midi(midi_path, max_dur=None):
         t += msg.time
         if max_dur is not None and t >= max_dur:
             break
+        # Ignore MIDI Channel 9 (percussion) so hi-hats don't hijack pitch/root estimation
+        if getattr(msg, 'channel', 0) == 9:
+            continue
         if msg.type == 'note_on' and msg.velocity > 0:
             events.append(mido.Message('note_on', note=msg.note, velocity=msg.velocity, time=t))
             active_notes[msg.note] = t

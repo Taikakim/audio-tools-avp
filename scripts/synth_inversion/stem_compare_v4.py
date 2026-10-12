@@ -53,7 +53,8 @@ def from_multitemp(path):
             continue
         for stem, rec in stems.items():
             for tag, r in (rec.get("temps") or {}).items():
-                tau = float(r["tau"])
+                TAG_TAU = {"t015": 0.15, "t03": 0.30, "t05": 0.50, "t07": 0.70, "t085": 0.85, "t10": 1.00}
+                tau = float(r.get("tau", TAG_TAU.get(tag, 1.0)))
                 for variant, key in (("raw", "stft_phrase_raw"), ("harm", "stft_phrase_harm")):
                     if key in r and r[key] is not None:
                         rows.append({"stem": stem, "system": f"{kind}/tau{tau:.2f}/{variant}", "seed": 0,

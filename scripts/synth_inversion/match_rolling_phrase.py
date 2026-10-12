@@ -94,6 +94,8 @@ def load_phrase_midi(midi_path: str, duration_s: float):
         current_time_s += mido.tick2second(msg.time, ticks_per_beat, current_tempo)
         if current_time_s >= duration_s:
             break
+        if getattr(msg, 'channel', 0) == 9:
+            continue
         if msg.type in ["note_on", "note_off"]:
             events.append(mido.Message(msg.type, note=msg.note, velocity=msg.velocity, time=current_time_s))
     if not any(e.type == "note_on" and e.velocity > 0 for e in events):

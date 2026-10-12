@@ -37,6 +37,8 @@ def parse_midi_notes_in_beats(midi_path: str, max_dur_s: float, bpm: float):
         t_s += msg.time
         if max_dur_s is not None and t_s >= max_dur_s:
             break
+        if getattr(msg, 'channel', 0) == 9:
+            continue
         beat = t_s * (bpm / 60.0)
         if msg.type == "note_on" and msg.velocity > 0:
             active_notes[msg.note] = (beat, msg.velocity / 127.0)

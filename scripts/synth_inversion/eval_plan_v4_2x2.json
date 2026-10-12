@@ -1,0 +1,49 @@
+{
+  "name": "v4 A-series 2x2 factorial: inharmonicity aux head (JEPA) and temporal ASP flow encoder (A0, A1, A2, A3, A3')",
+  "notes": [
+    "Full 2x2 factorial design with replicate pairs on both sides.",
+    "JEPA contrasts: No Aux (A0, A2) vs Aux Head (A1, A3, A3'). Replicate pairs: [A0, A2], [A1, A3], [A3, A3'].",
+    "Flow contrasts: Conv Flow (A0, A1) vs Temporal ASP Flow (A2, A3, A3'). Replicate pairs: [A0, A1], [A2, A3], [A3, A3'].",
+    "Primary metrics carry the Holm correction; secondary metrics are descriptive.",
+    "min_effect values are pre-registered minimal detectable differences."
+  ],
+  "set": "extra",
+  "ladder_set": "ladders_extra",
+  "kinds": ["ema", "online"],
+  "alpha": 0.05,
+  "n_boot": 10000,
+  "contrasts": [
+    {
+      "name": "aux_head",
+      "module": "jepa",
+      "a": ["A1", "A3", "A3_prime"],
+      "b": ["A0", "A2"],
+      "primary": ["mrr_a2p", "mrr_p2a"],
+      "secondary": ["hit_a2p", "hit_p2a", "top5_a2p", "top5_p2a", "ladder_jepa_rho"]
+    },
+    {
+      "name": "temporal_asp",
+      "module": "flow",
+      "a": ["A2", "A3", "A3_prime"],
+      "b": ["A0", "A1"],
+      "primary": ["flow_mse", "param_mae"],
+      "secondary": ["flow_mae", "cat_acc", "ladder_flow_rho", "ladder_flow_rho:cutoff_low", "ladder_flow_rho:aeg_sustain",
+                    "ladder_flow_rho:feg_amount", "ladder_flow_rho:aeg_decay", "param_err:cutoff", "param_err:resonance",
+                    "param_err:feg_amount", "param_err:feg_decay", "param_err:aeg_decay", "param_err:aeg_sustain"]
+    }
+  ],
+  "replicates": {
+    "jepa": [["A1", "A3"], ["A3", "A3_prime"], ["A0", "A2"]],
+    "flow": [["A2", "A3"], ["A3", "A3_prime"], ["A0", "A1"]]
+  },
+  "min_effect": {
+    "mrr_a2p": 0.01,
+    "mrr_p2a": 0.01,
+    "hit_a2p": 0.02,
+    "hit_p2a": 0.02,
+    "flow_mse": 0.005,
+    "param_mae": 0.005,
+    "ladder_flow_rho": 0.03,
+    "ladder_jepa_rho": 0.03
+  }
+}

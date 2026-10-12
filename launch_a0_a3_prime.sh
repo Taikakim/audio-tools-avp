@@ -1,0 +1,1 @@
+scripts/synth_inversion/launch_a0_a3_prime.sh
