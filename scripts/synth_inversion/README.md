@@ -60,6 +60,12 @@ scripts/synth_inversion/
 `-- run_overnight_suite.sh     # 200-epoch Muon+SF run, then 100-epoch AdamW baseline
 ```
 
+V5 tools (October 13, 2026; plan, findings and smoke tests in `V5_PROPOSAL_REVIEW.md`, CPU tests in `test_v5.py`):
+`audio_metrics_v5.py` (paired audio metrics incl. Mel-SSIM), `ladder_metric_check_v5.py` (metric gate on parameter
+sweeps), `render_pool_v5.py` / `render_bank_v5.py` (shared pre-rendered training data, `--bank`), `flow_sampling_v5.py`,
+`audio_eval_v5.py` (audio-space evaluation + listening pack), `dpo_pairs_v5.py` / `train_flow_dpo_v5.py` (Flow-DPO),
+`listening_test_v5.py` (paper-style blind test); cross-attention flow via `--flow_xattn`, model size via `SIZE=small`.
+
 ---
 
 ## 3. Running it

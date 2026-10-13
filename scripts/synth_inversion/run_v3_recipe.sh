@@ -12,6 +12,12 @@
 # Optional:         MANIFOLD  SEED (passed as --seed; the trainer rejects it until --seed exists)  PURPOSE
 #                   EMBED_DIM FLOW_DIM FF_DIM (768 768 2048)  LR_JEPA LR_FLOW (3.0e-4 2.0e-4)  BATCH_SIZE NUM_WORKERS
 #                   DEVICE PYTHON (default python3)  SAO (enables the GPU lock)  LOCK_HANDLE  DRY_RUN=1
+# v5 (2026-10-13):  SIZE=base|small  sets the defaults of EMBED_DIM FLOW_DIM FF_DIM JEPA_LAYERS FLOW_LAYERS
+#                   PREDICTOR_HIDDEN (base = 768 768 2048 8 8 1024, the sizes used so far; small = 384 384 1024 4 4 768,
+#                   about 1/8 of the compute, for choosing a training paradigm before a base-size confirmation).
+#                   Any of those variables set explicitly still wins.
+#                   FLOW_XATTN=1 (+ FLOW_XATTN_HEADS, default 4; needs FLOW_ENCODER=temporal_*)
+#                   BANK=<render_bank_v5 dir> (+ BANK_SEED, default 0)  VAL_CACHE=<dir>  LADDER_WORKERS (default 3)
 # Example (reference recipe, aux off):   OUT_DIR=... MAX_STEPS=78416 HOURS=30 DRY_RUN=1 ./run_v3_recipe.sh
 # To start a TWIN of a live run use twin_command.py instead: it copies the live run's own flags.
 set -uo pipefail
@@ -24,7 +30,16 @@ HOURS="${HOURS:-}";         [ -n "$HOURS" ]     || die "set HOURS (wall-clock ca
 COND_NOISE="${COND_NOISE:-1}"
 FLOW_LOSS="${FLOW_LOSS:-mae}"
 INHARM_WEIGHT="${INHARM_WEIGHT:-0}"
-EMBED_DIM="${EMBED_DIM:-768}"; FLOW_DIM="${FLOW_DIM:-768}"; FF_DIM="${FF_DIM:-2048}"
+SIZE="${SIZE:-base}"
+case "$SIZE" in
+  base)  D=(768 768 2048 8 8 1024) ;;
+  small) D=(384 384 1024 4 4 768) ;;
+  *) die "SIZE must be base or small" ;;
+esac
+EMBED_DIM="${EMBED_DIM:-${D[0]}}"; FLOW_DIM="${FLOW_DIM:-${D[1]}}"; FF_DIM="${FF_DIM:-${D[2]}}"
+JEPA_LAYERS="${JEPA_LAYERS:-${D[3]}}"; FLOW_LAYERS="${FLOW_LAYERS:-${D[4]}}"; PREDICTOR_HIDDEN="${PREDICTOR_HIDDEN:-${D[5]}}"
+FLOW_XATTN="${FLOW_XATTN:-0}"; FLOW_XATTN_HEADS="${FLOW_XATTN_HEADS:-4}"
+LADDER_WORKERS="${LADDER_WORKERS:-3}"; BANK_SEED="${BANK_SEED:-0}"
 LR_JEPA="${LR_JEPA:-3.0e-4}";  LR_FLOW="${LR_FLOW:-2.0e-4}"
 BATCH_SIZE="${BATCH_SIZE:-64}"; NUM_WORKERS="${NUM_WORKERS:-8}"
 DEVICE="${DEVICE:-cuda:0}"
@@ -44,11 +59,12 @@ PURPOSE="${PURPOSE:-reference recipe (H1+H6+MAE): cond_noise=$COND_NOISE flow_lo
 CMD=( "$PYTHON" "$HERE/train_realistic_bass_v3.py"
   --out_dir "$OUT_DIR" --hours "$HOURS" --max_steps "$MAX_STEPS" --batch_size "$BATCH_SIZE"
   --embed_dim "$EMBED_DIM" --flow_dim "$FLOW_DIM" --ff_dim "$FF_DIM"
+  --jepa_layers "$JEPA_LAYERS" --flow_layers "$FLOW_LAYERS" --predictor_hidden "$PREDICTOR_HIDDEN"
   --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05
   --num_workers "$NUM_WORKERS" --prefetch_factor 4
   --lr_jepa "$LR_JEPA" --lr_flow "$LR_FLOW" --lr_floor 0.333 --decay_frac 0.3
-  --ladder_every 4 --ladder_anchors 4 --ladder_steps 16 --ladder_workers 3 --lambda_ord 0.5 --ladder_val_anchors 8
+  --ladder_every 4 --ladder_anchors 4 --ladder_steps 16 --ladder_workers "$LADDER_WORKERS" --lambda_ord 0.5 --ladder_val_anchors 8
   --ot_coupling --ema_halflife_steps 2000
   --flow_loss "$FLOW_LOSS" --device "$DEVICE" )
 [ "$COND_NOISE" = 1 ]       && CMD+=( --cond_noise --cond_noise_clean_frac 0.3 )
@@ -57,6 +73,12 @@ CMD=( "$PYTHON" "$HERE/train_realistic_bass_v3.py"
 [ "$USE_AUX" = 1 ]          && CMD+=( --inharm_weight "$INHARM_WEIGHT" --inharm_config "$INHARM_CONFIG" )
 [ "$FLOW_ENCODER" != "conv" ] && CMD+=( --flow_encoder "$FLOW_ENCODER" )
 [ "$FLOW_FILM" = 1 ]          && CMD+=( --flow_film )
+if [ "$FLOW_XATTN" = 1 ]; then
+  case "$FLOW_ENCODER" in temporal_*) ;; *) die "FLOW_XATTN=1 needs FLOW_ENCODER=temporal_asp|temporal_segments|temporal_queries";; esac
+  CMD+=( --flow_xattn --flow_xattn_heads "$FLOW_XATTN_HEADS" )
+fi
+[ -n "${BANK:-}" ]            && CMD+=( --bank "$BANK" --bank_seed "$BANK_SEED" )
+[ -n "${VAL_CACHE:-}" ]       && CMD+=( --val_cache "$VAL_CACHE" )
 CMD+=( --purpose "$PURPOSE" )
 CMD+=( "$@" )
 

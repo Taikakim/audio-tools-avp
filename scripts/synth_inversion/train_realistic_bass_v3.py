@@ -32,6 +32,14 @@ v2 (2026-10-02 review). What changed and why:
     from the last good checkpoint.
   * Rolling step checkpoints are pruned to the last --keep_last.
   * run_meta.json is written at a fresh launch (purpose, prior, args).
+
+v5 additions (2026-10-13, KUANG; all off by default, so existing launch commands train the same model):
+  * --bank DIR reads pre-rendered clips (render_bank_v5.py) in an order fixed by --bank_seed, identical for every arm;
+    --val_cache DIR reuses the startup validation renders.
+  * --flow_xattn adds per-block cross-attention to the flow (models_v4); --jepa_layers, --predictor_hidden,
+    --flow_layers, --flow_enc_dim set the model size (defaults = the sizes used so far).
+  * The periodic log line reports samples/s and the share of wall time spent waiting for data.
+  * Flow exports carry args['v4_config'], so load_inverter_v4 rebuilds every v4 option (cross-attention heads too).
 """
 import argparse
 import glob
@@ -328,6 +336,19 @@ def build_parser():
     ap.add_argument("--flow_encoder", default="conv", choices=("conv", "temporal_asp", "temporal_segments", "temporal_queries"),
                     help="flow audio encoder: conv = the v3 pooled encoder (default, unchanged); temporal_* = models_v4 (keeps the time axis)")
     ap.add_argument("--flow_film", action="store_true", help="per-block FiLM from the audio embedding (models_v4)")
+    # --- v5 (2026-10-13): cross-attention flow, model size, render bank, cached validation sets ---
+    ap.add_argument("--flow_xattn", action="store_true",
+                    help="per-block cross-attention from the flow state to the encoder's time tokens (models_v4; "
+                         "needs a temporal_* --flow_encoder; zero-initialised, so it starts as the plain flow)")
+    ap.add_argument("--flow_xattn_heads", type=int, default=4)
+    ap.add_argument("--flow_xattn_dim", type=int, default=0, help="cross-attention width; 0 = the encoder's d_model")
+    ap.add_argument("--flow_layers", type=int, default=8, help="flow ResBlocks (default 8, as before)")
+    ap.add_argument("--flow_enc_dim", type=int, default=256, help="temporal_* encoder token width (d_model)")
+    ap.add_argument("--jepa_layers", type=int, default=8, help="JEPA audio and parameter encoder depth (default 8)")
+    ap.add_argument("--predictor_hidden", type=int, default=1024, help="JEPA cross-domain predictor width")
+    ap.add_argument("--bank", default="", help="read training clips from a render_bank_v5.py bank instead of live Surge")
+    ap.add_argument("--bank_seed", type=int, default=0, help="order of the bank (identical for every arm with this seed)")
+    ap.add_argument("--val_cache", default="", help="directory for cached validation and ladder-validation renders")
     ap.add_argument("--embed_dim", type=int, default=512, help="JEPA embedding dimension (default: 512)")
     ap.add_argument("--ff_dim", type=int, default=1152,
                     help="feedforward dimension for JEPA (1152 matches ~53M paper size, 1024 is default ~50M)")
@@ -417,8 +438,12 @@ def train(args):
         log("WARNING: manifold was built with --no_plugin (unverified unit conversions)")
 
     mel_fn = ExactGpuMel(device=device)
-    jepa_kwargs = dict(embed_dim=args.embed_dim, predictor_hidden=1024, num_audio_layers=8, num_param_layers=8,
-                       num_slices_sigreg=64, ff_dim=args.ff_dim, in_frames=81)
+    if args.embed_dim % 8:
+        raise SystemExit(f"--embed_dim {args.embed_dim} must be divisible by the JEPA's 8 attention heads")
+    if args.flow_xattn and not args.flow_encoder.startswith("temporal_"):
+        raise SystemExit("--flow_xattn needs a temporal_* --flow_encoder (the conv encoder has no time tokens)")
+    jepa_kwargs = dict(embed_dim=args.embed_dim, predictor_hidden=args.predictor_hidden, num_audio_layers=args.jepa_layers,
+                       num_param_layers=args.jepa_layers, num_slices_sigreg=64, ff_dim=args.ff_dim, in_frames=81)
     if args.inharm_weight > 0:
         jepa_kwargs["inharmonicity_head"] = True
     jepa = SynthJEPA(**jepa_kwargs).to(device)
@@ -436,11 +461,15 @@ def train(args):
     if args.seed is not None:
         torch.manual_seed(args.seed)
     FLOW_KWARGS["hidden_dim"] = args.flow_dim
-    if args.flow_encoder == "conv" and not args.flow_film:
+    FLOW_KWARGS["num_layers"] = args.flow_layers
+    if args.flow_encoder == "conv" and not args.flow_film and not args.flow_xattn:
         flow = build_model(**FLOW_KWARGS, cond_noise=args.cond_noise).to(device)
     else:
         from models_v4 import build_model_v4  # a v4 flow has different encoder keys: use a new --out_dir
-        flow = build_model_v4(**FLOW_KWARGS, cond_noise=args.cond_noise, encoder=args.flow_encoder, film=args.flow_film).to(device)
+        enc_kwargs = {"d_model": args.flow_enc_dim} if args.flow_encoder.startswith("temporal_") else None
+        flow = build_model_v4(**FLOW_KWARGS, cond_noise=args.cond_noise, encoder=args.flow_encoder, film=args.flow_film,
+                              enc_kwargs=enc_kwargs, xattn=args.flow_xattn, xattn_dim=args.flow_xattn_dim or None,
+                              xattn_heads=args.flow_xattn_heads).to(device)
 
     if args.optimizer == "modular":
         from stable_audio_tools.training.modular_opt import (
@@ -524,38 +553,86 @@ def train(args):
     log(f"JEPA {sum(p.numel() for p in jepa.parameters()) / 1e6:.2f}M params (ff_dim={args.ff_dim}), "
         f"flow {sum(p.numel() for p in flow.parameters()) / 1e6:.2f}M params")
 
-    # Fixed validation sets (main-process synth; verifies the enum mapping once)
+    # Fixed validation sets (main-process synth; verifies the enum mapping once). With --val_cache the renders are
+    # stored under a key of everything that determines them and reused by every later run with the same key.
     synth = init_synth(args.plugin, verify=True)
     extractor = InharmonicityExtractor(inharm_cfg) if args.inharm_weight > 0 else None
-    t0 = time.time()
-    val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1, extractor=extractor if args.inharm_weight > 0 else None),
-                "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2, extractor=extractor if args.inharm_weight > 0 else None)}
-    log(f"Rendered fixed validation sets ({args.val_size} notes each) in {time.time() - t0:.1f}s")
-    ladder_val_set = None
-    if args.ladder_val_anchors > 0:
+    cache_path = None
+    if args.val_cache:
+        import hashlib
+        from render_bank_v5 import file_md5
+        key = json.dumps({"v": 1, "prior": prior_md5, "val_size": args.val_size, "seeds": [1, 2, 3],
+                          "ladder_val_anchors": args.ladder_val_anchors, "ladder_steps": args.ladder_steps,
+                          "inharm": file_md5(args.inharm_config) if args.inharm_weight > 0 else None,
+                          "plugin": os.path.basename(os.path.normpath(args.plugin))}, sort_keys=True)
+        os.makedirs(args.val_cache, exist_ok=True)
+        cache_path = os.path.join(args.val_cache, f"valsets_{hashlib.sha1(key.encode()).hexdigest()[:16]}.pt")
+    if cache_path and os.path.exists(cache_path):
+        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+        val_sets, ladder_val_set = cached["val_sets"], cached["ladder_val_set"]
+        log(f"Loaded cached validation sets from {cache_path}")
+    else:
         t0 = time.time()
-        ladder_val_set = render_ladder_set(synth, val_prior, args.ladder_val_anchors, args.ladder_steps, seed=3)
-        log(f"Rendered held-out ladder set ({len(ladder_val_set[0])} notes) in {time.time() - t0:.1f}s")
+        val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1, extractor=extractor if args.inharm_weight > 0 else None),
+                    "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2, extractor=extractor if args.inharm_weight > 0 else None)}
+        log(f"Rendered fixed validation sets ({args.val_size} notes each) in {time.time() - t0:.1f}s")
+        ladder_val_set = None
+        if args.ladder_val_anchors > 0:
+            t0 = time.time()
+            ladder_val_set = render_ladder_set(synth, val_prior, args.ladder_val_anchors, args.ladder_steps, seed=3)
+            log(f"Rendered held-out ladder set ({len(ladder_val_set[0])} notes) in {time.time() - t0:.1f}s")
+        if cache_path:
+            atomic_save({"val_sets": val_sets, "ladder_val_set": ladder_val_set}, cache_path)
+            log(f"Cached validation sets in {cache_path}")
     del synth
     import gc
     gc.collect()
 
-    loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin, random_patch_frac=args.random_patch_frac, inharm_cfg=inharm_cfg),
-                        batch_size=args.batch_size,
-                        num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
-                        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-                        persistent_workers=args.num_workers > 0, worker_init_fn=_worker_init,
-                        # spawn, not fork: the main process has loaded Surge (validation renders),
-                        # and a forked copy of the plugin/audio state can deadlock
-                        multiprocessing_context="spawn" if args.num_workers > 0 else None)
-    batches = iter(loader)
+    if args.bank:
+        # Pre-rendered clips (render_bank_v5.py): the same items in the same order for every arm with this bank_seed.
+        from torch.utils.data import RandomSampler
+        from render_bank_v5 import BankLadderDataset, BankMainDataset, check_compatible, cycle, read_manifest
+        manifest = read_manifest(args.bank)
+        probs = check_compatible(manifest, prior_md5, args.inharm_weight, args.inharm_config, args.ladder_steps,
+                                 args.ladder_every, args.random_patch_frac)
+        if probs and not args.allow_prior_change:
+            raise SystemExit("--bank does not fit this run:\n  " + "\n  ".join(probs))
+        main_ds = BankMainDataset(args.bank)
+        need = (args.max_steps or 0) * args.batch_size * (1.0 - (1.0 / args.ladder_every if args.ladder_every else 0.0))
+        log(f"Training clips from bank {args.bank} ({len(main_ds)} items, seed {args.bank_seed}); this run needs "
+            f"~{need + args.norm_batches * args.batch_size:.0f} = {(need + args.norm_batches * args.batch_size) / len(main_ds):.2f} passes")
+        loader = DataLoader(main_ds, batch_size=args.batch_size,
+                            sampler=RandomSampler(main_ds, generator=torch.Generator().manual_seed(args.bank_seed)),
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
+                            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+                            persistent_workers=args.num_workers > 0)
+        batches = cycle(loader)
+    else:
+        loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin, random_patch_frac=args.random_patch_frac, inharm_cfg=inharm_cfg),
+                            batch_size=args.batch_size,
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
+                            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+                            persistent_workers=args.num_workers > 0, worker_init_fn=_worker_init,
+                            # spawn, not fork: the main process has loaded Surge (validation renders),
+                            # and a forked copy of the plugin/audio state can deadlock
+                            multiprocessing_context="spawn" if args.num_workers > 0 else None)
+        batches = iter(loader)
     ladder_batches = None
     if args.ladder_every > 0:
-        ladder_loader = DataLoader(LadderDataset(args.manifold, args.plugin, args.ladder_anchors, args.ladder_steps),
-                                   batch_size=None, num_workers=args.ladder_workers, pin_memory=device.type == "cuda",
-                                   prefetch_factor=2, persistent_workers=True, worker_init_fn=_worker_init,
-                                   multiprocessing_context="spawn")
-        ladder_batches = iter(ladder_loader)
+        if args.bank:
+            lad_ds = BankLadderDataset(args.bank, args.ladder_anchors)
+            ladder_loader = DataLoader(lad_ds, batch_size=None, num_workers=args.ladder_workers,
+                                       sampler=RandomSampler(lad_ds, generator=torch.Generator().manual_seed(args.bank_seed + 1)),
+                                       pin_memory=device.type == "cuda",
+                                       prefetch_factor=2 if args.ladder_workers > 0 else None,
+                                       persistent_workers=args.ladder_workers > 0)
+            ladder_batches = cycle(ladder_loader)
+        else:
+            ladder_loader = DataLoader(LadderDataset(args.manifold, args.plugin, args.ladder_anchors, args.ladder_steps),
+                                       batch_size=None, num_workers=args.ladder_workers, pin_memory=device.type == "cuda",
+                                       prefetch_factor=2, persistent_workers=True, worker_init_fn=_worker_init,
+                                       multiprocessing_context="spawn")
+            ladder_batches = iter(ladder_loader)
 
     ema_jepa = EMA(jepa, args.ema_halflife_steps) if args.ema_halflife_steps > 0 else None
     ema_flow = EMA(flow, args.ema_halflife_steps) if args.ema_halflife_steps > 0 else None
@@ -635,7 +712,8 @@ def train(args):
                      "normalizer": normalizer.state_dict(), "prior_bounds": prior_bounds, **meta},
                     os.path.join(args.out_dir, f"jepa_{tag}.pt"))
         atomic_save({"model_state": flow.state_dict(), "prior_bounds": prior_bounds,
-                     "args": {"model_type": "flow", "param_encoding": codec.ENCODING_V2, "time_scale": 1000.0}, **meta},
+                     "args": {"model_type": "flow", "param_encoding": codec.ENCODING_V2, "time_scale": 1000.0,
+                              "v4_config": getattr(flow, "v4_config", None)}, **meta},
                     os.path.join(args.out_dir, f"flow_{tag}.pt"))
 
     def save_checkpoint():
@@ -713,7 +791,8 @@ def train(args):
 
     total_s = args.hours * 3600.0
     start = time.time()
-    run = {k: 0.0 for k in ("jepa", "flow", "r_a2p", "r_p2a")}
+    t_window = start                                     # throughput window for the periodic log line
+    run = {k: 0.0 for k in ("jepa", "flow", "r_a2p", "r_p2a", "wait_s", "samples")}
     bad = {"jepa": 0, "flow": 0}
     log("Entering main training loop...")
     if hasattr(opt_jepa, "train"):
@@ -755,6 +834,7 @@ def train(args):
         curr_b = max(args.min_batch_size, min(args.batch_size, curr_b))
 
         is_ladder = ladder_batches is not None and step % args.ladder_every == args.ladder_every - 1
+        t_wait = time.time()
         if is_ladder:
             # No inharmonicity targets for ladder batches yet
             audio, params, _axis = next(ladder_batches)
@@ -762,6 +842,8 @@ def train(args):
             inharm_valid = torch.zeros(audio.shape[0])
         else:
             audio, params, inharm_val, inharm_valid = next(batches)
+        run["wait_s"] = run.get("wait_s", 0.0) + time.time() - t_wait   # time blocked on the data loader
+        run["samples"] = run.get("samples", 0.0) + audio.shape[0]
         if curr_b < audio.shape[0]:
             audio = audio[:curr_b]
             params = params[:curr_b]
@@ -834,13 +916,16 @@ def train(args):
         if step % args.log_interval_steps == 0:
             k = args.log_interval_steps
             el = elapsed_prev + time.time() - start
+            wall = max(time.time() - t_window, 1e-9)
             log(f"Step {step:7d} | {el / 3600:5.2f}h / {args.hours:.2f}h | lr x{f:.3f} | batch {curr_b:2d} | "
                 f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f} | Aux {run['inharm'] / k:.4f} (v={run['inharm_valid'] / k:.2f}) | "
                 f"in-batch R a2p {100 * run['r_a2p'] / k:5.1f}% p2a {100 * run['r_p2a'] / k:5.1f}% "
                 f"(chance {100 / curr_b:.1f}%)"
                 + (f" | ladders {run['n_ladder']:.0f} ord {run['ord'] / max(1, run['n_ladder']):.4f}"
-                   if run.get("n_ladder") else ""))
+                   if run.get("n_ladder") else "")
+                + f" | {run['samples'] / wall:.0f} samples/s, data wait {100 * run['wait_s'] / wall:.0f}%")
             run = {key: 0.0 for key in run}
+            t_window = time.time()
 
         if step % args.val_interval_steps == 0:
             if hasattr(opt_jepa, "eval"):
