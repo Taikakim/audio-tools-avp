@@ -185,10 +185,8 @@ def build_all_arms_dawproject(
 
     ref_bpm = available_stems[0].get("bpm", 140.0)
     transport = ET.SubElement(project, "Transport")
-    tempo_el = ET.SubElement(transport, "Tempo", unit="bpm")
-    tempo_el.text = f"{ref_bpm:.2f}"
-    time_sig = ET.SubElement(transport, "TimeSignature")
-    time_sig.text = "4/4"
+    ET.SubElement(transport, "Tempo", max="666.0", min="20.0", unit="bpm", value=f"{ref_bpm:.2f}", id="id_tempo", name="Tempo")
+    ET.SubElement(transport, "TimeSignature", denominator="4", numerator="4", id="id_ts")
 
     structure = ET.SubElement(project, "Structure")
     arrangement = ET.SubElement(project, "Arrangement", id="id_arr")
@@ -291,47 +289,48 @@ def build_all_arms_dawproject(
             ET.SubElement(g_chan, "Volume", max="2.0", min="0.0", unit="linear", value="1.0",
                           id=f"vol_{group_id}", name="Volume")
 
-            # Group Lanes
-            group_lanes = ET.SubElement(arr_lanes, "Lanes", track=group_id, id=f"glanes_{group_id}")
+            # Group Lane (empty Clips container, directly under arr_lanes)
+            group_lane = ET.SubElement(arr_lanes, "Lanes", track=group_id, id=f"lane_{group_id}")
+            ET.SubElement(group_lane, "Clips", id=f"clips_{group_id}")
 
             # Sub-track 1: Harmonic Snapped Audio (Active)
             t1_id = f"trk_harm_{s_idx+1}"
             t1 = ET.SubElement(group_track, "Track", contentType="audio", loaded="true",
                                id=t1_id, name="Harmonic Snapped Audio")
-            t1_chan = ET.SubElement(t1, "Channel", audioChannels="2", role="regular", solo="false",
+            t1_chan = ET.SubElement(t1, "Channel", audioChannels="2", destination=f"chan_{group_id}", role="regular", solo="false",
                                     id=f"chan_{t1_id}")
             ET.SubElement(t1_chan, "Volume", max="2.0", min="0.0", unit="linear", value="1.0",
                           id=f"vol_{t1_id}", name="Volume")
-            t1_lane = ET.SubElement(group_lanes, "Lanes", track=t1_id, id=f"lane_{t1_id}")
+            t1_lane = ET.SubElement(arr_lanes, "Lanes", track=t1_id, id=f"lane_{t1_id}")
             t1_clips_el = ET.SubElement(t1_lane, "Clips", id=f"clips_{t1_id}")
 
             # Sub-track 2: Raw Flow Predictions (Muted)
             t2_id = f"trk_raw_{s_idx+1}"
             t2 = ET.SubElement(group_track, "Track", contentType="audio", loaded="true",
                                id=t2_id, name="Raw Flow Predictions (Muted A/B)")
-            t2_chan = ET.SubElement(t2, "Channel", audioChannels="2", role="regular", solo="false",
+            t2_chan = ET.SubElement(t2, "Channel", audioChannels="2", destination=f"chan_{group_id}", role="regular", solo="false",
                                     id=f"chan_{t2_id}")
             ET.SubElement(t2_chan, "Volume", max="2.0", min="0.0", unit="linear", value="1.0",
                           id=f"vol_{t2_id}", name="Volume")
             ET.SubElement(t2_chan, "Mute", value="true", id=f"mute_{t2_id}", name="Mute")
-            t2_lane = ET.SubElement(group_lanes, "Lanes", track=t2_id, id=f"lane_{t2_id}")
+            t2_lane = ET.SubElement(arr_lanes, "Lanes", track=t2_id, id=f"lane_{t2_id}")
             t2_clips_el = ET.SubElement(t2_lane, "Clips", id=f"clips_{t2_id}")
 
             # Sub-track 3: Transcribed MIDI
             t3_id = f"trk_midi_{s_idx+1}"
             t3 = ET.SubElement(group_track, "Track", contentType="notes", loaded="true",
                                id=t3_id, name="Transcribed MIDI Notes")
-            t3_chan = ET.SubElement(t3, "Channel", role="regular", solo="false", id=f"chan_{t3_id}")
+            t3_chan = ET.SubElement(t3, "Channel", destination=f"chan_{group_id}", role="regular", solo="false", id=f"chan_{t3_id}")
             ET.SubElement(t3_chan, "Volume", max="2.0", min="0.0", unit="linear", value="1.0",
                           id=f"vol_{t3_id}", name="Volume")
-            t3_lane = ET.SubElement(group_lanes, "Lanes", track=t3_id, id=f"lane_{t3_id}")
+            t3_lane = ET.SubElement(arr_lanes, "Lanes", track=t3_id, id=f"lane_{t3_id}")
             t3_clips_el = ET.SubElement(t3_lane, "Clips", id=f"clips_{t3_id}")
 
             # Sub-track 4: Live Surge XT Instrument Track (Muted by default)
             t4_id = f"trk_synth_{s_idx+1}"
             t4 = ET.SubElement(group_track, "Track", contentType="notes", loaded="true",
                                id=t4_id, name="Surge XT Live Patch")
-            t4_chan = ET.SubElement(t4, "Channel", audioChannels="2", role="regular", solo="false",
+            t4_chan = ET.SubElement(t4, "Channel", audioChannels="2", destination=f"chan_{group_id}", role="regular", solo="false",
                                     id=f"chan_{t4_id}")
             ET.SubElement(t4_chan, "Volume", max="2.0", min="0.0", unit="linear", value="0.85",
                           id=f"vol_{t4_id}", name="Volume")
@@ -339,16 +338,19 @@ def build_all_arms_dawproject(
 
             # Attach VST3 Plugin Device if preset exists
             if plugin_rel:
-                devices = ET.SubElement(t4, "Devices")
-                dev_el = ET.SubElement(devices, "Device", deviceRole="instrument", loaded="true",
-                                       id=f"dev_{id_counter}", name="Surge XT")
+                devices = ET.SubElement(t4_chan, "Devices")
+                vst_dev = ET.SubElement(devices, "Vst3Plugin",
+                                        deviceID="ABCDEF019182FAEB566D624153675854",
+                                        deviceVendor="Surge Synth Team",
+                                        deviceName="Surge XT",
+                                        deviceRole="instrument",
+                                        loaded="true",
+                                        id=f"dev_{id_counter}",
+                                        name="Surge XT")
                 id_counter += 1
-                vst3_el = ET.SubElement(dev_el, "Vst3Plugin", pluginId="53757267652D78740000000000000000",
-                                        pluginVersion="1.3.4", id=f"vst_{id_counter}", name="Surge XT")
-                id_counter += 1
-                ET.SubElement(vst3_el, "State", path=plugin_rel)
+                ET.SubElement(vst_dev, "State", path=plugin_rel)
 
-            t4_lane = ET.SubElement(group_lanes, "Lanes", track=t4_id, id=f"lane_{t4_id}")
+            t4_lane = ET.SubElement(arr_lanes, "Lanes", track=t4_id, id=f"lane_{t4_id}")
             t4_clips_el = ET.SubElement(t4_lane, "Clips", id=f"clips_{t4_id}")
 
             # -------------------------------------------------------------
