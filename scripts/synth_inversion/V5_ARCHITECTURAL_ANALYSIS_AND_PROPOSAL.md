@@ -122,33 +122,67 @@ Section 3.2 of the Synth-JEPA paper (*"Synth-JEPA: Joint Embedding Prediction fo
 
 ---
 
-## 4. Evaluation Metrics: SonicMaster vs. Stable-Audio-Metrics vs. SI-SDR
+## 4. Repositories and Metric Suites Discussed
 
-### 4.1 SonicMaster (`2508.03448v5`) DSP Diagnostic Suite
-SonicMaster provides a domain-specific suite for physical and tonal degradation analysis (`evaluation/evaluate_control_multiple_degs_mass.py`):
-* **9-Band Spectral Balance Cosine Distance ($1 - \cos(\text{SB}_{\text{GT}}, \text{SB}_{\text{pred}})$):**  
-  Evaluates energy distribution across 9 bands: Sub (20–60 Hz), Punch (60–250 Hz), Low-Mid (250–500 Hz), Mid (500–2000 Hz), Upper-Mid (2–4 kHz), Presence (4–6 kHz), Brilliance (6–10 kHz, 10–16 kHz, 16–20 kHz).  
-  *Direct applicability to synth bass:* **Vital.** Bass inversion errors are overwhelmingly balance errors between sub weight, punch octave, and filter cutoff bite.
-* **Mel-SSIM (128-bin log-mel Structural Similarity):**  
-  Evaluates 2D spectro-temporal geometry (filter envelope sweep slopes, formant curves) while remaining invariant to acoustic phase.
-* **Transient Punch (`onset_strength`):**  
-  Directly measures attack click amplitude and envelope sharpness.
-* **Modulation Spectrum Distance (MSD):**  
-  Captures low-frequency envelope modulation ($< 20$ bins), isolating LFO wobble rates, chorus depth, and detuned unison phasing.
+### 4.1 Referenced Repositories
+1. **SonicMaster (`/home/kim/Projects/SonicMaster`):**
+   - Reference Paper: *SonicMaster: Towards Controllable All-in-One Music Restoration and Mastering* (arXiv:2508.03448v5, Jan Melechovsky, Ambuj Mehrish, Abhinaba Roy, Dorien Herremans).
+   - Core Architecture: Flow Matching with Flux Transformer on continuous audio latents guided by T5 text prompts and 19 degradation-specific audio transformations.
+   - Codebase Modules: Audio degradation generation, mass DSP metric calculation, Mel-SSIM/KL extraction, LAION-CLAP FAD, and Audiobox Aesthetics evaluation.
+2. **stable-audio-metrics (`/home/kim/Projects/stable-audio-metrics`):**
+   - Reference Organization: Stability AI (Zach Evans, CJ Carr, Julian Parker, et al.).
+   - Purpose: Standardized benchmark suite for evaluating generative audio and music models (Stable Audio, AudioCraft) on full-band 48 kHz stereo audio.
+   - Codebase Modules: `src/openl3_fd.py` (OpenL3 Fréchet Distance @ 48 kHz), `src/passt_kld.py` (PaSST AudioSet KL Divergence @ 32 kHz), and `src/clap_score.py` (LAION-CLAP @ 48 kHz).
 
-### 4.2 Stability AI's `stable-audio-metrics` Macro Benchmark
-`/home/kim/Projects/stable-audio-metrics` provides macro-level generative evaluation:
-* **OpenL3-FD @ 48 kHz:** Full-bandwidth Fréchet Audio Distance with LUFS normalization. Avoids 16 kHz VGGish bandwidth truncation.
-* **PaSST-KLD @ 32 kHz:** AudioSet class distribution matching using Patchout Audio Transformers.
-* **LAION-CLAP Score @ 48 kHz:** Multimodal audio-to-audio embedding cosine similarity (`630k-audioset-fusion-best`).
+---
 
-### 4.3 The SI-SDR Warning for Synthesizers
-**Scale-Invariant Signal-to-Distortion Ratio (SI-SDR) must NOT be used for synthesizer evaluation [I].**
-* SI-SDR is a **sample-level time-domain waveform metric**:
-  $$\text{SI-SDR}(s, \hat{s}) = 10 \log_{10} \frac{\| \alpha s \|^2}{\| \alpha s - \hat{s} \|^2}, \quad \alpha = \frac{\hat{s}^T s}{\|s\|^2}$$
-* In audio restoration/mastering (SonicMaster), the source and target share identical acoustic phase.
-* In synthesizers, oscillators are **free-running** (random initial phase), and multi-voice unison induces continuous chaotic phase cancellation.
-* If an inverted patch matches the ground-truth bass tone with **100% perceptual perfection**, but its oscillator phase starts $\pi$ radians out of phase (a $\sim 5\,\text{ms}$ shift at 100 Hz), waveform subtraction yields destructive cancellation, driving SI-SDR to **$-15\,\text{dB}$ or $-\infty\,\text{dB}$**. Time-domain sample metrics are mathematically invalid for un-synced synth audio.
+### 4.2 Comprehensive Inventory of All Metrics Discussed
+
+#### Category A: SonicMaster DSP & Degradation Metrics (`SonicMaster/evaluation/`)
+1. **FAD on CLAP Embeddings:** Fréchet Audio Distance (2-Wasserstein metric) between Gaussian fits of LAION-CLAP embeddings of clean references vs. outputs.
+2. **KL Divergence on Mel-Spectrograms:** Kullback-Leibler divergence between normalized mean energy distributions across log-mel frequency bins.
+3. **SSIM on 128-bin Mel-Spectrograms:** Structural Similarity Index Measure computed over 2D power-to-dB mel-spectrogram arrays, quantifying spectro-temporal envelope contours.
+4. **Production Quality (PQ) Score:** Audio aesthetic rating using Meta's `audiobox_aesthetics` predictor.
+5. **9-Band Spectral Balance Cosine Distance ($1 - \cos(\text{SB}_{\text{GT}}, \text{SB}_{\text{pred}})$):** Distance between normalized energy profiles across 9 frequency bands: (20–60, 60–250, 250–500, 500–2k, 2k–4k, 4k–6k, 6k–10k, 10k–16k, 16k–20k Hz).
+6. **9-Band Spectral Balance Euclidean Distance:** Euclidean distance across the 9 normalized frequency bands.
+7. **Band Energy Ratio ($E_{\text{band}} / E_{\text{total}}$):** Degradation-specific energy ratios across bounded bands:
+   - *Boom:* (20, 150 Hz)
+   - *Warm:* (20, 400 Hz)
+   - *Mud:* (200, 500 Hz)
+   - *Vocal:* (350, 3500 Hz)
+   - *Clarity:* (4000, $f_s/2$)
+   - *Bright / Dark:* (6000, $f_s/2$)
+   - *Airy:* (10000, $f_s/2$)
+8. **Dynamic Range Standard Deviation ($\text{STD DR}$):** Standard deviation of frame-level RMS energy (2048-sample frames, 1024 hop), measuring compression dynamics.
+9. **Transient Punch / Attack Strength:** Mean of `librosa.onset.onset_strength`, measuring attack transient onset sharpness and click energy.
+10. **Modulation Spectrum Distance (MSD):** Euclidean distance of low-frequency envelope modulation spectra across STFT bins ($< 20$ modulation bins), isolating LFO wobble, chorus, and detune phasing.
+11. **RT60 Reverberation Time:** Schroeder backwards integration of the energy decay curve, fitting linear slope between $-5\,\text{dB}$ and $-35\,\text{dB}$.
+12. **Spectral Flatness Error:** Absolute error of `librosa.feature.spectral_flatness` on STFT power spectrograms, quantifying saturation, clipping, and waveshaper distortion.
+13. **Global RMS Volume Error:** Absolute error of overall Root-Mean-Square signal amplitude.
+14. **Stereo Energy Ratio (Mid-Side Width):** Ratio of Side energy to Mid energy: $\text{RMS}(L - R) / (\text{RMS}(L + R) + \epsilon)$ or $\text{RMS}(S) / \text{RMS}(M)$.
+
+#### Category B: Stability AI Macro Generative Benchmark (`stable-audio-metrics/src/`)
+15. **OpenL3-FD @ 48 kHz:** Full-bandwidth Fréchet Distance on OpenL3 music/environmental representations with LUFS loudness normalization (`pyloudnorm`) and `soxr` resampling.
+16. **PaSST-KLD @ 32 kHz:** KL divergence over AudioSet acoustic/musical class probabilities predicted by the Patchout Audio Transformer (PaSST).
+17. **CLAP-LAION Score @ 48 kHz:** Cosine similarity in LAION-CLAP embedding space (`630k-audioset-fusion-best.pt`) between text prompts and audio, or audio-to-audio pairs.
+
+#### Category C: Waveform & Spectral Distance Metrics (Inquired & Baseline)
+18. **SI-SDR (Scale-Invariant Signal-to-Distortion Ratio):**
+    $$\text{SI-SDR}(s, \hat{s}) = 10 \log_{10} \frac{\| \alpha s \|^2}{\| \alpha s - \hat{s} \|^2}, \quad \alpha = \frac{\hat{s}^T s}{\|s\|^2}$$
+    *(Proven invalid for synthesizers due to free-running oscillator phase drift and unison cancelation, which drive SI-SDR to $-\infty\,\text{dB}$ even on perceptually identical sounds).*
+19. **Multi-Scale STFT (MSS) Distance:** Sum of linear spectral convergence and log-magnitude $\ell_1$ distance across multiple FFT frame sizes (e.g. 512, 1024, 2048).
+
+#### Category D: Pre-Registered V4 Factorial Evaluation Suite (`eval_v4_2x2`)
+20. **`mrr_a2p` / `mrr_p2a`:** Audio-to-Preset and Preset-to-Audio Mean Reciprocal Rank ($1 / (1 + \text{rank})$) within the held-out gallery.
+21. **`hit_a2p` / `hit_p2a`:** Audio-to-Preset and Preset-to-Audio exact Top-1 retrieval accuracy.
+22. **`top5_a2p` / `top5_p2a`:** Audio-to-Preset and Preset-to-Audio Top-5 retrieval accuracy.
+23. **`ladder_jepa_rho`:** Spearman rank correlation along control parameter sweeps in JEPA representation space.
+24. **`ladder_flow_rho`:** Spearman rank correlation of flow predictions across control ladders (overall and per-axis: `cutoff_low`, `aeg_sustain`, `feg_amount`, `aeg_decay`).
+25. **`flow_mse` / `flow_mae`:** Flow-matching velocity vector field regression loss on clean condition.
+26. **`param_mae`:** Mean Absolute Error across continuous synthesizer parameters.
+27. **`cat_acc`:** Majority-vote classification accuracy across categorical parameters.
+28. **`param_err:<param>`:** Per-parameter absolute error for individual continuous controls (`cutoff`, `resonance`, `feg_amount`, `feg_decay`, `aeg_decay`, `aeg_sustain`).
+29. **`aux_sqerr`:** Squared error of the inharmonicity prediction auxiliary head on items with valid labels.
 
 ---
 
