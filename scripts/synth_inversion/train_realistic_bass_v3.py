@@ -87,20 +87,124 @@ def _sig_handler(sig, frame):
 
 
 def sample_unconstrained_random_patch(rng=None):
-    """Draw a completely unconstrained random patch across the full 23-parameter space.
-    Not constrained to empirical bass distributions or proxy-bass heuristic ranges."""
+    """Draw a sensible random patch across the Surge XT bass parameter space.
+    
+    Incorporates:
+    - Pulse width bounded to [0.05, 0.95] (no needle impulses or flat DC).
+    - Headroom-aware filter cutoff modulation (no negative modulation choking low cutoff).
+    - Headroom-aware PWM modulation depth.
+    - Anti-click/anti-snap envelope constraints (guaranteed audible body and decay).
+    - Fast electronic bass archetype generator (50% draws: biting positive FEG, low FEG sustain,
+      snappy decay, Analog envelope curve).
+    - Randomized envelope curves and modes (Analog vs Digital, Linear/Quadratic/Cubic).
+    """
     rng = np.random if rng is None else rng
     vec = rng.uniform(0.0, 1.0, size=NUM_PARAMS).astype(np.float32)
-    filter_choice = int(rng.randint(0, len(LP_FILTERS)))
-    vec[PARAM_INDEX["filter_type"]] = filter_choice / max(1, len(LP_FILTERS) - 1)
-    unison_choice = int(rng.randint(0, 2))
-    vec[PARAM_INDEX["unison"]] = float(unison_choice)
+
+    is_fast_electronic = bool(rng.rand() < 0.50)
+
+    if is_fast_electronic:
+        # Fast electronic bass archetype:
+        # Biting filter envelope, low base cutoff, low FEG sustain, short decay, solid AEG sustain
+        ladder_circuits = [1, 2, 3, 5, 6, 7]  # LP 24dB, Legacy Ladder, Vintage Ladder, OB-Xd 24dB, K35, Diode Ladder
+        filter_choice = int(rng.choice(ladder_circuits))
+        vec[PARAM_INDEX["filter_type"]] = filter_choice / max(1, len(LP_FILTERS) - 1)
+
+        vec[PARAM_INDEX["cutoff"]] = float(rng.uniform(0.14, 0.30))
+        vec[PARAM_INDEX["resonance"]] = float(rng.uniform(0.15, 0.70))
+        vec[PARAM_INDEX["feg_amount"]] = float(rng.uniform(0.65, 0.88))  # +30 to +75 semitones bite
+        vec[PARAM_INDEX["feg_decay"]] = float(rng.uniform(0.08, 0.24))
+        vec[PARAM_INDEX["feg_sustain"]] = float(rng.uniform(0.0, 0.18))
+
+        vec[PARAM_INDEX["aeg_decay"]] = float(rng.uniform(0.18, 0.45))
+        vec[PARAM_INDEX["aeg_sustain"]] = float(rng.uniform(0.45, 0.85))
+        vec[PARAM_INDEX["aeg_release"]] = float(rng.uniform(0.08, 0.35))
+
+        # Envelope modes: analog mode for classic punchy RC curve
+        vec[PARAM_INDEX["filter_eg_mode"]] = 1.0  # Analog
+        vec[PARAM_INDEX["amp_eg_mode"]] = 1.0 if rng.rand() < 0.8 else 0.0
+        vec[PARAM_INDEX["filter_eg_decay_shape"]] = float(rng.choice([0.5, 1.0]))  # Quadratic (0.5) or Cubic (1.0)
+        vec[PARAM_INDEX["amp_eg_decay_shape"]] = float(rng.choice([0.5, 1.0]))
+
+        # Pulse width in musical range
+        vec[PARAM_INDEX["width"]] = float(rng.uniform(0.20, 0.80))
+        vec[PARAM_INDEX["sub_mix"]] = float(rng.uniform(0.0, 0.55))
+        vec[PARAM_INDEX["sync"]] = float(rng.uniform(0.0, 0.35)) if rng.rand() < 0.25 else 0.0
+
+        # Unison
+        use_unison = bool(rng.rand() < 0.30)
+        vec[PARAM_INDEX["unison"]] = 1.0 if use_unison else 0.0
+        vec[PARAM_INDEX["unison_detune"]] = float(rng.uniform(0.05, 0.40)) if use_unison else 0.0
+
+        # Single filter dominant for fast punch
+        vec[PARAM_INDEX["filter_configuration"]] = 0.0  # Serial 1
+        vec[PARAM_INDEX["filter_balance"]] = 0.0  # 100% Filter 1
+        vec[PARAM_INDEX["filter_2_cutoff"]] = float(rng.uniform(0.5, 0.9))
+        vec[PARAM_INDEX["filter_2_feg_amount"]] = 0.5  # 0 semitones
+    else:
+        # Diverse acoustic random patch with headroom and sanity constraints
+        filter_choice = int(rng.randint(0, len(LP_FILTERS)))
+        vec[PARAM_INDEX["filter_type"]] = filter_choice / max(1, len(LP_FILTERS) - 1)
+
+        # Pulse width bounds: exclude narrower than 5% or 95%
+        vec[PARAM_INDEX["width"]] = float(rng.uniform(0.05, 0.95))
+
+        cutoff = float(rng.uniform(0.12, 0.82))
+        vec[PARAM_INDEX["cutoff"]] = cutoff
+
+        # Headroom-aware filter modulation
+        if cutoff < 0.38:
+            # Low cutoff: MUST have positive FEG modulation so sound can develop
+            vec[PARAM_INDEX["feg_amount"]] = float(rng.uniform(0.52, 0.88))
+        else:
+            # Higher cutoff: can modulate up or down, but keep lower bound safe
+            vec[PARAM_INDEX["feg_amount"]] = float(rng.uniform(0.38, 0.80))
+
+        vec[PARAM_INDEX["feg_decay"]] = float(rng.uniform(0.06, 0.65))
+        vec[PARAM_INDEX["feg_sustain"]] = float(rng.uniform(0.0, 0.60))
+
+        # Anti-click / anti-snap AEG
+        aeg_decay = float(rng.uniform(0.12, 0.65))
+        vec[PARAM_INDEX["aeg_decay"]] = aeg_decay
+        if aeg_decay < 0.22:
+            vec[PARAM_INDEX["aeg_sustain"]] = float(rng.uniform(0.35, 0.85))
+        else:
+            vec[PARAM_INDEX["aeg_sustain"]] = float(rng.uniform(0.15, 0.80))
+        vec[PARAM_INDEX["aeg_release"]] = float(rng.uniform(0.06, 0.40))
+
+        # Envelope modes and shapes
+        vec[PARAM_INDEX["amp_eg_mode"]] = 1.0 if rng.rand() < 0.65 else 0.0
+        vec[PARAM_INDEX["filter_eg_mode"]] = 1.0 if rng.rand() < 0.65 else 0.0
+        vec[PARAM_INDEX["amp_eg_decay_shape"]] = float(rng.choice([0.0, 0.5, 1.0]))
+        vec[PARAM_INDEX["filter_eg_decay_shape"]] = float(rng.choice([0.0, 0.5, 1.0]))
+
+        # Filter 2 safe passband headroom
+        vec[PARAM_INDEX["filter_2_cutoff"]] = float(rng.uniform(0.25, 0.95))
+        vec[PARAM_INDEX["filter_2_feg_amount"]] = float(rng.uniform(0.48, 0.85))
+        vec[PARAM_INDEX["filter_balance"]] = float(rng.uniform(0.15, 0.85))
+
+        unison_choice = int(rng.randint(0, 2))
+        vec[PARAM_INDEX["unison"]] = float(unison_choice)
+        if not unison_choice:
+            vec[PARAM_INDEX["unison_detune"]] = 0.0
+
+    # Ensure secondary width controls are bounded [0.05, 0.95]
+    for w_name in ["osc_1_width_2", "osc_2_width_1", "osc_2_width_2", "osc_3_width_1", "osc_3_width_2"]:
+        vec[PARAM_INDEX[w_name]] = float(rng.uniform(0.05, 0.95))
+
+    # Keep primary oscillator volume solid and noise within musical bounds
+    vec[PARAM_INDEX["osc_1_volume"]] = float(rng.uniform(0.70, 1.0))
+    vec[PARAM_INDEX["noise_volume"]] = float(rng.uniform(0.0, 0.15))
+
     ws_choice = int(rng.randint(0, len(WAVESHAPER_TYPES)))
     vec[PARAM_INDEX["waveshaper_type"]] = ws_choice / max(1, len(WAVESHAPER_TYPES) - 1)
-    # no FX: they poison the persistent worker's Surge state (surge_spec.apply_patch), and the preset
-    # prior never uses them, so random patches must not either
+    if ws_choice == 0:
+        vec[PARAM_INDEX["drive"]] = 0.0
+
+    # No FX: they poison persistent workers
     for fx in ("chorus_mix", "delay_mix", "delay_fb"):
         vec[PARAM_INDEX[fx]] = 0.0
+
     vec = canonicalize_vector(vec)
     patch = vector_to_patch(vec)
     midi_note = patch["midi_note"]

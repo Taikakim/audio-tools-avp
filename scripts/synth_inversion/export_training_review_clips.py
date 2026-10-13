@@ -37,7 +37,7 @@ def decode_parameters(vec: np.ndarray) -> dict:
     ws_idx = spec.ordinal_to_class(vec[spec.PARAM_INDEX["waveshaper_type"]], len(spec.WAVESHAPER_TYPES))
     unison = bool(vec[spec.PARAM_INDEX["unison"]] > 0.5)
 
-    return {
+    res = {
         "filter_type": spec.LP_FILTERS[f_idx][0],
         "cutoff": float(vec[spec.PARAM_INDEX["cutoff"]]),
         "resonance": float(vec[spec.PARAM_INDEX["resonance"]]),
@@ -59,6 +59,17 @@ def decode_parameters(vec: np.ndarray) -> dict:
         "aeg_sustain": float(vec[spec.PARAM_INDEX["aeg_sustain"]]),
         "aeg_release": float(vec[spec.PARAM_INDEX["aeg_release"]]),
     }
+    if len(vec) >= 52:
+        shape_names = ["Linear", "Quadratic", "Cubic"]
+        amp_m = spec.ordinal_to_class(vec[spec.PARAM_INDEX["amp_eg_mode"]], 2)
+        flt_m = spec.ordinal_to_class(vec[spec.PARAM_INDEX["filter_eg_mode"]], 2)
+        amp_s = spec.ordinal_to_class(vec[spec.PARAM_INDEX["amp_eg_decay_shape"]], 3)
+        flt_s = spec.ordinal_to_class(vec[spec.PARAM_INDEX["filter_eg_decay_shape"]], 3)
+        res["amp_eg_mode"] = "Analog" if amp_m == 1 else "Digital"
+        res["filter_eg_mode"] = "Analog" if flt_m == 1 else "Digital"
+        res["amp_eg_decay_shape"] = shape_names[amp_s]
+        res["filter_eg_decay_shape"] = shape_names[flt_s]
+    return res
 
 
 def generate_html(clips: list, out_path: str, title: str):
@@ -80,6 +91,10 @@ def generate_html(clips: list, out_path: str, title: str):
             ws_info += f" (+{p['drive']*15:.1f} dB)"
         unison_str = "2v" if p["unison"] else "1v"
 
+        env_mode = p.get("filter_eg_mode", "Digital")
+        env_shape = p.get("filter_eg_decay_shape", "Quadratic")[:4]
+        env_info = f"{env_mode} ({env_shape})"
+
         row = f"""
         <tr data-type="{'random' if c['is_random_patch'] else 'prior'}">
             <td class="num">#{c['index']:02d}</td>
@@ -91,9 +106,10 @@ def generate_html(clips: list, out_path: str, title: str):
             </td>
             <td>{c['peak']:.3f} / {c['rms_db']:.1f} dB</td>
             <td>{p['filter_type']}</td>
-            <td>cut {p['cutoff']:.2f} · res {p['resonance']:.2f}</td>
+            <td>cut {p['cutoff']:.2f} · res {p['resonance']:.2f} · bite {p['feg_amount']:.2f}</td>
+            <td>{env_info} · dec {p['feg_decay']:.2f}s</td>
             <td>{ws_info}</td>
-            <td>shape {p['shape']:.2f} · sub {p['sub_mix']:.2f}</td>
+            <td>shp {p['shape']:.2f} · wid {p['width']:.2f} · sub {p['sub_mix']:.2f}</td>
             <td>{unison_str}</td>
         </tr>
         """
@@ -266,7 +282,8 @@ def generate_html(clips: list, out_path: str, title: str):
                 <th>Audio Player</th>
                 <th>Peak / RMS</th>
                 <th>Filter Circuit</th>
-                <th>Cutoff / Res</th>
+                <th>Cutoff / Res / Bite</th>
+                <th>Envelope</th>
                 <th>Waveshaper</th>
                 <th>Osc & Sub</th>
                 <th>Voice</th>
@@ -308,92 +325,129 @@ def main():
     ap.add_argument("--seed", type=int, default=42, help="random seed for sampling indices")
     ap.add_argument("--kind", choices=["all", "random", "prior"], default="all",
                     help="filter sample to only random patches, only prior presets, or all")
+    ap.add_argument("--from_generator", action="store_true",
+                    help="sample fresh clips directly from sample_unconstrained_random_patch")
     args = ap.parse_args()
 
     os.makedirs(os.path.join(args.out, "wavs"), exist_ok=True)
 
-    print(f"Loading bank from {args.bank}...")
-    ds = BankMainDataset(args.bank)
-    total_items = len(ds)
-    print(f"Bank has {total_items} items.")
+    if args.from_generator:
+        from train_realistic_bass_v3 import sample_unconstrained_random_patch
+        print(f"Sampling and rendering {args.n} clips directly using refined generator...")
+        plugin = spec.init_synth(verify=False)
+        title = "V5 Training Generator — 100 Refined Random Patches Sensibility Review"
+        clips_data = []
+        for i in range(args.n):
+            item_rng = np.random.RandomState(args.seed + i)
+            patch, vec, midi, dur = sample_unconstrained_random_patch(item_rng)
+            audio_f32 = spec.render_patch(plugin, patch, midi, dur)
+            peak = float(np.max(np.abs(audio_f32)))
+            rms = float(np.sqrt(np.mean(audio_f32**2)))
+            rms_db = float(20 * np.log10(max(rms, 1e-9)))
 
-    rng = np.random.default_rng(args.seed)
+            note_disp, note_fname = midi_to_names(midi)
+            fname = f"clip_{i:03d}_{note_fname}_refined_random.wav"
+            wav_path = os.path.join(args.out, "wavs", fname)
+            sf.write(wav_path, audio_f32, spec.SAMPLE_RATE, subtype="PCM_16")
 
-    if args.kind == "random":
-        print("Scanning bank shards for unconstrained random patch items...")
-        candidates = []
-        n_shards = math.ceil(total_items / ds.shard)
-        for k in range(n_shards):
-            _, meta_shard = ds.sh.get(k)
-            rp = meta_shard["random_patch"]
-            shard_rp_indices = np.where(rp)[0]
-            for j in shard_rp_indices:
-                candidates.append(k * ds.shard + j)
-            if len(candidates) >= args.n * 10:
-                break
-        print(f"Found {len(candidates)} candidate random patches.")
-        chosen_indices = sorted(rng.choice(candidates, size=min(args.n, len(candidates)), replace=False))
-        title = "V5 Training Bank — 100 Random Patches Sensibility Review"
-    elif args.kind == "prior":
-        print("Scanning bank shards for prior manifold items...")
-        candidates = []
-        n_shards = math.ceil(total_items / ds.shard)
-        for k in range(n_shards):
-            _, meta_shard = ds.sh.get(k)
-            rp = meta_shard["random_patch"]
-            shard_prior_indices = np.where(~rp)[0]
-            for j in shard_prior_indices:
-                candidates.append(k * ds.shard + j)
-            if len(candidates) >= args.n * 10:
-                break
-        chosen_indices = sorted(rng.choice(candidates, size=min(args.n, len(candidates)), replace=False))
-        title = "V5 Training Bank — 100 Prior Manifold Clips Review"
+            params = decode_parameters(vec)
+            clips_data.append(
+                {
+                    "index": i,
+                    "global_id": i,
+                    "filename": fname,
+                    "midi": midi,
+                    "note_display": note_disp,
+                    "note_filename": note_fname,
+                    "is_random_patch": True,
+                    "peak": peak,
+                    "rms_db": rms_db,
+                    "params": params,
+                    "vec": [round(float(x), 4) for x in vec],
+                }
+            )
     else:
-        chosen_indices = sorted(rng.choice(total_items, size=min(args.n, total_items), replace=False))
-        title = "V5 Training Bank (bank_v5_s0) — 100 Random Clip Review"
+        print(f"Loading bank from {args.bank}...")
+        ds = BankMainDataset(args.bank)
+        total_items = len(ds)
+        print(f"Bank has {total_items} items.")
 
-    print(f"Exporting {len(chosen_indices)} clips to {args.out}...")
-    clips_data = []
+        rng = np.random.default_rng(args.seed)
 
-    for i, global_idx in enumerate(chosen_indices):
-        k, j = divmod(int(global_idx), ds.shard)
-        audio_shard, meta_shard = ds.sh.get(k)
+        if args.kind == "random":
+            print("Scanning bank shards for unconstrained random patch items...")
+            candidates = []
+            n_shards = math.ceil(total_items / ds.shard)
+            for k in range(n_shards):
+                _, meta_shard = ds.sh.get(k)
+                rp = meta_shard["random_patch"]
+                shard_rp_indices = np.where(rp)[0]
+                for j in shard_rp_indices:
+                    candidates.append(k * ds.shard + j)
+                if len(candidates) >= args.n * 10:
+                    break
+            print(f"Found {len(candidates)} candidate random patches.")
+            chosen_indices = sorted(rng.choice(candidates, size=min(args.n, len(candidates)), replace=False))
+            title = "V5 Training Bank — 100 Random Patches Sensibility Review"
+        elif args.kind == "prior":
+            print("Scanning bank shards for prior manifold items...")
+            candidates = []
+            n_shards = math.ceil(total_items / ds.shard)
+            for k in range(n_shards):
+                _, meta_shard = ds.sh.get(k)
+                rp = meta_shard["random_patch"]
+                shard_prior_indices = np.where(~rp)[0]
+                for j in shard_prior_indices:
+                    candidates.append(k * ds.shard + j)
+                if len(candidates) >= args.n * 10:
+                    break
+            chosen_indices = sorted(rng.choice(candidates, size=min(args.n, len(candidates)), replace=False))
+            title = "V5 Training Bank — 100 Prior Manifold Clips Review"
+        else:
+            chosen_indices = sorted(rng.choice(total_items, size=min(args.n, total_items), replace=False))
+            title = "V5 Training Bank (bank_v5_s0) — 100 Random Clip Review"
 
-        audio_i16 = audio_shard[j]
-        audio_f32 = audio_i16.astype(np.float32) / 32767.0
-        vec = meta_shard["vec"][j]
-        midi = int(meta_shard["midi"][j])
-        is_random = bool(meta_shard["random_patch"][j])
-        note_disp, note_fname = midi_to_names(midi)
+        print(f"Exporting {len(chosen_indices)} clips to {args.out}...")
+        clips_data = []
 
-        # Audio statistics
-        peak = float(np.max(np.abs(audio_f32)))
-        rms = float(np.sqrt(np.mean(audio_f32**2)))
-        rms_db = float(20 * np.log10(max(rms, 1e-9)))
+        for i, global_idx in enumerate(chosen_indices):
+            k, j = divmod(int(global_idx), ds.shard)
+            audio_shard, meta_shard = ds.sh.get(k)
 
-        tag = "random" if is_random else "prior"
-        fname = f"clip_{i:03d}_item{global_idx:06d}_{note_fname}_{tag}.wav"
-        wav_path = os.path.join(args.out, "wavs", fname)
+            audio_i16 = audio_shard[j]
+            audio_f32 = audio_i16.astype(np.float32) / 32767.0
+            vec = meta_shard["vec"][j]
+            midi = int(meta_shard["midi"][j])
+            is_random = bool(meta_shard["random_patch"][j])
+            note_disp, note_fname = midi_to_names(midi)
 
-        sf.write(wav_path, audio_f32, spec.SAMPLE_RATE, subtype="PCM_16")
+            peak = float(np.max(np.abs(audio_f32)))
+            rms = float(np.sqrt(np.mean(audio_f32**2)))
+            rms_db = float(20 * np.log10(max(rms, 1e-9)))
 
-        params = decode_parameters(vec)
+            tag = "random" if is_random else "prior"
+            fname = f"clip_{i:03d}_item{global_idx:06d}_{note_fname}_{tag}.wav"
+            wav_path = os.path.join(args.out, "wavs", fname)
 
-        clips_data.append(
-            {
-                "index": i,
-                "global_id": int(global_idx),
-                "filename": fname,
-                "midi": midi,
-                "note_display": note_disp,
-                "note_filename": note_fname,
-                "is_random_patch": is_random,
-                "peak": peak,
-                "rms_db": rms_db,
-                "params": params,
-                "vec": [round(float(x), 4) for x in vec],
-            }
-        )
+            sf.write(wav_path, audio_f32, spec.SAMPLE_RATE, subtype="PCM_16")
+
+            params = decode_parameters(vec)
+
+            clips_data.append(
+                {
+                    "index": i,
+                    "global_id": int(global_idx),
+                    "filename": fname,
+                    "midi": midi,
+                    "note_display": note_disp,
+                    "note_filename": note_fname,
+                    "is_random_patch": is_random,
+                    "peak": peak,
+                    "rms_db": rms_db,
+                    "params": params,
+                    "vec": [round(float(x), 4) for x in vec],
+                }
+            )
 
     # Save manifest.json
     manifest_path = os.path.join(args.out, "manifest.json")

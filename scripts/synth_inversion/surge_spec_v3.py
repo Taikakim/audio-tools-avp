@@ -80,7 +80,8 @@ PARAM_NAMES = [
     "osc_1_octave", "osc_2_octave", "osc_3_octave", "noise_color",
     "osc_1_volume", "osc_2_volume", "osc_3_volume", "ring_1x2_volume", "ring_2x3_volume", "noise_volume",
     "filter_balance", "filter_configuration", "fm_routing",
-    "filter_2_type", "filter_2_cutoff", "filter_2_resonance", "filter_2_keytrack", "filter_2_feg_amount"
+    "filter_2_type", "filter_2_cutoff", "filter_2_resonance", "filter_2_keytrack", "filter_2_feg_amount",
+    "amp_eg_mode", "filter_eg_mode", "amp_eg_decay_shape", "filter_eg_decay_shape"
 ]
 NUM_PARAMS = len(PARAM_NAMES)
 PARAM_INDEX = {n: i for i, n in enumerate(PARAM_NAMES)}
@@ -88,7 +89,18 @@ PARAM_INDEX = {n: i for i, n in enumerate(PARAM_NAMES)}
 # Categorical parameters have no meaningful order, so they must be learned as classes,
 # not regressed as numbers. The h5 keeps the legacy ordinal storage for compatibility;
 # param_codec.py converts at train / inference time.
-CATEGORICAL = {"filter_type": len(LP_FILTERS), "unison": 2, "waveshaper_type": len(WAVESHAPER_TYPES), "filter_configuration": 7, "fm_routing": 4, "filter_2_type": len(LP_FILTERS)}
+CATEGORICAL = {
+    "filter_type": len(LP_FILTERS),
+    "unison": 2,
+    "waveshaper_type": len(WAVESHAPER_TYPES),
+    "filter_configuration": 7,
+    "fm_routing": 4,
+    "filter_2_type": len(LP_FILTERS),
+    "amp_eg_mode": 2,
+    "filter_eg_mode": 2,
+    "amp_eg_decay_shape": 3,
+    "filter_eg_decay_shape": 3,
+}
 CAT_INDICES = [(PARAM_INDEX[n], k) for n, k in CATEGORICAL.items()]
 CONT_INDICES = [i for i, n in enumerate(PARAM_NAMES) if n not in CATEGORICAL]
 
@@ -101,6 +113,8 @@ DOMAIN_WEIGHTS = {
     "feg_amount": 1.8,
     "aeg_decay": 1.5,
     "aeg_release": 1.5,
+    "amp_eg_mode": 1.5,
+    "filter_eg_mode": 1.5,
 }
 
 
@@ -215,26 +229,30 @@ def draw_patch(seed: int, note_dur_range=NOTE_DUR_RANGE) -> dict:
         filter_2_resonance=float(np.random.uniform(0.0, 1.0)),
         filter_2_keytrack=float(np.random.uniform(0.0, 1.0)),
         filter_2_feg_amount=float(np.random.uniform(0.0, 1.0)),
+        amp_eg_mode=int(np.random.randint(0, 2)),
+        filter_eg_mode=int(np.random.randint(0, 2)),
+        amp_eg_decay_shape=int(np.random.randint(0, 3)),
+        filter_eg_decay_shape=int(np.random.randint(0, 3)),
     )
 
 
-# Support of the training distribution for each CONTINUOUS parameter, in the 23-d vector
+# Support of the training distribution for each CONTINUOUS parameter, in the vector
 # space (what draw_patch can produce, including the 0 of spike-and-slab params). A model
 # trained on this data has never seen values outside these boxes, so searches over a learned
 # objective (Synth-JEPA, DE) must stay inside them. test_synth_inversion checks them
 # against draw_patch so they cannot drift.
 CONT_BOUNDS = {
-    "midi_note": (0.0, 1.0), "shape": (0.0, 1.0), "width": (0.0, 1.0), "sub_mix": (0.0, 0.85),
-    "sync": (0.0, 0.40), "fm_depth": (0.0, 0.45), "unison_detune": (0.0, 1.0), "cutoff": (0.08, 0.92),
+    "midi_note": (0.0, 1.0), "shape": (0.0, 1.0), "width": (0.05, 0.95), "sub_mix": (0.0, 0.85),
+    "sync": (0.0, 0.40), "fm_depth": (0.0, 0.45), "unison_detune": (0.0, 1.0), "cutoff": (0.10, 0.92),
     "resonance": (0.0, 0.95), "keytrack": (0.0, 1.0), "feg_amount": (0.2, 0.95), "feg_decay": (0.03, 1.0),
-    "feg_sustain": (0.0, 0.60), "aeg_decay": (0.05, 0.65), "aeg_sustain": (0.0, 0.80), "aeg_release": (0.01, 0.40),
+    "feg_sustain": (0.0, 0.60), "aeg_decay": (0.08, 0.65), "aeg_sustain": (0.0, 0.80), "aeg_release": (0.05, 0.40),
     "drive": (0.0, 1.0), "chorus_mix": (0.0, 0.60), "delay_mix": (0.0, 0.45), "delay_fb": (0.0, 0.50),
-    "osc_1_width_2": (0.0, 1.0), "osc_2_shape": (0.0, 1.0), "osc_2_width_1": (0.0, 1.0), "osc_2_width_2": (0.0, 1.0),
-    "osc_3_shape": (0.0, 1.0), "osc_3_width_1": (0.0, 1.0), "osc_3_width_2": (0.0, 1.0),
+    "osc_1_width_2": (0.05, 0.95), "osc_2_shape": (0.0, 1.0), "osc_2_width_1": (0.05, 0.95), "osc_2_width_2": (0.05, 0.95),
+    "osc_3_shape": (0.0, 1.0), "osc_3_width_1": (0.05, 0.95), "osc_3_width_2": (0.05, 0.95),
     "osc_1_octave": (0.0, 1.0), "osc_2_octave": (0.0, 1.0), "osc_3_octave": (0.0, 1.0), "noise_color": (0.0, 1.0),
     "osc_1_volume": (0.0, 1.0), "osc_2_volume": (0.0, 1.0), "osc_3_volume": (0.0, 1.0),
     "ring_1x2_volume": (0.0, 1.0), "ring_2x3_volume": (0.0, 1.0), "noise_volume": (0.0, 0.25),
-    "filter_balance": (0.0, 1.0), "filter_2_cutoff": (0.0, 1.0), "filter_2_resonance": (0.0, 1.0),
+    "filter_balance": (0.0, 1.0), "filter_2_cutoff": (0.12, 1.0), "filter_2_resonance": (0.0, 1.0),
     "filter_2_keytrack": (0.0, 1.0), "filter_2_feg_amount": (0.0, 1.0)
 }
 
@@ -285,12 +303,16 @@ def patch_to_vector(patch: dict) -> np.ndarray:
         patch["ring_1x2_volume"], patch["ring_2x3_volume"], patch["noise_volume"],
         patch["filter_balance"], patch["filter_configuration"] / 6.0, patch["fm_routing"] / 3.0,
         patch["filter_2_type"] / (len(LP_FILTERS) - 1), patch["filter_2_cutoff"], patch["filter_2_resonance"],
-        patch["filter_2_keytrack"], patch["filter_2_feg_amount"]
+        patch["filter_2_keytrack"], patch["filter_2_feg_amount"],
+        float(patch.get("amp_eg_mode", 0)),
+        float(patch.get("filter_eg_mode", 0)),
+        float(patch.get("amp_eg_decay_shape", 1)) / 2.0,
+        float(patch.get("filter_eg_decay_shape", 1)) / 2.0,
     ], dtype=np.float32)
 
 
 def vector_to_patch(p) -> dict:
-    """23-d normalised vector -> patch dict (inverse of patch_to_vector, with clipping)."""
+    """Normalised vector -> patch dict (inverse of patch_to_vector, with clipping)."""
     p = np.asarray(p, dtype=np.float64).copy()
     
     # Clip all continuous variables to their training distribution support.
@@ -351,6 +373,10 @@ def vector_to_patch(p) -> dict:
         filter_2_resonance=float(p[45]),
         filter_2_keytrack=float(p[46]),
         filter_2_feg_amount=float(p[47]),
+        amp_eg_mode=ordinal_to_class(p[48], 2),
+        filter_eg_mode=ordinal_to_class(p[49], 2),
+        amp_eg_decay_shape=ordinal_to_class(p[50], 3),
+        filter_eg_decay_shape=ordinal_to_class(p[51], 3),
     )
 
 
@@ -359,6 +385,11 @@ def describe_patch(patch: dict) -> dict:
     out = {k: v for k, v in patch.items() if k not in ("filter_idx", "ws_idx")}
     out["filter_circuit"] = LP_FILTERS[patch["filter_idx"]][0]
     out["waveshaper"] = WAVESHAPER_TYPES[patch["ws_idx"]][0]
+    out["amp_eg_mode_str"] = "Analog" if patch.get("amp_eg_mode", 0) == 1 else "Digital"
+    out["filter_eg_mode_str"] = "Analog" if patch.get("filter_eg_mode", 0) == 1 else "Digital"
+    shape_names = {0: "Linear", 1: "Quadratic", 2: "Cubic"}
+    out["amp_eg_decay_shape_str"] = shape_names.get(patch.get("amp_eg_decay_shape", 1), "Quadratic")
+    out["filter_eg_decay_shape_str"] = shape_names.get(patch.get("filter_eg_decay_shape", 1), "Quadratic")
     return out
 
 
@@ -480,6 +511,13 @@ def apply_patch(plugin, patch: dict) -> None:
     P["a_filter_2_resonance"].raw_value = patch["filter_2_resonance"]
     P["a_filter_2_keytrack"].raw_value = patch["filter_2_keytrack"]
     P["a_filter_2_feg_mod_amount"].raw_value = patch["filter_2_feg_amount"]
+    # Envelope modes: 0 = Digital, 1 = Analog (Surge raw: 0.0 = Digital, 0.5 = Analog)
+    P["a_amp_eg_envelope_mode"].raw_value = 0.5 if patch.get("amp_eg_mode", 0) == 1 else 0.0
+    P["a_filter_eg_envelope_mode"].raw_value = 0.5 if patch.get("filter_eg_mode", 0) == 1 else 0.0
+    # Decay shapes: 0 = Linear (0.0), 1 = Quadratic (0.26), 2 = Cubic (0.75)
+    decay_shapes = {0: 0.0, 1: 0.26, 2: 0.75}
+    P["a_amp_eg_decay_shape"].raw_value = decay_shapes.get(patch.get("amp_eg_decay_shape", 1), 0.26)
+    P["a_filter_eg_decay_shape"].raw_value = decay_shapes.get(patch.get("filter_eg_decay_shape", 1), 0.26)
     # FX are rendered OFF unless FX_RENDER_ENABLED. Surge keeps hidden chorus/delay state across
     # renders: once ANY patch with chorus or delay > 0 has played in an instance, every later render
     # in that instance comes out different, even with mix/feedback back at 0, after plugin.reset() and

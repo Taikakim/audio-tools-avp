@@ -257,6 +257,11 @@ def preset_to_vector(xml_p: dict, ranges: dict):
     unison = voices > 1  # our space has 1 or 2 voices; 3+ voice presets become 2 voices
     vec[PARAM_INDEX["unison"]] = 1.0 if unison else 0.0
 
+    vec[PARAM_INDEX["amp_eg_mode"]] = 1.0 if int(round(xml_p.get("a_env1_mode", 0))) == 1 else 0.0
+    vec[PARAM_INDEX["filter_eg_mode"]] = 1.0 if int(round(xml_p.get("a_env2_mode", 0))) == 1 else 0.0
+    vec[PARAM_INDEX["amp_eg_decay_shape"]] = min(max(int(round(xml_p.get("a_env1_decay_shape", 1))), 0), 2) / 2.0
+    vec[PARAM_INDEX["filter_eg_decay_shape"]] = min(max(int(round(xml_p.get("a_env2_decay_shape", 1))), 0), 2) / 2.0
+
     clipped = []
     for name, (tag, _pname, _lo, _hi, _kind) in CONTINUOUS.items():
         lo, hi = ranges[name]
