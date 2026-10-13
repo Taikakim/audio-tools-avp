@@ -2,7 +2,7 @@
 
 **Date:** October 13, 2026  
 **Author:** Antigravity (`antigravity@aavepyora.online`) for Kim, Kuang, and Wintermute  
-**Context:** Review of the A-series 2×2 factorial evaluation (`eval_v4_2x2`), comparison against original Synth-JEPA (Hayes et al., arXiv:2609.31024), metric review of SonicMaster (`2508.03448v5`) and Stability AI's `stable-audio-metrics`, and proposed architectural roadmap.  
+**Context:** Review of the A-series 2×2 factorial evaluation (`eval_v4_2x2`), comparison against original Synth-JEPA (Hayes et al., arXiv:2609.31024), metric review of SonicMaster (`2508.03448v5`) and Stability AI's `stable-audio-metrics`, analysis of the parameter-space vs audio-space training paradox, and proposed V5 architectural roadmap.  
 **Evidence Tags:** **[V]** verified in code/data here, **[I]** inferred from theoretical/acoustic mechanics, **[N]** project notes, **[U]** proposed/untrained.
 
 ---
@@ -19,13 +19,63 @@ Despite these specific improvements, macro-level parameter metrics appeared rema
 * **Disconnect 1 (Evaluation Blindness) [V, I]:** The `eval_v4` suite operates strictly in **unrendered parameter space** on synthetic presets. It calculates isotropic $\ell_1$ error across 48 parameter dimensions. Crucially, **inactive or inaudible parameters** (e.g., waveshaper drive when waveshaper type is disabled; detune when unison voices = 1; oscillator 2 pulse width when oscillator 2 volume is zero) receive the exact same error penalty as the main lowpass filter cutoff. This injects an irreducible $\sim 0.12$ parameter error floor that masks genuine acoustic divergence.
 * **Disconnect 2 (Training Deafness) [V, I]:** The conditional flow-matching model is trained with supervised $\ell_1$ regression against parameter vectors:
   $$\mathcal{L}_{\text{flow}} = \mathbb{E}_{t, \theta_0, \theta_1} \left[ \| v_\phi(\theta_t, t, z_a) - (\theta_1 - \theta_0) \|_1 \right]$$
-  **The trainer literally never synthesizes audio during training.** Surge XT is a non-differentiable C++ VST3 plugin; standard backpropagation from audio reconstruction loss is blocked. As a result, the flow model has no mechanism to learn that missing the cutoff frequency by 5% ruins the sound, whereas missing an inactive chorus rate by 50% is completely inaudible.
+  **The trainer literally never synthesizes audio from its predictions during training.** Surge XT is a non-differentiable C++ VST3 plugin; standard backpropagation from audio reconstruction loss is blocked. As a result, the flow model has no mechanism to learn that missing the cutoff frequency by 5% ruins the sound, whereas missing an inactive chorus rate by 50% is completely inaudible.
 
 ---
 
-## 1. Deconstruction of the 2×2 Factorial Results
+## 1. The Core Training Paradox: What MELs Are Used For vs. What Is Never Heard
 
-### 1.1 Complete Multi-Arm Performance Table (Online Weights)
+A crucial point of confusion in neural synth inversion is: **"If we work purely in parameter space, where do MEL spectrograms fit in, and why don't we hear the sound?"**
+
+### 1.1 Where the MELs Come From: They Are the "Input Questions"
+During training, audio **is** rendered by Surge XT, but **only in the background by the DataLoader to create the input prompts**:
+1. **Background Preset Sampling:** The DataLoader takes a ground-truth preset $\theta^*$ from the training manifold (e.g., Cutoff = 35%, 1-voice Saw, Pluck decay).
+2. **Offline Rendering:** Surge XT renders a 0.8-second audio waveform for that preset.
+3. **Spectrogram Generation:** On the GPU, `ExactGpuMel` converts the waveform into a $128$-bin log-mel spectrogram.
+4. **Input Prompt:** This MEL spectrogram is handed to the neural network as the **input conditioning question**:  
+   *"Here is a spectrogram image of a sound. Predict the 48 Surge XT knob positions that produced it."*
+
+### 1.2 What We NEVER Do: We Never Render or Hear the Model's "Answers"
+Here is where the training loop terminates without audio feedback:
+1. **The Model's Output:** The flow model integrates its velocity field and outputs a predicted parameter vector $\hat{\theta}$ (e.g., Cutoff = 38%, 1-voice Saw).
+2. **The Loss Evaluation (On Paper Only):** We calculate the training loss by directly comparing the numbers:
+   $$\mathcal{L} = \| \hat{\theta}_{\text{guess}} - \theta^*_{\text{truth}} \|_1$$
+3. **The Missing Step:** We **never** take $\hat{\theta}_{\text{guess}}$, instantiate Surge XT, render the audio, convert it into a spectrogram $\widehat{\text{MEL}}$, and evaluate whether:
+   $$\widehat{\text{MEL}} \stackrel{?}{\approx} \text{Target MEL}$$
+
+```
+CURRENT OPEN-LOOP TRAINING:
+[Target Audio] ──► [Target MEL] ──► [Neural Network] ──► [Predicted Knobs θ_pred]
+                                                                │
+                                              ┌─────────────────┴─────────────────┐
+                                              ▼                                   ▼
+                                     LOSS: |θ_pred - θ*|                 [Surge XT Engine]
+                                     (Knob distance only)                        │
+                                                                           (NEVER RUN!)
+                                                                                 │
+                                                                                 ▼
+                                                                           [Render Audio]
+                                                                                 │
+                                                                                 ▼
+                                                                            [Audio Loss]
+                                                                           (DOES NOT EXIST)
+```
+
+### 1.3 The Classroom "Cake Recipe" Analogy
+Our current training setup is identical to training an apprentice chef to replicate cakes with their **sense of taste completely blocked**:
+* **The Question:** You show them a photograph of a chocolate cake (the **Input MEL Spectrogram**).
+* **The Task:** You ask them to write down 48 ingredient quantities on a clipboard (the **Predicted Parameters $\hat{\theta}$**).
+* **The Grading:** You grade their test by comparing their written clipboard numbers against the master chef's written recipe sheet ($|\hat{\theta} - \theta^*|$).
+* **The Flaw:** **Nobody ever bakes the cake from the apprentice's recipe to taste it!**
+  - If the apprentice writes down salt instead of sugar, nobody tastes the cake during training.
+  - If the apprentice makes a huge error on an ingredient that does not affect taste (e.g. food coloring when chocolate is already dark), they receive a heavy mathematical penalty on paper.
+  - **When given a real cake from a commercial bakery (a real audio stem):** There is **no chef's recipe sheet ($\theta^*$)** to grade against! The stem was made on a Moog or Roland through an analog console. The *only* way to know if you matched it is to bake the cake, taste it, and compare flavors—which the model was never trained to do.
+
+---
+
+## 2. Deconstruction of the 2×2 Factorial Results
+
+### 2.1 Complete Multi-Arm Performance Table (Online Weights)
 
 | Metric Category | Metric | A0 (Baseline)<br>Conv / No Aux | A1<br>Conv / +Aux | A2<br>Temporal / No Aux | A3<br>Temporal / +Aux | A3′ (Replicate)<br>Temporal / +Aux | Replicate Gauge ($\|A3 - A3'\|$) | Contrast Effect [$95\%$ CI] | Verdict |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -42,24 +92,24 @@ Despite these specific improvements, macro-level parameter metrics appeared rema
 | | Mean Param MAE | 0.1221 | 0.1216 | 0.1220 | 0.1207 | 0.1216 | 0.0013 | Temporal: $-0.0004$ [$-0.002, 0.001$] | **Not established** ($p=0.536$) |
 | | Flow MSE Loss | 0.3917 | 0.3957 | 0.4067 | 0.4040 | 0.4039 | 0.0040 | Temporal: $+0.0111$ [$-0.002, 0.028$] | **Not established** ($p=0.125$) |
 
-### 1.2 Scientific Interpretation
+### 2.2 Scientific Interpretation
 1. **The Inharmonicity Aux Head ($h(z_a) \to y_{\text{inharm}}$):** On clean synthetic presets, inharmonic dissonance is close to zero ($R^2 \le 0$ on held-out). Adding an auxiliary task with near-zero variance provided no gradient signal to structure the latent space. Its observed variation across arms is purely seed noise within the replicate gauge ($\|A3 - A3'\|$).
 2. **The Temporal ASP Encoder:** Preserving time resolution and pooling with Attentive Statistics Pooling (ASP) significantly improves dynamic temporal control (AEG sustain tracking jumped $+0.1114$). This validates that spectro-temporal order matters, but exposes the next bottleneck: how that audio information is ingested by the flow model.
 
 ---
 
-## 2. Comparison with Original Synth-JEPA (Hayes et al., 2026)
+## 3. Comparison with Original Synth-JEPA (Hayes et al., 2026)
 
 Section 3.2 of the Synth-JEPA paper (*"Synth-JEPA: Joint Embedding Prediction for Renderer-Free Synthesizer Parameter Search"*, arXiv:2609.31024) reveals crucial architectural alignments and divergences:
 
-### 2.1 Conceptual Inversion Paradigms
+### 3.1 Conceptual Inversion Paradigms
 * **Original Synth-JEPA is an Optimization Landscape, Not a Generator [V]:**  
   In the paper, Synth-JEPA never directly predicts parameters in a single forward pass. Instead, it is used as a **differentiable proxy objective** $D_{\text{JEPA}}(y^*, x) = \| z_a^* - f_{p \to a}(E_p(x)) \|^2$.  
   Inversion is executed by running **JADE evolutionary search + Adam gradient descent directly on continuous parameter coordinates** through $\nabla_x D_{\text{JEPA}}$ via backpropagation through the neural parameter encoder $E_p$.
 * **Our Work Uses an Amortized Flow Generator [V]:**  
   Because multi-step JADE + Adam search takes several seconds to minutes per musical phrase, we co-trained an amortized **Conditional Flow Matching ResMLP** to sample the complete parameter vector in 25 Euler steps ($\sim 50\,\text{ms}$). Flow matching was a separate, competing baseline in the original paper.
 
-### 2.2 Deep Architectural Audit
+### 3.2 Deep Architectural Audit
 
 | Subsystem | Original Synth-JEPA Specification | Our Implementation (`real_bass_v3_*`) | Status & Impact |
 | :--- | :--- | :--- | :--- |
@@ -72,9 +122,9 @@ Section 3.2 of the Synth-JEPA paper (*"Synth-JEPA: Joint Embedding Prediction fo
 
 ---
 
-## 3. Evaluation Metrics: SonicMaster vs. Stable-Audio-Metrics vs. SI-SDR
+## 4. Evaluation Metrics: SonicMaster vs. Stable-Audio-Metrics vs. SI-SDR
 
-### 3.1 SonicMaster (`2508.03448v5`) DSP Diagnostic Suite
+### 4.1 SonicMaster (`2508.03448v5`) DSP Diagnostic Suite
 SonicMaster provides a domain-specific suite for physical and tonal degradation analysis (`evaluation/evaluate_control_multiple_degs_mass.py`):
 * **9-Band Spectral Balance Cosine Distance ($1 - \cos(\text{SB}_{\text{GT}}, \text{SB}_{\text{pred}})$):**  
   Evaluates energy distribution across 9 bands: Sub (20–60 Hz), Punch (60–250 Hz), Low-Mid (250–500 Hz), Mid (500–2000 Hz), Upper-Mid (2–4 kHz), Presence (4–6 kHz), Brilliance (6–10 kHz, 10–16 kHz, 16–20 kHz).  
@@ -86,13 +136,13 @@ SonicMaster provides a domain-specific suite for physical and tonal degradation 
 * **Modulation Spectrum Distance (MSD):**  
   Captures low-frequency envelope modulation ($< 20$ bins), isolating LFO wobble rates, chorus depth, and detuned unison phasing.
 
-### 3.2 Stability AI's `stable-audio-metrics` Macro Benchmark
+### 4.2 Stability AI's `stable-audio-metrics` Macro Benchmark
 `/home/kim/Projects/stable-audio-metrics` provides macro-level generative evaluation:
 * **OpenL3-FD @ 48 kHz:** Full-bandwidth Fréchet Audio Distance with LUFS normalization. Avoids 16 kHz VGGish bandwidth truncation.
 * **PaSST-KLD @ 32 kHz:** AudioSet class distribution matching using Patchout Audio Transformers.
 * **LAION-CLAP Score @ 48 kHz:** Multimodal audio-to-audio embedding cosine similarity (`630k-audioset-fusion-best`).
 
-### 3.3 The SI-SDR Warning for Synthesizers
+### 4.3 The SI-SDR Warning for Synthesizers
 **Scale-Invariant Signal-to-Distortion Ratio (SI-SDR) must NOT be used for synthesizer evaluation [I].**
 * SI-SDR is a **sample-level time-domain waveform metric**:
   $$\text{SI-SDR}(s, \hat{s}) = 10 \log_{10} \frac{\| \alpha s \|^2}{\| \alpha s - \hat{s} \|^2}, \quad \alpha = \frac{\hat{s}^T s}{\|s\|^2}$$
@@ -102,7 +152,7 @@ SonicMaster provides a domain-specific suite for physical and tonal degradation 
 
 ---
 
-## 4. V5 Architectural Proposals
+## 5. V5 Architectural Proposals
 
 To resolve the evaluation blindness and the trainer deafness, we propose four concrete interventions:
 
@@ -136,7 +186,7 @@ This provides the speed of amortized flow generation combined with the asymptoti
 
 ---
 
-## 5. Immediate Action Plan
+## 6. Immediate Action Plan
 
 1. **Deploy Audio Evaluation Suite (`eval_audio_perceptual_suite.py`):**
    Evaluate our existing 24 rendered stems across all 5 arms (A0, A1, A2, A3, A3′) against target stems using:
