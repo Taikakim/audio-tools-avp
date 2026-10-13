@@ -14,13 +14,25 @@ The v3 flow condition is ONE vector from `models_v3.AudioEncoder`: four stride-2
         pool="queries"   n_queries learned queries cross-attend to the tokens -> n_queries * d
   FlowMatchingResMLPV4               `FlowMatchingResMLP` with that encoder and optional per-block FiLM
                                      (zero-initialised, so it starts equal to the un-modulated flow)
+      xattn=True (v5, 2026-10-13)    per-block CROSS-ATTENTION from the flow state to the encoder's time tokens: after
+                                     every ResBlock the hidden state (which already carries x_t, t and tau) forms one
+                                     query per head over the 41 tokens, so different blocks and different ODE times can
+                                     read different parts of the note (attack for envelope amounts, tail for sustain).
+                                     The output projection is zero-initialised: at step 0 the model equals the same
+                                     flow without cross-attention. Needs a temporal_* encoder.
 
 Everything else (cond_noise, OT coupling, `sample`, `path`, the loss) is inherited unchanged, so `flow_loss` and the
 inference code work as they are. A state dict is NOT compatible with a v3 flow (different encoder keys): start a new
 out_dir. `load_inverter_v4` rebuilds either kind from a flow_best.pt / flow_latest.pt.
 
-Status: unit-tested on CPU (shapes, gradients, FiLM identity at init, cond_noise, sampling, save/load); NOT trained on
-Surge data. The toy probe (probe_encoders_toy_v4.py) is the only learning evidence, on a stand-in synth.
+How xattn stays compatible with callers that do `audio_emb = model.encoder(mel)` and pass it back as
+`model(x, t, audio_emb=audio_emb)` (models_v3.sample, inference_v3.predict_vectors_pinned): with xattn the encoder
+returns ONE packed tensor [B, hidden + n_tokens * d_model] (pooled embedding, then the flattened tokens), and the
+forward unpacks it. A batch-1 condition broadcasts over a batch of draws, as before.
+
+Status: unit-tested on CPU (shapes, gradients, FiLM and cross-attention identity at init, cond_noise, sampling,
+save/load); NOT trained on Surge data. The toy probe (probe_encoders_toy_v4.py) is the only learning evidence for the
+temporal encoders, on a stand-in synth; there is none yet for cross-attention.
 """
 import math
 
@@ -49,8 +61,10 @@ class TemporalAudioEncoderV4(nn.Module):
     def __init__(self, embed_dim: int = 512, in_mels: int = 128, in_frames: int = 81,
                  channels=(32, 64, 128, 256), time_strides=(1, 1, 1, 2), d_model: int = 256, n_layers: int = 1,
                  n_heads: int = 4, pool: str = "asp", n_queries: int = 4, hop_ms: float = 10.0, att_ms: float = 40.0,
-                 sus_start_frac: float = 0.25):
+                 sus_start_frac: float = 0.25, pack_tokens: bool = False):
         super().__init__()
+        self.pack_tokens = bool(pack_tokens)
+        self.embed_dim = embed_dim
         if pool not in ("asp", "segments", "queries"):
             raise ValueError("pool must be 'asp', 'segments' or 'queries'")
         if len(channels) != len(time_strides):
@@ -104,7 +118,48 @@ class TemporalAudioEncoderV4(nn.Module):
             q = self.queries.unsqueeze(0).expand(tok.shape[0], -1, -1)
             out, _ = self.attn(q, tok, tok)
             pooled = out.flatten(1)
-        return self.proj(pooled)
+        emb = self.proj(pooled)
+        return torch.cat([emb, tok.flatten(1)], dim=1) if self.pack_tokens else emb
+
+    def unpack(self, packed):
+        """[B, embed_dim + n_tokens * d_model] -> (emb [B, embed_dim], tokens [B, n_tokens, d_model])."""
+        emb = packed[:, :self.embed_dim]
+        return emb, packed[:, self.embed_dim:].reshape(packed.shape[0], self.n_tokens, self.d_model)
+
+
+class CrossAttnBlock(nn.Module):
+    """h [B, dim] reads tokens [B, T, ctx_dim]: one query per head from LayerNorm(h), keys and values from the tokens,
+    residual output through a zero-initialised projection (identity at init). attn_dim is the inner width."""
+
+    def __init__(self, dim: int, ctx_dim: int, attn_dim: int = 256, n_heads: int = 4):
+        super().__init__()
+        if attn_dim % n_heads:
+            raise ValueError(f"attn_dim {attn_dim} is not divisible by n_heads {n_heads}")
+        self.n_heads, self.attn_dim = n_heads, attn_dim
+        self.norm = nn.LayerNorm(dim)
+        self.q = nn.Linear(dim, attn_dim)
+        self.kv = nn.Linear(ctx_dim, 2 * attn_dim)
+        self.out = nn.Linear(attn_dim, dim)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+
+    def attend(self, h, tok):
+        B, H = h.shape[0], self.n_heads
+        if tok.shape[0] != B:
+            if tok.shape[0] != 1:
+                raise ValueError(f"token batch {tok.shape[0]} does not match {B}")
+            tok = tok.expand(B, -1, -1)
+        T, dh = tok.shape[1], self.attn_dim // H
+        q = self.q(self.norm(h)).view(B, H, 1, dh)
+        k, v = self.kv(tok).chunk(2, dim=-1)
+        k = k.reshape(B, T, H, dh).transpose(1, 2)
+        v = v.reshape(B, T, H, dh).transpose(1, 2)
+        w = torch.softmax((q @ k.transpose(-2, -1)) / math.sqrt(dh), dim=-1)    # [B, H, 1, T]
+        return (w @ v).reshape(B, self.attn_dim), w.squeeze(2)
+
+    def forward(self, h, tok):
+        o, _ = self.attend(h, tok)
+        return h + self.out(o)
 
 
 class FiLMBlock(nn.Module):
@@ -135,47 +190,87 @@ def make_encoder_v4(kind: str, embed_dim: int, n_mels: int = 128, **kw) -> nn.Mo
 class FlowMatchingResMLPV4(FlowMatchingResMLP):
     def __init__(self, param_dim=None, hidden_dim=256, num_layers=4, encoding=codec.ENCODING_V2, time_scale=1000.0,
                  sigma_min=1e-5, cond_noise=False, n_mels=128, encoder: str = "temporal_asp", film: bool = False,
-                 film_rank: int = 128, enc_kwargs=None):
+                 film_rank: int = 128, enc_kwargs=None, xattn: bool = False, xattn_dim=None, xattn_heads: int = 4):
         super().__init__(param_dim=param_dim, hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding,
                          time_scale=time_scale, sigma_min=sigma_min, cond_noise=cond_noise, n_mels=n_mels)
-        self.v4_config = dict(encoder=encoder, film=bool(film), film_rank=int(film_rank), enc_kwargs=dict(enc_kwargs or {}))
-        self.encoder = make_encoder_v4(encoder, hidden_dim, n_mels, **(enc_kwargs or {}))
+        if xattn and not encoder.startswith("temporal_"):
+            raise ValueError("xattn needs a temporal_* encoder (the conv encoder has no time tokens)")
+        enc_kwargs = dict(enc_kwargs or {})
+        self.encoder = make_encoder_v4(encoder, hidden_dim, n_mels, **enc_kwargs)
         self.film = nn.ModuleList([FiLMBlock(hidden_dim, film_rank) for _ in range(num_layers)]) if film else None
+        self.xattn = None
+        if xattn:
+            self.encoder.pack_tokens = True
+            ctx = self.encoder.d_model
+            xattn_dim = int(xattn_dim or ctx)
+            self.xattn = nn.ModuleList([CrossAttnBlock(hidden_dim, ctx, xattn_dim, xattn_heads) for _ in range(num_layers)])
+        self.v4_config = dict(encoder=encoder, film=bool(film), film_rank=int(film_rank), enc_kwargs=enc_kwargs,
+                              xattn=bool(xattn), xattn_dim=int(xattn_dim) if xattn else None, xattn_heads=int(xattn_heads))
+
+    def _split(self, audio_emb):
+        if self.xattn is None:
+            return audio_emb, None
+        return self.encoder.unpack(audio_emb)
 
     def forward(self, x_t, t, mel=None, audio_emb=None, tau=None):
         if audio_emb is None:
             audio_emb = self.encoder(mel)
-        h = audio_emb + self.time_embed(t) + self.param_proj(x_t)
+        emb, tok = self._split(audio_emb)
+        h = emb + self.time_embed(t) + self.param_proj(x_t)
         if self.cond_noise:
             if tau is None:
                 tau = torch.ones(x_t.shape[0], device=x_t.device)
             h = h + self.tau_embed(tau)
         for i, block in enumerate(self.blocks):
             h = block(h)
+            if self.xattn is not None:
+                h = self.xattn[i](h, tok)
             if self.film is not None:
-                h = self.film[i](h, audio_emb)
+                h = self.film[i](h, emb)
         h = self.norm(h)
         return self.head(h)
 
+    @torch.no_grad()
+    def attention_maps(self, x_t, t, mel, tau=None):
+        """Diagnostics: per block, the cross-attention weights over time tokens [B, heads, T] for one (x_t, t)."""
+        if self.xattn is None:
+            raise ValueError("model has no cross-attention")
+        emb, tok = self._split(self.encoder(mel))
+        h = emb + self.time_embed(t) + self.param_proj(x_t)
+        if self.cond_noise:
+            h = h + self.tau_embed(tau if tau is not None else torch.ones(x_t.shape[0], device=x_t.device))
+        maps = []
+        for i, block in enumerate(self.blocks):
+            h = block(h)
+            o, w = self.xattn[i].attend(h, tok)
+            maps.append(w)
+            h = h + self.xattn[i].out(o)
+            if self.film is not None:
+                h = self.film[i](h, emb)
+        return maps
+
 
 def build_model_v4(model_type="flow", hidden_dim=512, num_layers=8, encoding=codec.ENCODING_V2, time_scale=1000.0,
-                   cond_noise=False, encoder="temporal_asp", film=False, film_rank=128, enc_kwargs=None):
+                   cond_noise=False, encoder="temporal_asp", film=False, film_rank=128, enc_kwargs=None,
+                   xattn=False, xattn_dim=None, xattn_heads=4):
     """Same signature as `models_v3.build_model` plus the encoder choice. `encoder="conv"` with film=False returns the
     v3 flow unchanged."""
     if model_type != "flow":
         raise ValueError("build_model_v4 builds the flow model only")
-    if encoder == "conv" and not film:
+    if encoder == "conv" and not film and not xattn:
         return FlowMatchingResMLP(hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding,
                                   time_scale=time_scale, cond_noise=cond_noise)
     return FlowMatchingResMLPV4(hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding, time_scale=time_scale,
-                                cond_noise=cond_noise, encoder=encoder, film=film, film_rank=film_rank, enc_kwargs=enc_kwargs)
+                                cond_noise=cond_noise, encoder=encoder, film=film, film_rank=film_rank, enc_kwargs=enc_kwargs,
+                                xattn=xattn, xattn_dim=xattn_dim, xattn_heads=xattn_heads)
 
 
 def load_inverter_v4(ckpt_path, device="cpu", v4_config=None):
     """Rebuild a v3 or v4 flow from a flow_*.pt written by the trainer ({'model_state', 'args', ...}).
 
-    The encoder kind is inferred from the state-dict keys; pass `v4_config` (the dict `model.v4_config` holds) to
-    override, which is needed only for non-default encoder kwargs (heads, channels, strides)."""
+    The config comes from `v4_config` if given, else from the checkpoint's args['v4_config'] (written by the trainer
+    since v5), else it is inferred from the state-dict keys (encoder kind, FiLM, cross-attention width; the number of
+    cross-attention heads cannot be inferred and defaults to 4)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state = ckpt["model_state"]
     if "encoder.tok_proj.weight" not in state:
@@ -183,7 +278,7 @@ def load_inverter_v4(ckpt_path, device="cpu", v4_config=None):
         return load_inverter(ckpt_path, device=device)
     hidden = state["head.weight"].shape[1]
     num_layers = len({k.split(".")[1] for k in state if k.startswith("blocks.")})
-    cfg = dict(v4_config or {})
+    cfg = dict(v4_config or (ckpt.get("args") or {}).get("v4_config") or {})
     if not cfg:
         d_model = state["encoder.tok_proj.weight"].shape[0]
         n_in = state["encoder.proj.weight"].shape[1]
@@ -194,8 +289,10 @@ def load_inverter_v4(ckpt_path, device="cpu", v4_config=None):
         else:
             kind = "temporal_asp"
         n_layers = len({k.split(".")[3] for k in state if k.startswith("encoder.transformer.layers.")})
+        has_x = "xattn.0.q.weight" in state
         cfg = dict(encoder=kind, film=any(k.startswith("film.") for k in state), film_rank=128,
-                   enc_kwargs=dict(d_model=d_model, n_layers=n_layers))
+                   enc_kwargs=dict(d_model=d_model, n_layers=n_layers), xattn=has_x,
+                   xattn_dim=state["xattn.0.q.weight"].shape[0] if has_x else None, xattn_heads=4)
     model = FlowMatchingResMLPV4(hidden_dim=hidden, num_layers=num_layers, cond_noise="tau_embed.1.weight" in state, **cfg)
     model.load_state_dict(state)
     return model.to(device).eval()
