@@ -74,6 +74,28 @@ Findings that shaped the plan:
 
 Hygiene: the V5 document and the launchers contain absolute home-directory paths, and the repo is public at the moment.
 
+### 2.1 Addendum: the audio benchmark added later (V5 section 8, `6e4c9b7`, and `eval_audio_perceptual_suite.py`)
+
+1. **The arms it compares differ only by seed.** The renders come from the flow alone: `render_multitemp_eval_arms.py` loads `flow_*_best.pt` with `load_inverter_v4` and reranks with the STFT loss. The JEPA, and so the inharmonicity head, is never loaded **[V]**. The JEPA and the flow are separate modules with separate losses, and the flow is not conditioned on the JEPA. So for the audio:
+   - A0 vs A1 and A2 vs A3 are flow replicates;
+   - A3 vs A3′ is a full replicate.
+
+   The one path from the aux head to the audio is checkpoint selection: `flow_*_best.pt` is the step with the best held-out JEPA loss (train :701–707) **[V]**. The "A1 failure mode" and "A3 synergy" explanations therefore have no mechanism.
+2. **The replicate spread in its own table is as large as the effects it reports.**
+   - **EMA Mel-SSIM:** A0 vs A1 differ by 0.052, A2 vs A3 by 0.026, A3 vs A3′ by 0.026. The between-arm differences it highlights are of the same size.
+   - **Punch error:** online A3 vs A3′ differ by 0.10, more than A0 vs A3.
+   - **No statistics:** there are no paired tests or confidence intervals; per-stem standard deviations are 0.12–0.34 on 24 stems.
+
+   Nothing in the section is established. Under EVAL_PARADIGM_V4.md it would need paired, preset- or stem-clustered intervals that exceed the replicate gauge.
+3. **Forking paths.** It reports 5 temperatures × 2 weight kinds × snapped/raw, highlighting the best setting per claim. Two further problems:
+   - all 24 stems were used, so no dev/test split remains for a later confirmation;
+   - the metrics are the SonicMaster ones that section 3 puts through the gate first.
+4. **Naming.** "ASP" in this code base is attentive statistics pooling (`models_v4.py`), not "acoustic parameter sensitivity."
+5. **The manifold change (`285a4c5`, 134 → 149 presets, 127 train / 22 held-out) affects every later comparison.**
+   - **A-series checkpoints:** evaluate them with the manifold they were trained on. The md5 is in each run's `run_meta.json`; `audio_eval_v5.py --manifold` must point at that file. If the held-out split was re-drawn, some new held-out presets may have been training presets.
+   - **New arms:** they train on a different prior, so compare them with each other, not with the A-series numbers.
+   - **Render bank:** build it from the manifold the new arms use; the trainer refuses a mismatch.
+
 ## 3. Metrics for This Task
 
 Our audio **[V]**:
