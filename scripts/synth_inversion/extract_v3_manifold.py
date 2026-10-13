@@ -52,6 +52,7 @@ FORMAT_VERSION = 2
 OUTPUT_PATH = "/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz"
 SURGE_DATA_DIR = "/home/kim/Downloads/surge-xt-portable-content-1.3.4/Surge Synth Team/SurgeXTData"
 NEW_LOOPS_ZIP = "/home/kim/Documents/Surge XT/Patches/AI Inversions/kim_bass_.zip"
+PRESETSHARE_DIR = "/home/kim/Documents/Surge XT/Patches/Presetshare"
 
 # Surge enum list lengths - 1 (the raw value of position i is i / N). surge_spec's enum raw
 # values are exact multiples of these, which _enum_positions() asserts.
@@ -88,12 +89,12 @@ CONTINUOUS = {
     "osc_2_octave": ("a_osc2_octave", "a_osc_2_octave", -4.0, 4.0, "semitones"),
     "osc_3_octave": ("a_osc3_octave", "a_osc_3_octave", -4.0, 4.0, "semitones"),
     "noise_color": ("a_noise_color", "a_noise_color", -1.0, 1.0, "pct"),
-    "osc_1_volume": ("a_level_o1", "a_osc_1_level", 0.0, 1.0, "pct"),
-    "osc_2_volume": ("a_level_o2", "a_osc_2_level", 0.0, 1.0, "pct"),
-    "osc_3_volume": ("a_level_o3", "a_osc_3_level", 0.0, 1.0, "pct"),
-    "ring_1x2_volume": ("a_level_ring12", "a_ring_1x2_level", 0.0, 1.0, "pct"),
-    "ring_2x3_volume": ("a_level_ring23", "a_ring_2x3_level", 0.0, 1.0, "pct"),
-    "noise_volume": ("a_level_noise", "a_noise_level", 0.0, 1.0, "pct"),
+    "osc_1_volume": ("a_level_o1", "a_osc_1_volume", 0.0, 1.0, None),
+    "osc_2_volume": ("a_level_o2", "a_osc_2_volume", 0.0, 1.0, None),
+    "osc_3_volume": ("a_level_o3", "a_osc_3_volume", 0.0, 1.0, None),
+    "ring_1x2_volume": ("a_level_ring12", "a_ring_modulation_1x2_volume", 0.0, 1.0, None),
+    "ring_2x3_volume": ("a_level_ring23", "a_ring_modulation_2x3_volume", 0.0, 1.0, None),
+    "noise_volume": ("a_level_noise", "a_noise_volume", 0.0, 1.0, None),
     "filter_balance": ("a_f_balance", "a_filter_balance", -1.0, 1.0, "pct"),
     "filter_2_cutoff": ("a_filter2_cutoff", "a_filter_2_cutoff", -60.0, 70.0, "hz"),
     "filter_2_resonance": ("a_filter2_resonance", "a_filter_2_resonance", 0.0, 1.0, "pct"),
@@ -156,6 +157,9 @@ def calibrate_ranges(plugin, use_measured=False, points=(0.2, 0.5, 0.8), tol=0.0
     Returns {name: (min, max)} to use. Raises RuntimeError listing each mismatch."""
     ranges, problems = {}, []
     for name, (_tag, pname, lo, hi, kind) in CONTINUOUS.items():
+        if kind is None or pname not in plugin.parameters:
+            ranges[name] = (lo, hi)
+            continue
         param = plugin.parameters[pname]
         old = param.raw_value
         xs, ys = [], []
@@ -280,8 +284,8 @@ def is_val_row(vec: np.ndarray, val_frac: float) -> bool:
     return (int(h[:8], 16) % 10000) < val_frac * 10000
 
 
-def collect_presets(surge_data_dir, new_loops_zip):
-    """-> list of (name, bytes) for every .fxp under a path containing 'bass'."""
+def collect_presets(surge_data_dir, new_loops_zip, presetshare_dir=None):
+    """-> list of (name, bytes) for every .fxp under a path containing 'bass' or from presetshare."""
     out = []
     if surge_data_dir and os.path.isdir(surge_data_dir):
         for root, _dirs, files in os.walk(surge_data_dir):
@@ -295,6 +299,12 @@ def collect_presets(surge_data_dir, new_loops_zip):
             for info in z.infolist():
                 if "bass" in info.filename.lower() and info.filename.endswith(".fxp"):
                     out.append(("NewLoops/" + info.filename, z.read(info)))
+    if presetshare_dir and os.path.isdir(presetshare_dir):
+        for root, _dirs, files in os.walk(presetshare_dir):
+            for f in files:
+                if f.endswith(".fxp"):
+                    with open(os.path.join(root, f), "rb") as fh:
+                        out.append(("Presetshare/" + os.path.relpath(os.path.join(root, f), presetshare_dir), fh.read()))
     return sorted(out)
 
 
@@ -332,6 +342,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--surge_data_dir", default=SURGE_DATA_DIR)
     ap.add_argument("--new_loops_zip", default=NEW_LOOPS_ZIP)
+    ap.add_argument("--presetshare_dir", default=PRESETSHARE_DIR)
     ap.add_argument("--out", default=OUTPUT_PATH)
     ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
     ap.add_argument("--val_frac", type=float, default=0.1, help="held-out preset fraction")
@@ -349,7 +360,7 @@ def main():
         ranges = calibrate_ranges(plugin, use_measured=args.use_measured_ranges)
         print("Native ranges verified against the plugin.")
 
-    presets = collect_presets(args.surge_data_dir, args.new_loops_zip)
+    presets = collect_presets(args.surge_data_dir, args.new_loops_zip, args.presetshare_dir)
     print(f"Found {len(presets)} bass preset files.")
     params, names, is_val, skips, clip_frac = build_manifold(presets, ranges, args.val_frac)
     print(f"Kept {len(params)} presets ({int(is_val.sum())} held out). Skipped:")
