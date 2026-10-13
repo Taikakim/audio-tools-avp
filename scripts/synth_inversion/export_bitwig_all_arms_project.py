@@ -74,24 +74,33 @@ def parse_clean_midi_notes_in_beats(midi_path: str, max_dur_s: float, bpm: float
 
 def resolve_arm_directory(base_dir: str, arm_name: str):
     """Resolve an arm name (e.g. 'a0', 'a1', 'a2', 'a3', 'a3_prime') to an existing directory."""
-    raw = arm_name.upper()
-    if raw.startswith("ARM"):
-        raw = raw[3:].lstrip("_")
-    arm_num = raw[1:] if raw.startswith("A") else raw
-    label = f"A{arm_num}"
-    clean = f"a{arm_num.lower().rstrip('\'').rstrip('_prime')}"
+    raw = arm_name.strip().lower()
+    is_prime = ("prime" in raw) or raw.endswith("'") or raw.endswith("p")
+    clean = raw.replace("arm_", "").replace("arm", "")
+    core = clean.rstrip("'_primep")
+    if not core.startswith("a"):
+        core = f"a{core}"
 
-    candidates = [
-        (label, os.path.join(base_dir, f"real_bass_v3_{clean}_seeded")),
-        (f"{label}'", os.path.join(base_dir, f"real_bass_v3_{clean}_prime")),
-        (label, os.path.join(base_dir, f"real_bass_v3_{clean}")),
-        (label, os.path.join(base_dir, arm_name)),
-    ]
-    for label, path in candidates:
+    if is_prime:
+        label = f"{core.upper()}'"
+        candidates = [
+            (label, os.path.join(base_dir, f"real_bass_v3_{core}_prime")),
+            (label, os.path.join(base_dir, f"real_bass_v3_{core}_prime_seeded")),
+            (label, os.path.join(base_dir, arm_name)),
+        ]
+    else:
+        label = core.upper()
+        candidates = [
+            (label, os.path.join(base_dir, f"real_bass_v3_{core}_seeded")),
+            (label, os.path.join(base_dir, f"real_bass_v3_{core}")),
+            (label, os.path.join(base_dir, arm_name)),
+        ]
+
+    for lbl, path in candidates:
         audio_dir = os.path.join(path, "eval_cpu_muscriptor_temps", "audio")
         if os.path.isdir(audio_dir):
             preset_dir = os.path.join(path, "eval_cpu_muscriptor_temps", "vstpresets")
-            return label, audio_dir, preset_dir
+            return lbl, audio_dir, preset_dir
 
     if os.path.isdir(arm_name):
         audio_dir = os.path.join(arm_name, "eval_cpu_muscriptor_temps", "audio")
