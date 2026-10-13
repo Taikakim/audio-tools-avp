@@ -1,11 +1,14 @@
 # Owner: ANTIGRAVITY (created 2026-10-14)
-"""Export 100 random training clips from the V5 render bank for listening and sensibility review.
+# Last edited: ANTIGRAVITY 2026-10-14 -- URL-safe note filenames (Fs instead of F#) + --kind random/prior filter
+"""Export random training clips from the V5 render bank for listening and sensibility review.
 
-Samples 100 clips from bank_v5_s0, writes 16-bit PCM WAV files, computes audio metrics (peak, RMS dB),
-decodes synth parameters to human-readable labels, and generates an interactive HTML player page.
+Samples clips from bank_v5_s0, writes 16-bit PCM WAV files with URL-safe filenames,
+computes audio metrics (peak, RMS dB), decodes synth parameters to human-readable labels,
+and generates an interactive HTML player page.
 """
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -18,13 +21,15 @@ sys.path.insert(0, SCRIPT_DIR)
 from render_bank_v5 import BankMainDataset  # noqa: E402
 import surge_spec_v3 as spec  # noqa: E402
 
-NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+NOTE_NAMES_DISPLAY = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+NOTE_NAMES_FILENAME = ["C", "Cs", "D", "Ds", "E", "F", "Fs", "G", "Gs", "A", "As", "B"]
 
 
-def midi_to_name(midi: int) -> str:
+def midi_to_names(midi: int) -> tuple[str, str]:
     octave = (midi // 12) - 1
-    note = NOTE_NAMES[midi % 12]
-    return f"{note}{octave}"
+    disp = f"{NOTE_NAMES_DISPLAY[midi % 12]}{octave}"
+    fname = f"{NOTE_NAMES_FILENAME[midi % 12]}{octave}"
+    return disp, fname
 
 
 def decode_parameters(vec: np.ndarray) -> dict:
@@ -56,11 +61,11 @@ def decode_parameters(vec: np.ndarray) -> dict:
     }
 
 
-def generate_html(clips: list, out_path: str):
+def generate_html(clips: list, out_path: str, title: str):
     prior_count = sum(1 for c in clips if not c["is_random_patch"])
     random_count = len(clips) - prior_count
-    avg_peak = np.mean([c["peak"] for c in clips])
-    avg_rms_db = np.mean([c["rms_db"] for c in clips])
+    avg_peak = np.mean([c["peak"] for c in clips]) if clips else 0.0
+    avg_rms_db = np.mean([c["rms_db"] for c in clips]) if clips else 0.0
 
     rows = []
     for c in clips:
@@ -79,7 +84,7 @@ def generate_html(clips: list, out_path: str):
         <tr data-type="{'random' if c['is_random_patch'] else 'prior'}">
             <td class="num">#{c['index']:02d}</td>
             <td class="item-id">idx {c['global_id']}</td>
-            <td><strong>{c['note_name']}</strong> ({c['midi']})</td>
+            <td><strong>{c['note_display']}</strong> ({c['midi']})</td>
             <td>{tag_badge}</td>
             <td class="player">
                 <audio controls preload="none" src="wavs/{c['filename']}"></audio>
@@ -98,7 +103,7 @@ def generate_html(clips: list, out_path: str):
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>V5 Training Bank — 100 Clip Sensibility Review</title>
+<title>{title}</title>
 <style>
     body {{
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -222,8 +227,8 @@ def generate_html(clips: list, out_path: str):
 </style>
 </head>
 <body>
-    <h1>V5 Training Bank (bank_v5_s0) — 100 Random Clip Review</h1>
-    <div class="subtitle">Sampled from 786,432 pre-rendered 0.8s clips on OS NVMe (44.1 kHz mono, Surge XT 1.3.4, FX off).</div>
+    <h1>{title}</h1>
+    <div class="subtitle">Exported from <code>bank_v5_s0</code> (786,432 items on OS NVMe, 44.1 kHz mono, Surge XT 1.3.4, FX off).</div>
 
     <div class="stats-grid">
         <div class="stat-card">
@@ -232,11 +237,11 @@ def generate_html(clips: list, out_path: str):
         </div>
         <div class="stat-card">
             <div class="stat-label">Prior Manifold</div>
-            <div class="stat-val">{prior_count} ({prior_count / len(clips):.0%})</div>
+            <div class="stat-val">{prior_count} ({prior_count / max(len(clips), 1):.0%})</div>
         </div>
         <div class="stat-card">
             <div class="stat-label">Random Patches</div>
-            <div class="stat-val">{random_count} ({random_count / len(clips):.0%})</div>
+            <div class="stat-val">{random_count} ({random_count / max(len(clips), 1):.0%})</div>
         </div>
         <div class="stat-card">
             <div class="stat-label">Mean Peak / RMS</div>
@@ -246,7 +251,7 @@ def generate_html(clips: list, out_path: str):
 
     <div class="filter-bar">
         <span style="font-size: 13px; color: #8b949e;">Filter:</span>
-        <button id="btn-all" class="active" onclick="filterClips('all')">All (100)</button>
+        <button id="btn-all" class="active" onclick="filterClips('all')">All ({len(clips)})</button>
         <button id="btn-prior" onclick="filterClips('prior')">Prior Manifold ({prior_count})</button>
         <button id="btn-random" onclick="filterClips('random')">Random Patches ({random_count})</button>
     </div>
@@ -301,6 +306,8 @@ def main():
     ap.add_argument("--out", default="/home/kim/sao_runs/bank_v5_s0_review_100", help="output directory")
     ap.add_argument("--n", type=int, default=100, help="number of clips to sample")
     ap.add_argument("--seed", type=int, default=42, help="random seed for sampling indices")
+    ap.add_argument("--kind", choices=["all", "random", "prior"], default="all",
+                    help="filter sample to only random patches, only prior presets, or all")
     args = ap.parse_args()
 
     os.makedirs(os.path.join(args.out, "wavs"), exist_ok=True)
@@ -311,7 +318,39 @@ def main():
     print(f"Bank has {total_items} items.")
 
     rng = np.random.default_rng(args.seed)
-    chosen_indices = sorted(rng.choice(total_items, size=min(args.n, total_items), replace=False))
+
+    if args.kind == "random":
+        print("Scanning bank shards for unconstrained random patch items...")
+        candidates = []
+        n_shards = math.ceil(total_items / ds.shard)
+        for k in range(n_shards):
+            _, meta_shard = ds.sh.get(k)
+            rp = meta_shard["random_patch"]
+            shard_rp_indices = np.where(rp)[0]
+            for j in shard_rp_indices:
+                candidates.append(k * ds.shard + j)
+            if len(candidates) >= args.n * 10:
+                break
+        print(f"Found {len(candidates)} candidate random patches.")
+        chosen_indices = sorted(rng.choice(candidates, size=min(args.n, len(candidates)), replace=False))
+        title = "V5 Training Bank — 100 Random Patches Sensibility Review"
+    elif args.kind == "prior":
+        print("Scanning bank shards for prior manifold items...")
+        candidates = []
+        n_shards = math.ceil(total_items / ds.shard)
+        for k in range(n_shards):
+            _, meta_shard = ds.sh.get(k)
+            rp = meta_shard["random_patch"]
+            shard_prior_indices = np.where(~rp)[0]
+            for j in shard_prior_indices:
+                candidates.append(k * ds.shard + j)
+            if len(candidates) >= args.n * 10:
+                break
+        chosen_indices = sorted(rng.choice(candidates, size=min(args.n, len(candidates)), replace=False))
+        title = "V5 Training Bank — 100 Prior Manifold Clips Review"
+    else:
+        chosen_indices = sorted(rng.choice(total_items, size=min(args.n, total_items), replace=False))
+        title = "V5 Training Bank (bank_v5_s0) — 100 Random Clip Review"
 
     print(f"Exporting {len(chosen_indices)} clips to {args.out}...")
     clips_data = []
@@ -325,7 +364,7 @@ def main():
         vec = meta_shard["vec"][j]
         midi = int(meta_shard["midi"][j])
         is_random = bool(meta_shard["random_patch"][j])
-        note_name = midi_to_name(midi)
+        note_disp, note_fname = midi_to_names(midi)
 
         # Audio statistics
         peak = float(np.max(np.abs(audio_f32)))
@@ -333,7 +372,7 @@ def main():
         rms_db = float(20 * np.log10(max(rms, 1e-9)))
 
         tag = "random" if is_random else "prior"
-        fname = f"clip_{i:03d}_item{global_idx:06d}_{note_name}_{tag}.wav"
+        fname = f"clip_{i:03d}_item{global_idx:06d}_{note_fname}_{tag}.wav"
         wav_path = os.path.join(args.out, "wavs", fname)
 
         sf.write(wav_path, audio_f32, spec.SAMPLE_RATE, subtype="PCM_16")
@@ -346,7 +385,8 @@ def main():
                 "global_id": int(global_idx),
                 "filename": fname,
                 "midi": midi,
-                "note_name": note_name,
+                "note_display": note_disp,
+                "note_filename": note_fname,
                 "is_random_patch": is_random,
                 "peak": peak,
                 "rms_db": rms_db,
@@ -368,14 +408,14 @@ def main():
             p = c["params"]
             t = "random" if c["is_random_patch"] else "prior"
             f.write(
-                f"{c['index']}\t{c['global_id']}\t{c['filename']}\t{c['midi']}\t{c['note_name']}\t{t}\t"
+                f"{c['index']}\t{c['global_id']}\t{c['filename']}\t{c['midi']}\t{c['note_display']}\t{t}\t"
                 f"{c['peak']:.3f}\t{c['rms_db']:.1f}\t{p['filter_type']}\t{p['cutoff']:.2f}\t"
                 f"{p['waveshaper_type']}\t{p['drive']:.2f}\t{p['unison_voices']}v\n"
             )
 
     # Save index.html
     html_path = os.path.join(args.out, "index.html")
-    generate_html(clips_data, html_path)
+    generate_html(clips_data, html_path, title=title)
 
     print(f"Successfully exported {len(clips_data)} clips:")
     print(f"  - WAV directory: {os.path.join(args.out, 'wavs')}")
