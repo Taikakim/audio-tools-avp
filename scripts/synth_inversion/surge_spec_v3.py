@@ -81,7 +81,8 @@ PARAM_NAMES = [
     "osc_1_volume", "osc_2_volume", "osc_3_volume", "ring_1x2_volume", "ring_2x3_volume", "noise_volume",
     "filter_balance", "filter_configuration", "fm_routing",
     "filter_2_type", "filter_2_cutoff", "filter_2_resonance", "filter_2_keytrack", "filter_2_feg_amount",
-    "amp_eg_mode", "filter_eg_mode", "amp_eg_decay_shape", "filter_eg_decay_shape"
+    "amp_eg_mode", "filter_eg_mode", "amp_eg_decay_shape", "filter_eg_decay_shape",
+    "feg_release"
 ]
 NUM_PARAMS = len(PARAM_NAMES)
 PARAM_INDEX = {n: i for i, n in enumerate(PARAM_NAMES)}
@@ -113,6 +114,7 @@ DOMAIN_WEIGHTS = {
     "feg_amount": 1.8,
     "aeg_decay": 1.5,
     "aeg_release": 1.5,
+    "feg_release": 1.5,
     "amp_eg_mode": 1.5,
     "filter_eg_mode": 1.5,
 }
@@ -233,6 +235,7 @@ def draw_patch(seed: int, note_dur_range=NOTE_DUR_RANGE) -> dict:
         filter_eg_mode=int(np.random.randint(0, 2)),
         amp_eg_decay_shape=int(np.random.randint(0, 3)),
         filter_eg_decay_shape=int(np.random.randint(0, 3)),
+        feg_release=float(np.random.uniform(0.05, 0.40)),
     )
 
 
@@ -253,7 +256,8 @@ CONT_BOUNDS = {
     "osc_1_volume": (0.0, 1.0), "osc_2_volume": (0.0, 1.0), "osc_3_volume": (0.0, 1.0),
     "ring_1x2_volume": (0.0, 1.0), "ring_2x3_volume": (0.0, 1.0), "noise_volume": (0.0, 0.25),
     "filter_balance": (0.0, 1.0), "filter_2_cutoff": (0.12, 1.0), "filter_2_resonance": (0.0, 1.0),
-    "filter_2_keytrack": (0.0, 1.0), "filter_2_feg_amount": (0.0, 1.0)
+    "filter_2_keytrack": (0.0, 1.0), "filter_2_feg_amount": (0.0, 1.0),
+    "feg_release": (0.05, 0.75),
 }
 
 
@@ -308,6 +312,7 @@ def patch_to_vector(patch: dict) -> np.ndarray:
         float(patch.get("filter_eg_mode", 0)),
         float(patch.get("amp_eg_decay_shape", 1)) / 2.0,
         float(patch.get("filter_eg_decay_shape", 1)) / 2.0,
+        float(patch.get("feg_release", patch.get("aeg_release", 0.23))),
     ], dtype=np.float32)
 
 
@@ -377,6 +382,7 @@ def vector_to_patch(p) -> dict:
         filter_eg_mode=ordinal_to_class(p[49], 2),
         amp_eg_decay_shape=ordinal_to_class(p[50], 3),
         filter_eg_decay_shape=ordinal_to_class(p[51], 3),
+        feg_release=float(p[52]),
     )
 
 
@@ -518,6 +524,7 @@ def apply_patch(plugin, patch: dict) -> None:
     decay_shapes = {0: 0.0, 1: 0.26, 2: 0.75}
     P["a_amp_eg_decay_shape"].raw_value = decay_shapes.get(patch.get("amp_eg_decay_shape", 1), 0.26)
     P["a_filter_eg_decay_shape"].raw_value = decay_shapes.get(patch.get("filter_eg_decay_shape", 1), 0.26)
+    P["a_filter_eg_release"].raw_value = patch.get("feg_release", patch.get("aeg_release", 0.23))
     # FX are rendered OFF unless FX_RENDER_ENABLED. Surge keeps hidden chorus/delay state across
     # renders: once ANY patch with chorus or delay > 0 has played in an instance, every later render
     # in that instance comes out different, even with mix/feedback back at 0, after plugin.reset() and

@@ -77,6 +77,7 @@ CONTINUOUS = {
     "aeg_decay":     ("a_env1_decay",        "a_amp_eg_decay",             -8.0,  5.0, "seconds"),
     "aeg_sustain":   ("a_env1_sustain",      "a_amp_eg_sustain",           0.0,  1.0, "pct"),
     "aeg_release":   ("a_env1_release",      "a_amp_eg_release",           -8.0,  5.0, "seconds"),
+    "feg_release":   ("a_env2_release",      "a_filter_eg_release",        -8.0,  5.0, "seconds"),
     "drive":         ("a_ws_drive",          "a_waveshaper_drive",       -24.0, 24.0, "db"),
     "osc_1_width_2": ("a_osc1_param2", "a_osc_1_width_2", 0.0, 1.0, "pct"),
     "osc_2_shape": ("a_osc2_param0", "a_osc_2_shape", -1.0, 1.0, "pct"),

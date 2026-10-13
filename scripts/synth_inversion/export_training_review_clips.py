@@ -59,6 +59,8 @@ def decode_parameters(vec: np.ndarray) -> dict:
         "aeg_sustain": float(vec[spec.PARAM_INDEX["aeg_sustain"]]),
         "aeg_release": float(vec[spec.PARAM_INDEX["aeg_release"]]),
     }
+    if len(vec) >= 53:
+        res["feg_release"] = float(vec[spec.PARAM_INDEX["feg_release"]])
     if len(vec) >= 52:
         shape_names = ["Linear", "Quadratic", "Cubic"]
         amp_m = spec.ordinal_to_class(vec[spec.PARAM_INDEX["amp_eg_mode"]], 2)
@@ -106,8 +108,8 @@ def generate_html(clips: list, out_path: str, title: str):
             </td>
             <td>{c['peak']:.3f} / {c['rms_db']:.1f} dB</td>
             <td>{p['filter_type']}</td>
-            <td>cut {p['cutoff']:.2f} · res {p['resonance']:.2f} · bite {p['feg_amount']:.2f}</td>
-            <td>{env_info} · dec {p['feg_decay']:.2f}s</td>
+            <td>cut {p['cutoff']:.2f} ({440*2**((-60+130*p['cutoff'])/12):.0f} Hz) · res {p['resonance']:.2f} · FEG {(p['feg_amount']-0.5)*192:+.0f} st</td>
+            <td>{env_info} · dec {2**(-8+13*p['feg_decay']):.2f}s · sus {p['feg_sustain']:.2f} · rel F {2**(-8+13*p.get('feg_release',0)):.2f}s / A {2**(-8+13*p['aeg_release']):.2f}s</td>
             <td>{ws_info}</td>
             <td>shp {p['shape']:.2f} · wid {p['width']:.2f} · sub {p['sub_mix']:.2f}</td>
             <td>{unison_str}</td>
