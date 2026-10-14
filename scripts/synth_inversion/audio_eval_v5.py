@@ -7,6 +7,9 @@ heldout_eval_v4.draw_items, so every item carries its archetype preset for clust
 vectors, Surge renders them, and every candidate is scored against the target audio with audio_metrics_v5.
 
 Systems:
+  --seeded NAME=flow.pt,jepa.pt  flow-seeded batched JEPA search (flow_seeded_search_v5), one system per budget in
+                           --seeded_budgets (NAME@256, ...); compare with --jepa (the paper's JADE + Adam, budget 2048).
+                           summary.json meta.seconds_per_target_incl_render gives each system's time per target.
   --flow NAME=flow_*.pt    K candidates (flow_sampling_v5, MIDI pinned, an independent condition-noise draw per
                            candidate at tau < 1). Reported as NAME/draw0 (one draw: what a single sample sounds like)
                            and NAME/bestK (best of K by --select, default log-mel L1; its select-metric score is
@@ -67,6 +70,21 @@ def jepa_system(path, targets_mel, midi, pool, budget, seed, device):
     return vecs[:, None, :], pool.render(vecs, midi)[:, None, :]
 
 
+def seeded_system(flow_path, jepa_path, targets_mel, midi, pool, budget, n_seeds, random_frac, steps, tau, seed,
+                  device, batch=64):
+    """Flow-seeded batched JEPA search (flow_seeded_search_v5): one returned vector per target."""
+    from flow_seeded_search_v5 import FlowSeededSearcher
+    from models_v4 import load_inverter_v4
+    from synth_jepa_search_v3 import checkpoint_bounds, load_synth_jepa
+    model, norm = load_synth_jepa(jepa_path, device=device)
+    s = FlowSeededSearcher(model, norm, load_inverter_v4(flow_path, device=device), device=device,
+                           bounds=checkpoint_bounds(jepa_path))
+    vecs = np.concatenate([s.search(targets_mel[i:i + batch], midi[i:i + batch], budget=budget, n_seeds=n_seeds,
+                                    random_frac=random_frac, steps=steps, tau=tau, seed=seed + i)["vectors"]
+                           for i in range(0, len(midi), batch)]).astype(np.float32)
+    return vecs[:, None, :], pool.render(vecs, midi)[:, None, :]
+
+
 def score_system(targets, audio, metrics, workers=0):
     """audio [n, K, N] -> {metric: [n, K]}"""
     n, K, _ = audio.shape
@@ -77,7 +95,7 @@ def score_system(targets, audio, metrics, workers=0):
 
 def views(name, scores, select, kind):
     """-> {view name: (per-metric arrays [n], chosen candidate index [n])}"""
-    if kind == "jepa":
+    if kind in ("jepa", "seeded"):
         return {name: ({m: v[:, 0] for m, v in scores.items()}, np.zeros(len(scores[select]), int))}
     best = np.nanargmin(np.where(np.isfinite(scores[select]), scores[select], np.inf), axis=1)
     rows = np.arange(len(best))
@@ -139,6 +157,11 @@ def main(argv=None, pool=None, prior=None):
     ap.add_argument("--plugin", default=None)
     ap.add_argument("--flow", action="append", default=[], metavar="NAME=PATH")
     ap.add_argument("--jepa", action="append", default=[], metavar="NAME=PATH")
+    ap.add_argument("--seeded", action="append", default=[], metavar="NAME=FLOW_PATH,JEPA_PATH",
+                    help="flow-seeded batched JEPA search (flow_seeded_search_v5); one system per --seeded_budgets")
+    ap.add_argument("--seeded_budgets", type=int, nargs="+", default=[256, 512, 1024])
+    ap.add_argument("--seeded_seeds", type=int, default=32, help="seed candidates per target")
+    ap.add_argument("--seeded_random_frac", type=float, default=0.0, help="share of seeds drawn uniformly")
     ap.add_argument("--n", type=int, default=256)
     ap.add_argument("--seed", type=int, default=11, help="item draw seed (val split); the trainer's sets use 1, 2, 3")
     ap.add_argument("--k", type=int, default=8)
@@ -171,11 +194,23 @@ def main(argv=None, pool=None, prior=None):
         targets = p.render(items["vecs"], midi)
         mel = mel_of(targets, a.device)
         systems = [(n, path, "flow") for n, path in parse_specs(a.flow)] + [(n, path, "jepa") for n, path in parse_specs(a.jepa)]
+        for n, spec in parse_specs(a.seeded):
+            if "," not in spec:
+                raise SystemExit(f"--seeded expects NAME=FLOW_PATH,JEPA_PATH, got {spec!r}")
+            systems += [(f"{n}@{b}", (spec, b), "seeded") for b in a.seeded_budgets]
+        search_time = {}
         for name, path, kind in systems:
+            ts = time.time()
             if kind == "flow":
                 vecs, audio = flow_system(name, path, mel, midi, p, a.k, a.steps, a.tau, a.seed, a.device)
+            elif kind == "seeded":
+                (spec, b) = path
+                fp, jp = spec.split(",", 1)
+                vecs, audio = seeded_system(fp, jp, mel, midi, p, b, a.seeded_seeds, a.seeded_random_frac, a.steps,
+                                            a.tau, a.seed, a.device)
             else:
                 vecs, audio = jepa_system(path, mel, midi, p, a.jepa_budget, a.seed, a.device)
+            search_time[name] = (time.time() - ts) / len(midi)      # proposal + rendering, per target
             sc = score_system(targets, audio, a.metrics, workers=a.workers)
             if a.clap_ckpt:
                 n, K, _ = audio.shape
@@ -189,7 +224,8 @@ def main(argv=None, pool=None, prior=None):
     metrics = list(a.metrics) + (["clap_dist"] if a.clap_ckpt else [])
     summary = summarize(per_view, clusters, metrics)
     summary["meta"] = {"n": a.n, "seed": a.seed, "k": a.k, "steps": a.steps, "tau": a.tau, "select": a.select,
-                       "systems": systems, "time_s": time.time() - t0, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+                       "systems": systems, "time_s": time.time() - t0,
+                       "seconds_per_target_incl_render": search_time, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1, default=str)
     with open(os.path.join(a.out, "report.md"), "w", encoding="utf-8") as f:

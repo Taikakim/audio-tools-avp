@@ -219,6 +219,22 @@ There is also a fixed per-step cost: the radial brake calls `.item()` once for e
 
 **Candidate C: not built** [U]. A renderer-free JEPA-proxy loss, ‖f<sub>p→a</sub>(E<sub>p</sub>(θ̂<sub>1</sub>)) − sg(z<sub>a</sub>)‖². It is cheap, but needs its own validation on renders.
 
+### 6.1 Replacing the paper's JADE stage (added October 15, 2026)
+
+**Built:** `flow_seeded_search_v5.py`. The paper's JADE stage (half of 2 048 evaluations: population 32, about 32 generations) only finds the right region, categoricals included. The flow already does that, so:
+1. K flow samples per target (default 32, MIDI pinned) replace the JADE population. Optionally a share is drawn uniformly from the training box (`random_frac`), in case the flow misses a mode.
+2. The paper's Adam stage (lr 0.1, cosine decay, worse half pruned 3 times) runs on **all targets in one batch**, with the training box, the couplings and the per-row note applied after every step.
+3. The best candidate seen at any scoring point is returned, so the result is never worse than the best seed by the objective [T].
+
+**Why not a newer DE variant:** SHADE's success memory needs hundreds of generations, and we run about 32. L-SHADE's standard setting starts at about 18 × D candidates and is tuned for CEC budgets of 10 000 × D evaluations, over 200× ours; its population-reduction idea is already the Adam stage's halving. NL-SHADE-RSP, EBJADE and mLSHADE-RL are tuned to CEC test functions. MetaDE/EvoX's useful part, scoring a whole population per GPU call, the search already does.
+
+**Status:** CPU-tested on tiny random models (`test_flow_seeded_v5.py`, 6 tests): budget accounting, note pinning, box and couplings, never worse than the seeds, determinism, batched equals one-by-one, and the evaluator integration. Not run on real checkpoints; speed and audio quality are unmeasured.
+
+**Desktop (not the laptop; full-size models need the 16 GB card):**
+- Timing with random weights: `python flow_seeded_search_v5.py --bench --device cuda:0 --targets 16 --budgets 256 512 1024`. It prints the paper's search per target next to the batched flow-seeded search.
+- Audio quality: `audio_eval_v5.py ... --flow A3p=RUN/flow_ema_latest.pt --jepa A3pJADE=RUN/jepa_ema_latest.pt --seeded A3pFS=RUN/flow_ema_latest.pt,RUN/jepa_ema_latest.pt --seeded_budgets 256 512 1024`. `summary.json` reports seconds per target for each system.
+- **Decision:** adopt flow-seeded search if one budget matches JADE + Adam on log-mel L1 and MSS (paired, preset-clustered CI within the replicate gauge) at a fraction of the time. Keep JADE if it clearly wins on audio, which would mean the flow misses good regions.
+
 ## 7. Staged Plan
 
 Each stage ends in a decision, and the evaluation rules of EVAL_PARADIGM_V4.md apply:
