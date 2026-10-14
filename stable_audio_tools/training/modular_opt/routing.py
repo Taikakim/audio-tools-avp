@@ -93,6 +93,7 @@ def build_modular_param_groups(
     split_adaln: bool = True,
     force_sign: Iterable[str] = (),
     lora_a_lr_mult: float = 1.0,
+    spectral_all: bool = False,
 ) -> list[dict]:
     """Group model parameters according to Role-Based Norm Assignment.
 
@@ -127,13 +128,13 @@ def build_modular_param_groups(
         elif p.ndim < 2:
             role = "sign"
         # AdaLN modulation emitter always uses Sign (preserves modulation scale)
-        elif _ADALN_RE.search(name):
+        elif _ADALN_RE.search(name) and not spectral_all:
             role = "sign"
         # Input embeddings use ColNorm
-        elif _EMBEDDING_RE.search(name) and p.ndim == 2:
+        elif _EMBEDDING_RE.search(name) and p.ndim == 2 and not spectral_all:
             role = "colnorm"
         # Standard 2D linear/conv projections (including DiT output projection) use Spectral
-        elif p.ndim == 2 and min(p.shape) >= MIN_SPECTRAL_DIM:
+        elif p.ndim == 2 and (spectral_all or min(p.shape) >= MIN_SPECTRAL_DIM):
             role = "spectral"
         else:
             role = "sign"
