@@ -141,7 +141,13 @@ class ShampooPreconditioner(Preconditioner):
         trace = torch.diagonal(C32, dim1=-2, dim2=-1).sum(-1)
         C32 = C32 * (n / (trace + self.delta))
         sym = 0.5 * (C32 + C32.transpose(-1, -2)) + self.delta * eye
-        eigvals, eigvecs = torch.linalg.eigh(sym)
+        try:
+            eigvals, eigvecs = torch.linalg.eigh(sym)
+        except torch.linalg.LinAlgError:
+            # GHOST-NOTE 2026-10-15: a diverging run (NaN/inf covariance) made eigh raise and killed the whole run (air-head bracket,
+            # lr >= 5e-2). Keep the previous preconditioner instead; the caller's P is untouched, so the step proceeds with the old factor.
+            self.eigh_failures = getattr(self, "eigh_failures", 0) + 1
+            return self.P.float()
         # line 6: Spectral Tempering -- alpha is a tunable curvature exponent.
         scaled = eigvals.clamp_min(1e-12).pow(-self.alpha)
         return (eigvecs @ torch.diag_embed(scaled) @ eigvecs.transpose(-1, -2))
