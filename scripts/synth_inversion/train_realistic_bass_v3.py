@@ -738,8 +738,8 @@ def train(args):
     cache_path = None
     if args.val_cache:
         import hashlib
-        from render_bank_v5 import file_md5
-        key = json.dumps({"v": 1, "prior": prior_md5, "val_size": args.val_size, "seeds": [1, 2, 3],
+        from render_bank_v5 import code_fingerprint, file_md5
+        key = json.dumps({"v": 2, "code": code_fingerprint(), "prior": prior_md5, "val_size": args.val_size, "seeds": [1, 2, 3],
                           "ladder_val_anchors": args.ladder_val_anchors, "ladder_steps": args.ladder_steps,
                           "inharm": file_md5(args.inharm_config) if args.inharm_weight > 0 else None,
                           "plugin": os.path.basename(os.path.normpath(args.plugin))}, sort_keys=True)
@@ -769,10 +769,11 @@ def train(args):
     if args.bank:
         # Pre-rendered clips (render_bank_v5.py): the same items in the same order for every arm with this bank_seed.
         from torch.utils.data import RandomSampler
-        from render_bank_v5 import BankLadderDataset, BankMainDataset, check_compatible, cycle, read_manifest
+        from render_bank_v5 import (BankLadderDataset, BankMainDataset, check_compatible, code_fingerprint, cycle,
+                                    read_manifest)
         manifest = read_manifest(args.bank)
         probs = check_compatible(manifest, prior_md5, args.inharm_weight, args.inharm_config, args.ladder_steps,
-                                 args.ladder_every, args.random_patch_frac)
+                                 args.ladder_every, args.random_patch_frac, fingerprint=code_fingerprint())
         if probs and not args.allow_prior_change:
             raise SystemExit("--bank does not fit this run:\n  " + "\n  ".join(probs))
         main_ds = BankMainDataset(args.bank)

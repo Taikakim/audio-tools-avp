@@ -1,6 +1,6 @@
 # V5 Proposal Review and Staged Plan: Listening, Metrics, Single-GPU Throughput
 
-**Date:** October 13, 2026
+**Date:** October 13, 2026; **last updated October 15, 2026** (section "Status" below, sections 3, 6.1, 9, 10)
 **Reviewer:** KUANG, for Kim, Antigravity and Wintermute (the validation step that V5 section 7.3 asks for)
 **Reviews:** `V5_ARCHITECTURAL_ANALYSIS_AND_PROPOSAL.md` at `4426f77`, plus section 6 (training speed and precomputation) added in `d91ccb8`
 **Checked against:**
@@ -20,6 +20,24 @@ Nothing here ran on Surge, a ROCm GPU, real checkpoints or stems. The laptop has
 
 ---
 
+## Status, October 15, 2026 (read this first)
+
+**Where things are** (branch `fix/inharmonicity-aux` holds the v5 tools since merge `5c53a3a`; `feature/v5-flow-seeded-search` adds the flow-seeded search and the bank code guard below):
+
+| Stage | State | Evidence |
+|---|---|---|
+| 0a. 500-step throughput runs (live rendering) | **Not done** | `implementation_plan.md` step 0.3 |
+| 0b. Render bank | Built on October 14 (`bank_v5_s0`, 786 432 items + 12 288 ladders, 65 GB, verified), then **made stale** the same night: `d795b1e` and `e6e07f4` changed the parameter layout from 48 to 53 values (amp/filter EG mode, decay shapes, `feg_release`), the ranges and the random-patch sampler. A rebuild was started and **stopped part-way** when the desktop agent ran out of tokens (Kim, October 15) | `walkthrough.md`, `surge_spec_v3.py` diff |
+| 0c. Ladder metric check | **Done** on Surge (October 13, 48-value code, 149-preset manifold) | `ladder_gate.md`; summary in section 3 |
+| 0d. Banked throughput (step 0.6) | Not done | — |
+| 1–4 | Not started | — |
+
+**Rules that follow (for any agent):**
+1. **Bank code guard (new).** `render_bank_v5.py` now writes a `code_fingerprint` (md5 of `surge_spec_v3.py`, `realistic_bass_prior_v3.py`, `training_controls_v3.py` and the trainer's random-patch sampler with its helpers; line endings normalised) and `num_params` into `manifest.json`. The trainer refuses a bank whose fingerprint differs from the running code, `BankMainDataset` refuses vectors of the wrong length, and `--val_cache` keys include the fingerprint. A bank directory from before this guard (including a half-built one) is refused on resume: **delete it and rebuild**, or pass `build --trust_existing` only if every existing shard was rendered by exactly the current code. Any later edit to those files means rebuilding the bank (about 28 min at the measured 580 clips/s).
+2. **A-series checkpoints (A0–A3′) are 48-value models.** The current 53-value code cannot load them (the flow head and the parameter encoder change shape) [I, from the code]. Stage 1 on A-series checkpoints must run in a worktree at a 48-value commit, for example `git worktree add ../sit48 aa734a8`, with the v5 evaluation files copied in (`git checkout feature/v5-flow-seeded-search -- scripts/synth_inversion/flow_seeded_search_v5.py scripts/synth_inversion/audio_eval_v5.py`), and with the manifold each run was trained on (md5 in its `run_meta.json`). New 53-value runs compare only with each other.
+3. **Throughput, revised.** The bank build rendered 580 clips/s with 14 workers, about 41 clips/s per worker [N, `walkthrough.md`]. The trainer's 8 + 3 workers can therefore supply several hundred clips/s against the 42 samples/s the A-series achieved, so those runs were probably **not** waiting on Surge [I]; the GPU step, including ModularOptimizer's per-weight syncs (section 5.1), is the likelier limit. Steps 0a and 0d measure it. If confirmed, the bank's value is identical data across arms rather than speed, and the speed must come from model size and the optimizer.
+4. **Laptop vs desktop.** Full-size model runs, timing and anything with Surge belong on the desktop; the laptop runs the CPU tests only.
+
 ## 0. Summary
 
 The diagnosis is right in direction. No predicted patch is ever rendered in training or in the v4 per-item evaluation, so we have neither heard nor scored our generations as audio.
@@ -38,7 +56,7 @@ Findings that shaped the plan:
 2. **The throughput numbers are budgets, not measurements.** 42 samples/s is 12 000 × 64 / 5 h. A smaller model only trains faster if the GPU, not Surge, is the bottleneck. The trainer now logs both rates (stage 0), and the render bank removes Surge from the loop.
 3. **Most of the SonicMaster and stable-audio-metrics list does not fit our audio: 0.8 s, mono, peak-normalized bass notes** (section 3).
    - Faithful ports of the SonicMaster metrics sit in the ladder check so the data can confirm or overturn that verdict.
-   - A stand-in test finds that **log-mel L1, our primary metric, is blind to unison detune**: a re-render with new phases scores the same as twice the detune. The modulation spectrum separates them [T].
+   - A stand-in test finds that **log-mel L1, our primary metric, is blind to unison detune**: a re-render with new phases scores the same as twice the detune. The modulation spectrum separates them [T]. On Surge ladders no metric tracks detune reliably (best ρ ≈ 0.4; section 3), so detune is judged by ear for now [N].
 4. **Pre-encode audio, not mel and not JEPA tokens** (section 5).
 
 ## 1. What holds up
@@ -115,15 +133,23 @@ All metrics below live in `audio_metrics_v5.py` as paired distances, where 0 mea
 | MSS (`mss`) | 0.470; a paper metric | Milliseconds per clip | **Primary** |
 | wMFCC (`wmfcc`) | 0.392; a paper metric; tolerant of timing shifts (DTW) | Milliseconds | Secondary |
 | RMS envelope (`env_dist`, 1 − cosine) | 0.307 overall, but best on the envelope-driven datasets | Milliseconds | Secondary, for the envelope axes |
-| **Mel-SSIM** (`mel_ssim_dist`) | Structure of envelopes and filter sweeps on our own mel | Milliseconds | Candidate; decided by the ladder check |
-| **Gated Mel-SSIM** (`mel_ssim_gated_dist`) | The same, but averaged only over pixels within 40 dB of either clip's maximum. Plain SSIM averages a spectral difference with the identical silent tail; the gated version doesn't **[T]** | Milliseconds | **Preferred Mel-SSIM variant**, if it passes the ladder check |
-| Modulation spectrum (`modspec_dist`) | Separates 40 from 80 cents about 3.4× better than a re-render does at 110 Hz **[T]**. Beats slower than about 2 Hz (small detune on low notes) never complete a cycle in 0.8 s and stay phase-dependent: only 1.3× at 55 Hz with 10 vs 30 cents **[T]** | Milliseconds | **Detune diagnostic**: the one metric here that sees unison |
-| Gated flatness (`flatness_gated_err`) | Noisiness (drive, noise, FM) over frames within 30 dB of the loudest. The ungated version mostly measures how much of the clip is silent (more than 3× the error on identical timbre) **[T]** | Milliseconds | Diagnostic for drive, noise and FM |
+| **Mel-SSIM** (`mel_ssim_dist`) | Structure of envelopes and filter sweeps on our own mel; Surge ladder ρ 0.61 **[N]** | Milliseconds | **Secondary metric** (passed the ladder check) |
+| **Gated Mel-SSIM** (`mel_ssim_gated_dist`) | The same, but averaged only over pixels within 40 dB of either clip's maximum **[T]**. On Surge not better overall than plain (0.57 vs 0.61) | Milliseconds | **Not adopted** (Surge ladder check); plain Mel-SSIM goes forward |
+| Modulation spectrum (`modspec_dist`) | Separates 40 from 80 cents about 3.4× better than a re-render at 110 Hz on a synthetic saw **[T]**, but on Surge detune ladders only ρ = 0.37 **[N]** | Milliseconds | Weak detune diagnostic; detune judged by ear for now |
+| Gated flatness (`flatness_gated_err`) | Fails the Surge ladder check (ρ 0.23 overall; drive 0.13, noise 0.07) **[N]** | Milliseconds | **Dropped** |
 | Octave-band dB profile (`octave_db_l1`) | A bass-resolution replacement for the 9-band balance | Milliseconds | Diagnostic for tilt (cutoff, shape) |
 | CLAP audio-to-audio (`clap_distances`) | A paper metric. laion_clap repeats a 0.8 s clip to fill 10 s. Optional; needs laion_clap and a checkpoint | GPU | Add after the gate |
 | SonicMaster ports: `sm_band9_*`, `sm_mel_kl`, `sm_ssim_dist`, `sm_punch_err`, `sm_dr_err`, `sm_flatness_err`, `sm_modspec_dist` | Reasons in the previous answer and correction 8: linear 9-band shares, KL on dB values, one-number punch and dynamic range, flatness counting silence | Milliseconds | Expect "don't use"; kept in the ladder check so the data decides |
 | FAD (CLAP), OpenL3-FD | Distribution-level; meaningless on 24 stems. OpenL3 needs TensorFlow | — | Not for inversion |
 | RT60, stereo ratio, global RMS, PQ, SI-SDR | Degenerate for dry, mono, peak-normalized notes | — | Don't use |
+
+**Ladder check on Surge (October 13, 2026; `ladder_gate.md`, 9 axes × 8 held-out anchors × 9 steps, 48-value code) [N]:** mean Spearman ρ over the nine axes: `mss` 0.65, `logmel_l1` 0.64, `octave_db_l1` 0.63, `mel_ssim_dist` 0.61, `wmfcc` 0.60, the SonicMaster SSIM and KL ports 0.60, `modspec_dist` 0.58, `mel_ssim_gated_dist` 0.57, `env_dist` 0.52; the remaining SonicMaster ports 0.30–0.42; `flatness_gated_err` 0.23. What this changes:
+- **Primary metrics confirmed:** `mss` and `logmel_l1` (ρ ≈ 0.85–0.98 on cutoff, sustain, FEG amount, resonance).
+- **Mel-SSIM:** the plain version (0.61) goes forward as the secondary structural metric. The gated version is not better overall (0.57); it is better only on AEG sustain (0.90 vs 0.76) and worse on drive (0.28 vs 0.67).
+- **Detune:** no metric tracks it reliably on Surge. Best are `env_dist` 0.40, `modspec_dist` 0.37 [CI 0.10, 0.62] and the SonicMaster modulation port 0.34; `logmel_l1` is 0.15. The stand-in result (modulation spectrum sees detune, log-mel L1 does not) holds in direction only. Detune errors will be judged by ear for now.
+- **Gated flatness fails** (drive 0.13, noise 0.07): dropped as a diagnostic. **Noise level and FM depth** are tracked weakly by every metric (best ρ about 0.16 and 0.51).
+- **SonicMaster ports:** the band, punch, dynamic-range and flatness ports rank last, as expected. The SSIM and KL ports do as well as our Mel-SSIM, but they add nothing over `mss` and `logmel_l1`.
+- **To re-run on the 53-value code:** the check reads the spec at run time, so rerun `ladder_metric_check_v5.py` after the bank rebuild if the new envelope modes need an axis.
 
 **Gate before adopting any metric:**
 1. **Human alignment:** `timbre_alignment_check.py`. Its datasets are acoustic tones, so this is out of domain.
@@ -246,7 +272,7 @@ Each stage ends in a decision, and the evaluation rules of EVAL_PARADIGM_V4.md a
 |---|---|---|---|---|
 | **0. Infrastructure and measurement** | (a) 500-step runs at base and small size on live rendering: read `samples/s, data wait`. (b) Build bank seed 0 and verify it. (c) Ladder check of every metric. | trainer log line, `render_bank_v5.py`, `ladder_metric_check_v5.py` | (a) about 1 h; (b) about 6.5 h unattended at 42 clips/s; (c) about 700 renders, minutes | Is training data-bound? Which metrics, and which Mel-SSIM variant, go forward? |
 | **1. Audio-space baseline, no training** | A0 and A3′ (EMA): flow draw 0, best-of-8 and JEPA search on 256 held-out notes; listening pack; one blind A/B by Kim | `audio_eval_v5.py`, `listening_test_v5.py` | About 256 × (2 × 8 + 1) ≈ 4 400 renders plus search, about 30 min | DPO headroom (draw 0 vs best-of-8); JEPA search vs flow on audio |
-| **2. Small-model paradigm search** | `SIZE=small` on the bank, 12 000 steps: S0 = temporal ASP; S1 = S0 + cross-attention; two seeds each, same `BANK_SEED`; optional S2 = AdamW control | `run_v3_recipe.sh`, `heldout_eval_v4.py`, `audio_eval_v5.py` | Unknown until stage 0. GPU compute is about 1/8 of base; render cost is zero with the bank | Pre-register the primary metrics: `logmel_l1` and the gated Mel-SSIM (if it passed) on draw 0. Cross-attention goes forward only if it beats the replicate gauge |
+| **2. Small-model paradigm search** | `SIZE=small` on the bank, 12 000 steps: S0 = temporal ASP; S1 = S0 + cross-attention; two seeds each, same `BANK_SEED`; optional S2 = AdamW control | `run_v3_recipe.sh`, `heldout_eval_v4.py`, `audio_eval_v5.py` | Unknown until stage 0. GPU compute is about 1/8 of base; render cost is zero with the bank | Pre-register the primary metrics: `logmel_l1` and `mss` on draw 0, with plain Mel-SSIM as secondary (Surge ladder check, section 3). Cross-attention goes forward only if it beats the replicate gauge |
 | **3. Flow-DPO** | On the stage-2 winner, and in parallel on A3′: 8 192 synthetic conditions × K = 8 (about 82 000 renders, about 35 min at 42/s); β ∈ {30, 100, 300}, lr 1e-5, 2 000 steps; with and without an SFT anchor of 0.2 | `dpo_pairs_v5.py`, `train_flow_dpo_v5.py`, `audio_eval_v5.py`, `heldout_eval_v4.py` | Pairs once (about 35 min); each DPO run is minutes on the GPU | Success means DPO's draw 0 closes at least half the gap to the reference's best-of-8, parameter-space metrics get no worse than the gauge, and listeners prefer it. A second round, sampled from the DPO checkpoint, only if round one helps. Real-audio DPO (3b) needs bass clips outside the eval stems, transcribed for MIDI notes |
 | **4. Confirm at base size** | The winning recipe at `SIZE=base`, two seeds, against the A3′ recipe at two seeds; then the paper-style listening test | everything above | Two to four base runs | The decision that ships |
 
@@ -280,6 +306,8 @@ The idea: choose the training paradigm on a model about 1/8 the compute, then co
 | `dpo_pairs_v5.py`, `train_flow_dpo_v5.py` | Flow-DPO | CPU-tested (neutral at init, learns a synthetic preference, refuses off-policy pairs) |
 | `audio_eval_v5.py` | Audio-space evaluation and listening pack | CPU-tested end to end on a fake renderer |
 | `listening_test_v5.py` | Paper-style multi-listener test | CPU-tested (BS.1770 meter, make, analyze, exclusions, domains) |
+| `flow_seeded_search_v5.py` | Flow-seeded, batched JEPA search replacing the paper's JADE stage (section 6.1); `--bench` timing | CPU-tested in `test_flow_seeded_v5.py` (6 tests) |
+| `render_bank_v5.py` code guard | `code_fingerprint` and `num_params` in the bank manifest and the validation-cache key; `--trust_existing` | CPU-tested (`test_bank_refuses_other_code`) |
 
 **Test results:** `test_v5.py` has 32 tests. Together with the existing `test_eval_v4.py`, `test_v4_components.py`, `test_activity_table.py` and the inharmonicity tests, 117 pass. One existing test fails because surgepy isn't installed here: `test_activity_table.py::test_v4_registry_coverage`, which doesn't touch anything this branch changes.
 
@@ -292,7 +320,8 @@ The idea: choose the training paradigm on a model about 1/8 the compute, then co
 
 ## 10. Questions for the Desktop
 
-1. Please commit `report_v4_2x2.md` and the per-item eval files so the V5 table can be checked.
-2. What do the stage-0 measurements show: samples/s, data wait, and renders per second?
+1. ~~Commit `report_v4_2x2.md`~~ Done (`6e7ef56`); it matches the numbers in correction 1 (online kind: `flow_mse` +0.0111, p = 0.125, Holm 0.249; AEG-sustain ladder +0.1114).
+2. What do steps 0a and 0d show: samples/s and data wait, live and from the bank? Renders per second are answered: about 41 clips/s per worker (580/s with 14).
 3. Has JEPA search been scored with `reference_metrics` on the v3 or v4 checkpoints? If so, where are the results?
 4. Is there a pool of real bass clips, outside the evaluation stems, for real-audio DPO (stage 3b)?
+5. After the bank rebuild: does `render_bank_v5.py verify` pass on the 53-value bank, and does the manifest carry `code_fingerprint`?

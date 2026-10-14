@@ -342,6 +342,23 @@ def test_bank_ladder_items_and_compatibility(tmp_path, fake_md5):
     assert len(probs) == 4
 
 
+def test_bank_refuses_other_code(tmp_path, fake_md5):
+    import json as _json
+    import render_bank_v5 as rb
+    _build(tmp_path)
+    m = rb.read_manifest(str(tmp_path))
+    fp = rb.code_fingerprint()
+    assert m["code_fingerprint"] == fp and rb.check_compatible(m, "fakemd5", 0.0, None, 4, 4, 0.2, fingerprint=fp) == []
+    assert len(rb.check_compatible(m, "fakemd5", 0.0, None, 4, 4, 0.2, fingerprint="0" * 32)) == 1
+    del m["code_fingerprint"]                                  # a bank from before fingerprints
+    with open(tmp_path / "manifest.json", "w") as f:
+        _json.dump(m, f)
+    with pytest.raises(SystemExit):
+        _build(tmp_path)                                       # resume refused ...
+    _build(tmp_path, trust_existing=True)                     # ... unless explicitly trusted
+    assert rb.read_manifest(str(tmp_path))["code_fingerprint"] == fp
+
+
 def test_bank_order_does_not_depend_on_model_rng(tmp_path, fake_md5):
     import render_bank_v5 as rb
     from torch.utils.data import DataLoader, RandomSampler

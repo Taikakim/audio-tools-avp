@@ -58,6 +58,35 @@ def file_md5(path):
     return h.hexdigest()
 
 
+def _src(obj):
+    import inspect
+    return inspect.getsource(obj).replace("\r\n", "\n")
+
+
+def code_fingerprint():
+    """md5 over everything that decides what a vector is and how it sounds: the parameter spec and renderer
+    (surge_spec_v3.py), the prior (realistic_bass_prior_v3.py), the ladders (training_controls_v3.py) and the trainer's
+    random-patch sampler with the module-level helpers and tables it uses. Line endings are normalised, so a Windows
+    and a Linux checkout of the same commit agree. Any change to those files makes earlier banks and cached
+    validation sets refuse to load (the safe failure: they would otherwise mix two parameter layouts or samplers)."""
+    import surge_spec_v3
+    import realistic_bass_prior_v3
+    import training_controls_v3
+    from train_realistic_bass_v3 import sample_unconstrained_random_patch as f
+    h = hashlib.md5()
+    for m in (surge_spec_v3, realistic_bass_prior_v3, training_controls_v3):
+        with open(m.__file__, "rb") as fh:
+            h.update(fh.read().replace(b"\r\n", b"\n"))
+    h.update(_src(f).encode())
+    for name in sorted(set(f.__code__.co_names)):
+        obj = f.__globals__.get(name)
+        if callable(obj) and getattr(obj, "__module__", None) == f.__module__:
+            h.update(_src(obj).encode())
+        elif isinstance(obj, (int, float, str, tuple, list, dict, np.ndarray)):
+            h.update(repr(obj).encode())
+    return h.hexdigest()
+
+
 def draw_main_item(prior, i, seed, random_patch_frac):
     rng = item_rng(seed, 0, i)
     if random_patch_frac > 0.0 and rng.rand() < random_patch_frac:
@@ -92,7 +121,7 @@ def _save_shard(bank, kind, k, audio16, **meta):
 
 def build(a, prior=None, pool=None, log=print):
     from render_pool_v5 import RenderPool, to_int16
-    from surge_spec_v3 import AUDIO_LEN, FX_RENDER_ENABLED, SAMPLE_RATE
+    from surge_spec_v3 import AUDIO_LEN, FX_RENDER_ENABLED, NUM_PARAMS, SAMPLE_RATE
     os.makedirs(a.out, exist_ok=True)
     if prior is None:
         from realistic_bass_prior_v3 import RealisticBassPrior
@@ -103,13 +132,24 @@ def build(a, prior=None, pool=None, log=print):
            "n_items": a.n_items, "shard_size": a.shard_size, "n_ladders": a.n_ladders, "ladder_steps": a.ladder_steps,
            "ladder_shard": a.ladder_shard, "inharm_config": a.inharm_config, "inharm_config_md5": file_md5(a.inharm_config),
            "renderer": "pedalboard-vst3" if pool is None else "custom", "plugin": a.plugin,
-           "fx_render_enabled": bool(FX_RENDER_ENABLED), "sample_rate": SAMPLE_RATE, "audio_len": AUDIO_LEN}
+           "fx_render_enabled": bool(FX_RENDER_ENABLED), "sample_rate": SAMPLE_RATE, "audio_len": AUDIO_LEN,
+           "num_params": NUM_PARAMS, "code_fingerprint": code_fingerprint()}
     mpath = os.path.join(a.out, "manifest.json")
     if os.path.exists(mpath):
         with open(mpath) as f:
             old = json.load(f)
+        if getattr(a, "trust_existing", False) and "code_fingerprint" not in old:
+            log("--trust_existing: stamping the existing manifest with the current code fingerprint")
+            old.update(num_params=cfg["num_params"], code_fingerprint=cfg["code_fingerprint"])
+            with open(mpath, "w") as f:
+                json.dump(old, f, indent=1)
         diff = {k: (old.get(k), v) for k, v in cfg.items() if k not in ("created",) and old.get(k) != v}
         if diff:
+            if "code_fingerprint" in diff:
+                raise SystemExit(f"{a.out} was (partly) rendered by different spec / prior / sampler code, or before "
+                                 "banks carried a code fingerprint. Delete it and rebuild; or, ONLY if every existing "
+                                 "shard was rendered by exactly this code, pass --trust_existing. Differences: "
+                                 f"{diff}")
             raise SystemExit(f"{a.out} holds a bank with a different configuration: {diff}")
         log(f"resuming the bank in {a.out}")
     else:
@@ -184,6 +224,10 @@ class BankMainDataset:
         self.n, self.shard = int(m["n_items"]), int(m["shard_size"])
         self.manifest = m
         self.sh = _Shards(bank, "main", math.ceil(self.n / self.shard))
+        from surge_spec_v3 import NUM_PARAMS
+        dim = self.sh.get(0)[1]["vec"].shape[-1]
+        if dim != NUM_PARAMS:
+            raise SystemExit(f"{bank}: bank vectors have {dim} values, the current spec has {NUM_PARAMS}; rebuild the bank")
 
     def __len__(self):
         return self.n
@@ -223,9 +267,14 @@ class BankLadderDataset:
                 torch.from_numpy(np.concatenate(axis)))
 
 
-def check_compatible(manifest, prior_md5, inharm_weight, inharm_config, ladder_steps, ladder_every, random_patch_frac):
-    """Problems that make a bank the wrong data for this run (empty list = fine)."""
+def check_compatible(manifest, prior_md5, inharm_weight, inharm_config, ladder_steps, ladder_every, random_patch_frac,
+                     fingerprint=None):
+    """Problems that make a bank the wrong data for this run (empty list = fine). fingerprint: code_fingerprint() of
+    the running code; None skips that check (tests)."""
     probs = []
+    if fingerprint is not None and manifest.get("code_fingerprint") != fingerprint:
+        probs.append("the bank was rendered by different spec / prior / sampler code (or predates code fingerprints; "
+                     f"bank {manifest.get('code_fingerprint')}, run {fingerprint}): rebuild it")
     if manifest.get("format") != FORMAT:
         probs.append(f"bank format {manifest.get('format')} != {FORMAT}")
     if manifest.get("prior_md5") != prior_md5:
@@ -297,6 +346,9 @@ def main(argv=None):
     b.add_argument("--inharm_config", default=None)
     b.add_argument("--seed", type=int, default=0)
     b.add_argument("--workers", type=int, default=8)
+    b.add_argument("--trust_existing", action="store_true",
+                   help="stamp an unfingerprinted existing bank with the current code fingerprint and resume it; only "
+                        "when every existing shard was rendered by exactly this code")
     v = sub.add_parser("verify")
     v.add_argument("--bank", required=True)
     v.add_argument("--n", type=int, default=32)

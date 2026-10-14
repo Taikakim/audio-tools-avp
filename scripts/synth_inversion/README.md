@@ -60,11 +60,18 @@ scripts/synth_inversion/
 `-- run_overnight_suite.sh     # 200-epoch Muon+SF run, then 100-epoch AdamW baseline
 ```
 
-V5 tools (October 13, 2026; plan, findings and smoke tests in `V5_PROPOSAL_REVIEW.md`, CPU tests in `test_v5.py`):
+V5 tools (October 13–15, 2026). **Current state, rules and open questions: the "Status" section at the top of
+`V5_PROPOSAL_REVIEW.md`** (plan, findings, desktop smoke tests in the same file; Antigravity's stage-0 notes in
+`walkthrough.md`, `implementation_plan.md`, `ladder_gate.md`). CPU tests: `test_v5.py`, `test_flow_seeded_v5.py`.
 `audio_metrics_v5.py` (paired audio metrics incl. Mel-SSIM), `ladder_metric_check_v5.py` (metric gate on parameter
 sweeps), `render_pool_v5.py` / `render_bank_v5.py` (shared pre-rendered training data, `--bank`), `flow_sampling_v5.py`,
 `audio_eval_v5.py` (audio-space evaluation + listening pack), `dpo_pairs_v5.py` / `train_flow_dpo_v5.py` (Flow-DPO),
-`listening_test_v5.py` (paper-style blind test); cross-attention flow via `--flow_xattn`, model size via `SIZE=small`.
+`listening_test_v5.py` (paper-style blind test), `flow_seeded_search_v5.py` (flow-seeded batched JEPA search, the
+replacement for the paper's JADE stage); cross-attention flow via `--flow_xattn`, model size via `SIZE=small`.
+Two rules that bite: a render bank is tied to the code that rendered it (`code_fingerprint` in its manifest; the trainer
+refuses a mismatch, so edits to `surge_spec_v3.py`, the prior, the ladders or the random-patch sampler mean a rebuild),
+and the parameter layout is 53 values since `e6e07f4`, so the 48-value A-series checkpoints load only at an older
+commit (see the Status section).
 
 ---
 

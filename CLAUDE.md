@@ -64,5 +64,12 @@ the v4 components and eval paradigm. Added 2026-10-12 from Antigravity/KUANG's w
 - Run scripts **from that directory** (they import each other by module name). Training venv: `stable-audio-3/.venv`; dataset generation / Surge: `synth_env` (pedalboard). Eval scripts need torch AND pedalboard in one venv.
 - Tests need no Surge or GPU: `python -m pytest -q test_synth_inversion.py test_v4_components.py`.
 - **Evidence rule:** the v4 [R] results are on a stand-in synth, not Surge; the v1 reports were invalidated (see `docs/synth_inversion_reports/WALKTHROUGH.md`). Compare runs with the paired, replicate-gated tools, not single-run numbers.
-- Branches: `fix/inharmonicity-aux` (current), `feature/v4-components`, `feature/v4-eval-paradigm`. Interfaces are not frozen.
+- **V5 (October 2026):** state, rules and next steps are in the "Status" section at the top of
+  `scripts/synth_inversion/V5_PROPOSAL_REVIEW.md`; tool list in the README's "V5 tools" paragraph. Tests:
+  `python -m pytest -q test_v5.py test_flow_seeded_v5.py` (CPU, no Surge; the trainer import needs Essentia or the fakes).
+  Render banks carry a code fingerprint and must be rebuilt after edits to the spec, prior, ladders or random-patch
+  sampler. The layout is 53 values since `e6e07f4`; the 48-value A-series checkpoints load only at an older commit.
+  Division of work: KUANG (laptop) writes and CPU-tests ML code; runs, timing and Surge work happen on the desktop.
+- Branches: `fix/inharmonicity-aux` (current; v5 tools merged), `feature/v5-flow-seeded-search` (flow-seeded search,
+  bank code guard), `feature/v4-components`, `feature/v4-eval-paradigm`. Interfaces are not frozen.
 - Optimizer details for `ModularOptimizer` / `FusionOpt`: `fusion-optimiser/docs/MANUAL.md` (branch `docs/manual`, option-by-option).
