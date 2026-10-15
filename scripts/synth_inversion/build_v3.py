@@ -161,11 +161,11 @@ def build_extract_v3():
 
     ext = ext.replace(
         'OUTPUT_PATH = "/run/media/kim/Mantu/surge_200k_models/real_bass_manifold.npz"',
-        'OUTPUT_PATH = "/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz"'
+        'OUTPUT_PATH = "/run/media/kim/Mantu/surge_200k_models/real_bass_manifold_v3.npz"'
     )
     ext = ext.replace(
-        'OUTPUT_PATH = "/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold.npz"',
-        'OUTPUT_PATH = "/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz"'
+        'OUTPUT_PATH = "/run/media/kim/Mantu/surge_200k_models/real_bass_manifold.npz"',
+        'OUTPUT_PATH = "/run/media/kim/Mantu/surge_200k_models/real_bass_manifold_v3.npz"'
     )
 
 

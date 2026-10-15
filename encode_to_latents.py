@@ -11,13 +11,13 @@ Usage:
     python encode_to_latents.py \
         --model-config models/checkpoints/vae_model_config.json \
         --ckpt-path models/checkpoints/vae_model.ckpt \
-        --input-dir /run/media/kim/Mantu1/ai-music/Goa_Separated_crops
+        --input-dir /run/media/kim/Mantu/ai-music/Goa_Separated_crops
 
     # Or using the full diffusion model checkpoint (same autoencoder):
     python encode_to_latents.py \
         --model-config models/checkpoints/small/base_model_config.json \
         --ckpt-path models/checkpoints/small/base_model.ckpt \
-        --input-dir /run/media/kim/Mantu1/ai-music/Goa_Separated_crops
+        --input-dir /run/media/kim/Mantu/ai-music/Goa_Separated_crops
 """
 
 import argparse

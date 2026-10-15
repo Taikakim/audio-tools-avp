@@ -49,7 +49,7 @@ from surge_spec_v3 import (DEFAULT_PLUGIN_PATH, LP_FILTERS, NUM_PARAMS, PARAM_IN
                         WAVESHAPER_TYPES, verify_surge_mapping)
 
 FORMAT_VERSION = 2
-OUTPUT_PATH = "/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz"
+OUTPUT_PATH = "/run/media/kim/Mantu/surge_200k_models/real_bass_manifold_v3.npz"
 SURGE_DATA_DIR = "/home/kim/Downloads/surge-xt-portable-content-1.3.4/Surge Synth Team/SurgeXTData"
 NEW_LOOPS_ZIP = "/home/kim/Documents/Surge XT/Patches/AI Inversions/kim_bass_.zip"
 PRESETSHARE_DIR = "/home/kim/Documents/Surge XT/Patches/Presetshare"

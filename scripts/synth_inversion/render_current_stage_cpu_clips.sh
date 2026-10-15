@@ -4,7 +4,7 @@ set -uo pipefail
 SAO=/home/kim/Projects/SAO
 PYTHON=$SAO/stable-audio-tools/sat-venv/bin/python
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a0"
+ROOT="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a0"
 FLOW_CKPT="$ROOT/flow_best.pt"
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') Starting CPU audio clip generation for A0 current stage ==="

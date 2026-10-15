@@ -482,11 +482,11 @@ def build_multitemp_dawproject(
 
 def main():
     parser = argparse.ArgumentParser(description="Export Surge XT A2 & A3 Multi-Temp Evaluation to .dawproject format")
-    parser.add_argument("--a2_audio", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a2/eval_cpu_muscriptor_temps/audio")
-    parser.add_argument("--a3_audio", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a3/eval_cpu_muscriptor_temps/audio")
-    parser.add_argument("--a2_presets", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a2/eval_cpu_muscriptor_temps/vstpresets")
-    parser.add_argument("--a3_presets", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a3/eval_cpu_muscriptor_temps/vstpresets")
-    parser.add_argument("--midi_dir", default="/run/media/kim/Mantu2/surge_200k_models/real_stems_eval/midi_muscriptor")
+    parser.add_argument("--a2_audio", default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a2/eval_cpu_muscriptor_temps/audio")
+    parser.add_argument("--a3_audio", default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a3/eval_cpu_muscriptor_temps/audio")
+    parser.add_argument("--a2_presets", default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a2/eval_cpu_muscriptor_temps/vstpresets")
+    parser.add_argument("--a3_presets", default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a3/eval_cpu_muscriptor_temps/vstpresets")
+    parser.add_argument("--midi_dir", default="/run/media/kim/Mantu/surge_200k_models/real_stems_eval/midi_muscriptor")
     parser.add_argument("--out", default="/home/kim/Documents/Surge_A2_A3_Sequential_Evaluation.dawproject")
     parser.add_argument("--title", default="Surge XT A2 & A3 Multi-Temp Evaluation")
     parser.add_argument("--stems", nargs="+", default=None)

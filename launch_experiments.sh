@@ -14,7 +14,7 @@ export HOURS=5.0
 echo "=========================================================="
 echo "Starting Arm A1: Inharmonicity 100 Isolation (5.0h)..."
 echo "=========================================================="
-export OUT_DIR=/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1
+export OUT_DIR=/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1
 export INHARM_WEIGHT=100.0
 export INHARM_CONFIG=scripts/synth_inversion/inharm_config.json
 export FLOW_ENCODER=conv
@@ -27,7 +27,7 @@ bash scripts/synth_inversion/run_v3_recipe.sh
 echo "=========================================================="
 echo "Starting Arm A2: Temporal Audio Encoder (ASP) Isolation (5.0h)..."
 echo "=========================================================="
-export OUT_DIR=/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a2
+export OUT_DIR=/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a2
 export INHARM_WEIGHT=0
 unset INHARM_CONFIG
 export FLOW_ENCODER=temporal_asp

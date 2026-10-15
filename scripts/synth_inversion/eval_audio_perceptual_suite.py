@@ -29,11 +29,11 @@ from skimage.metrics import structural_similarity as ssim
 
 # Default evaluation arms and directories
 DEFAULT_ARMS = {
-    "A0_base": "/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a0_seeded/eval_cpu_muscriptor_temps/audio",
-    "A1_inharm": "/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps/audio",
-    "A2_asp": "/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a2/eval_cpu_muscriptor_temps/audio",
-    "A3_asp_inh": "/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a3/eval_cpu_muscriptor_temps/audio",
-    "A3_prime": "/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a3_prime/eval_cpu_muscriptor_temps/audio",
+    "A0_base": "/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a0_seeded/eval_cpu_muscriptor_temps/audio",
+    "A1_inharm": "/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps/audio",
+    "A2_asp": "/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a2/eval_cpu_muscriptor_temps/audio",
+    "A3_asp_inh": "/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a3/eval_cpu_muscriptor_temps/audio",
+    "A3_prime": "/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a3_prime/eval_cpu_muscriptor_temps/audio",
 }
 
 SPECTRAL_BANDS = [

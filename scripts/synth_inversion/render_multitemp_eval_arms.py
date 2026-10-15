@@ -378,9 +378,9 @@ def render_arm_isolated(arm: str, base_dir: str, midi_dir: str, temps: list, ste
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--arms", nargs="+", default=["a2", "a3"], help="Arms to render (a2, a3)")
-    parser.add_argument("--base_dir", type=str, default="/run/media/kim/Mantu2/surge_200k_models")
+    parser.add_argument("--base_dir", type=str, default="/run/media/kim/Mantu/surge_200k_models")
     parser.add_argument("--midi_dir", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_stems_eval/midi_muscriptor")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_stems_eval/midi_muscriptor")
     parser.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.5, 0.7, 0.85, 1.0])
     parser.add_argument("--stem", type=str, default=None, help="Filter to specific stem id substring")
     parser.add_argument("--worker", action="store_true", help="Run single worker pass (internal)")

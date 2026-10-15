@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio_utils import MultiScaleSTFTLoss
 from invert_stem_collection_v3_cpu import STEM_CATALOG, resolve_mantu
 
-BASE_DIR = "/run/media/kim/Mantu2/surge_200k_models"
+BASE_DIR = "/run/media/kim/Mantu/surge_200k_models"
 ARMS = ["a1", "a2", "a3"]
 LABELS = {
     "t015": "tau=0.15",

@@ -8,7 +8,7 @@ set -uo pipefail
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE MIOPEN_FIND_MODE=2 PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
 export ROCR_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
 SAO=/home/kim/Projects/SAO
-ROOT="${ROOT:-/run/media/kim/Mantu2/surge_200k_models}"
+ROOT="${ROOT:-/run/media/kim/Mantu/surge_200k_models}"
 SRC="${SRC:-$ROOT/h6_condnoise_b64}"
 OUT_DIR="${OUT_DIR:-$ROOT/h6_cont4h_b64}"
 HOURS="${HOURS:-4.0}"

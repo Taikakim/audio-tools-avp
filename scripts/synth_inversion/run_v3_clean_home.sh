@@ -12,7 +12,7 @@ export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE MIOPEN_FIND_MODE=2 PYTORCH_TUNABL
 export ROCR_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
 SAO=/home/kim/Projects/SAO
 OUT_DIR="${OUT_DIR:-/home/kim/sao_runs/v3_clean_b64}"
-MANIFOLD="${MANIFOLD:-/run/media/kim/Mantu1/surge_200k_models/real_bass_manifold.npz}"
+MANIFOLD="${MANIFOLD:-/run/media/kim/Mantu/surge_200k_models/real_bass_manifold.npz}"
 EVAL_ROOT=/run/media/kim/Mantu/surge_200k_models
 PYTHON=$SAO/stable-audio-tools/sat-venv/bin/python
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

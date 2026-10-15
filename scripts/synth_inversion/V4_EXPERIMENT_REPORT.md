@@ -233,9 +233,9 @@ The external agent should execute the remaining v4 rollout across three distinct
 
 | Artifact | Path |
 |---|---|
-| **Arm A1 Weights** | `/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1/` |
-| **Arm A2 Weights** | `/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a2/` |
-| **Arm A3 Weights** | `/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a3/` |
-| **A1 Multi-Temp Audio (504 clips)** | `/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps/audio/` |
+| **Arm A1 Weights** | `/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1/` |
+| **Arm A2 Weights** | `/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a2/` |
+| **Arm A3 Weights** | `/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a3/` |
+| **A1 Multi-Temp Audio (504 clips)** | `/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps/audio/` |
 | **v4 Test Suite (40/40 Passing)** | `scripts/synth_inversion/test_v4_components.py` |
 | **v4 Modules** | `frontend_v4.py`, `models_v4.py`, `objectives_v4.py`, `resonance_v4.py`, `musical_snapping.py` |

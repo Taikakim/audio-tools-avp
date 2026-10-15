@@ -471,8 +471,8 @@ def atomic_save(obj, path):
 
 def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out_dir", default="/run/media/kim/Mantu2/surge_200k_models/overnight_realistic_bass_v3")
-    ap.add_argument("--manifold", default="/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz")
+    ap.add_argument("--out_dir", default="/run/media/kim/Mantu/surge_200k_models/overnight_realistic_bass_v3")
+    ap.add_argument("--manifold", default="/run/media/kim/Mantu/surge_200k_models/real_bass_manifold_v3.npz")
     ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
     ap.add_argument("--hours", type=float, default=8.0, help="total time budget, including resumed time")
     ap.add_argument("--seed", type=int, default=None, help="seed for torch, numpy, random, and dataloader workers")

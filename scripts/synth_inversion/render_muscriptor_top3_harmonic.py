@@ -54,9 +54,9 @@ def apply_patch_with_pitch(synth, p: dict):
 
 
 def main():
-    flow_ckpt = resolve_mantu("/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a0/flow_best.pt")
-    out_dir = resolve_mantu("/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a0/eval_cpu_muscriptor_top3")
-    muscriptor_midi_dir = resolve_mantu("/run/media/kim/Mantu2/surge_200k_models/real_stems_eval/midi_muscriptor")
+    flow_ckpt = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a0/flow_best.pt")
+    out_dir = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a0/eval_cpu_muscriptor_top3")
+    muscriptor_midi_dir = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval/midi_muscriptor")
 
     audio_dir = os.path.join(out_dir, "audio")
     presets_dir = os.path.join(out_dir, "vstpresets")

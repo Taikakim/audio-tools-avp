@@ -25,9 +25,9 @@ different numbers). A mismatch on the same device means the evaluation does not 
 find out why before comparing anything.
 
 Usage (training machine; renders on CPU, scores on --device):
-  python heldout_eval_v4.py --run A1=/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1 \\
+  python heldout_eval_v4.py --run A1=/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1 \\
       --run A2=.../real_bass_v3_a2 --run A3=.../real_bass_v3_a3 --kinds sf online ema --tag latest \\
-      --extra_n 2048 --out /run/media/kim/Mantu2/surge_200k_models/eval_v4 --device cuda:0
+      --extra_n 2048 --out /run/media/kim/Mantu/surge_200k_models/eval_v4 --device cuda:0
 """
 import argparse
 import hashlib

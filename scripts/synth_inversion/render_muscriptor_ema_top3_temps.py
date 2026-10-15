@@ -38,11 +38,11 @@ from render_muscriptor_top3_harmonic import snap_to_harmonic_ratio, apply_patch_
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--flow_ckpt", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a0/flow_ema_best.pt")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a0/flow_ema_best.pt")
     parser.add_argument("--out_dir", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a0/eval_cpu_muscriptor_ema_temps")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a0/eval_cpu_muscriptor_ema_temps")
     parser.add_argument("--midi_dir", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_stems_eval/midi_muscriptor")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_stems_eval/midi_muscriptor")
     parser.add_argument("--temps", type=float, nargs="+", default=[0.3, 0.7, 1.0])
     args = parser.parse_args()
 

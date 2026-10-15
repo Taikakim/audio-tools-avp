@@ -127,7 +127,7 @@ what was checked and works. Part D is the pre-A1 gate: commands that turn the re
 
 ### A13. LOW. Module docstring and hard-coded paths
 - `train_realistic_bass_v3.py`: imports sit above the docstring, so `__doc__` is empty (since round 1). [V]
-- `launch_experiments.sh` and the trainer defaults contain drive paths (`/run/media/kim/Mantu2/...`, `/home/kim/Projects/SAO`). [V]
+- `launch_experiments.sh` and the trainer defaults contain drive paths (`/run/media/kim/Mantu/...`, `/home/kim/Projects/SAO`). [V]
   Acceptable in the agent's private tree, but they should not go into any shared commit.
 
 ### A14. Process: decision records need provenance

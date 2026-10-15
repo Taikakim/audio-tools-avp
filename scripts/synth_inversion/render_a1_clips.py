@@ -22,7 +22,7 @@ def main():
         json.dump({"p95": p95}, f)
         
     model = SynthJEPA(inharmonicity_head=True, ff_dim=1152).to(device)
-    ckpt = torch.load("/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_inharm/checkpoint_latest.pt", map_location=device, weights_only=False)
+    ckpt = torch.load("/run/media/kim/Mantu/surge_200k_models/real_bass_v3_inharm/checkpoint_latest.pt", map_location=device, weights_only=False)
     model.load_state_dict(ckpt["jepa_state_dict"])
     model.eval()
     
@@ -32,7 +32,7 @@ def main():
     normalizer.frozen = True
     
     plugin = surge_spec_v3.init_synth()
-    prior = RealisticBassPrior("/run/media/kim/Mantu2/surge_200k_models/real_bass_manifold_v3.npz", split="val", jitter=0.0)
+    prior = RealisticBassPrior("/run/media/kim/Mantu/surge_200k_models/real_bass_manifold_v3.npz", split="val", jitter=0.0)
     
     searcher = SynthJEPASearcher(model, normalizer=normalizer, device=device)
     

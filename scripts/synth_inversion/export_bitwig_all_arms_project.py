@@ -459,8 +459,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export Any Combination of Synth-JEPA Arms to .dawproject format")
     parser.add_argument("--arms", nargs="+", default=["a0", "a1", "a2", "a3"],
                         help="Arms to include (e.g. a0 a1 a2 a3)")
-    parser.add_argument("--base_dir", default="/run/media/kim/Mantu2/surge_200k_models")
-    parser.add_argument("--midi_dir", default="/run/media/kim/Mantu2/surge_200k_models/real_stems_eval/midi_muscriptor")
+    parser.add_argument("--base_dir", default="/run/media/kim/Mantu/surge_200k_models")
+    parser.add_argument("--midi_dir", default="/run/media/kim/Mantu/surge_200k_models/real_stems_eval/midi_muscriptor")
     parser.add_argument("--temps", nargs="+", default=["t03", "t05", "t07", "t085", "t10"])
     parser.add_argument("--kinds", nargs="+", default=["ema", "online"])
     parser.add_argument("--out", default="/home/kim/Documents/Surge_All_Arms_Evaluation.dawproject")

@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-BASE_OUT="/run/media/kim/Mantu2/surge_200k_models"
+BASE_OUT="/run/media/kim/Mantu/surge_200k_models"
 SUITE_LOG="$BASE_OUT/suite_a0_a3_prime.log"
 mkdir -p "$BASE_OUT"
 

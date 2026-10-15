@@ -104,17 +104,17 @@ parity lines; seeds, `num_workers`, steps completed and resumes per run; which w
 ```
 # T0 + T1 (training machine; renders on CPU, scores on the GPU)
 python scripts/synth_inversion/heldout_eval_v4.py \
-    --run A1=/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1 \
-    --run A2=/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a2 \
-    --run A3=/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a3 \
+    --run A1=/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1 \
+    --run A2=/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a2 \
+    --run A3=/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a3 \
     --kinds sf online ema --tag latest --extra_n 2048 \
-    --out /run/media/kim/Mantu2/surge_200k_models/eval_v4 --device cuda:0
-python scripts/synth_inversion/compare_runs_v4.py --dir /run/media/kim/Mantu2/surge_200k_models/eval_v4 \
+    --out /run/media/kim/Mantu/surge_200k_models/eval_v4 --device cuda:0
+python scripts/synth_inversion/compare_runs_v4.py --dir /run/media/kim/Mantu/surge_200k_models/eval_v4 \
     --plan scripts/synth_inversion/eval_plan_v4_aseries.json
 
 # T2 on the existing A1 multi-tau output (re-render after the P8 fix first)
 python scripts/synth_inversion/stem_compare_v4.py --multitemp \
-    /run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps/results.json \
+    /run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps/results.json \
     --metric mss --baseline ema/tau1.00/raw --select "ema_tau=ema/tau" --select "online_tau=online/tau"
 ```
 

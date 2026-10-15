@@ -75,11 +75,11 @@ def format_tau_tag(tau: float) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--a1_dir", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1")
     parser.add_argument("--out_dir", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_bass_v3_a1/eval_cpu_muscriptor_temps")
     parser.add_argument("--midi_dir", type=str,
-                        default="/run/media/kim/Mantu2/surge_200k_models/real_stems_eval/midi_muscriptor")
+                        default="/run/media/kim/Mantu/surge_200k_models/real_stems_eval/midi_muscriptor")
     parser.add_argument("--temps", type=float, nargs="+", default=[0.15, 0.3, 0.5, 0.7, 1.0])
     args = parser.parse_args()
 
