@@ -44,6 +44,7 @@ from .routing import (
     infer_attention_dim,
 )
 from .protocols import NormConstraint, Preconditioner
+from .grad_noise import GradNoiseMeter
 
 __all__ = [
     # Core optimizer
@@ -75,4 +76,6 @@ __all__ = [
     # Protocols
     "NormConstraint",
     "Preconditioner",
+    # Half-batch gradient-noise meter (C6)
+    "GradNoiseMeter",
 ]
