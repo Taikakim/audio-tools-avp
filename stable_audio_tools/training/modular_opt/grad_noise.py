@@ -125,3 +125,94 @@ class GradNoiseMeter:
             with open(self.out_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec) + "\n")
         return out
+
+
+# ---------------------------------------------------------------------------------------------------
+# Direction-resolved agreement (test plan section P; KUANG 2026-10-17)
+# ---------------------------------------------------------------------------------------------------
+DEFAULT_BANDS = ((0, 1), (1, 4), (4, 16), (16, 32))
+
+
+def momentum_basis(M: Tensor, k: int = 32) -> dict:
+    """Singular basis of a (pre-polar) momentum matrix M = U S V^T, top k kept.
+
+    Use a momentum built from batches that are NOT the ones being compared (a third sample group, or the
+    saved optimizer momentum), so the directions are not selected on the gradients they are tested with.
+    """
+    U, S, Vh = torch.linalg.svd(M.float(), full_matrices=False)
+    k = min(k, S.numel())
+    return {"U": U[:, :k], "S": S, "V": Vh[:k].T, "k": k}
+
+
+def _band_block(G: Tensor, U: Tensor, V: Tensor) -> Tensor:
+    return U.T @ G @ V
+
+
+@torch.no_grad()
+def direction_agreement(gA: Tensor, gB: Tensor, basis: dict, bands=DEFAULT_BANDS, gap_tol: float = 0.05) -> dict:
+    """Compare two independent gradients (each a mean over its own samples) on a FIXED momentum basis.
+
+    Per band of ranks [lo, hi) the band block C = U_b^T G V_b is compared as a whole (cosine of the two
+    blocks). That cosine is invariant to rotations inside the band, so near-degenerate singular vectors
+    inside a band need no identification; a band EDGE between near-equal singular values is flagged
+    (edge_ratio = S[lo-1] / S[lo] < 1 + gap_tol) because the split there is unstable.
+    Also per band: share of each gradient's energy, and `agree_momentum` = fraction of the band's ranks
+    whose diagonal coefficient u_i^T G v_i is positive for BOTH gradients (the momentum's descent
+    direction -u_i v_i^T then lowers both losses; SAMuon appendix I's sign alignment).
+    `residual` = everything outside the top-k subspace pair, G - U_k U_k^T G V_k V_k^T, labelled as such:
+    it is the bulk beyond rank k, not measured direction by direction.
+    """
+    gA = gA.float()
+    gB = gB.float()
+    U, V, S, k = basis["U"].to(gA.device), basis["V"].to(gA.device), basis["S"].to(gA.device), basis["k"]
+    eA, eB = float((gA * gA).sum()), float((gB * gB).sum())
+    out = {}
+    for lo, hi in bands:
+        if lo >= k:
+            continue
+        hi = min(hi, k)
+        cA = _band_block(gA, U[:, lo:hi], V[:, lo:hi])
+        cB = _band_block(gB, U[:, lo:hi], V[:, lo:hi])
+        nA, nB = float(cA.norm()), float(cB.norm())
+        dA, dB = torch.diagonal(cA), torch.diagonal(cB)
+        edge = float(S[lo - 1] / S[lo].clamp_min(1e-30)) if lo > 0 else float("inf")
+        out[f"r{lo + 1}-{hi}"] = {
+            "cos": float((cA * cB).sum()) / max(nA * nB, 1e-30),
+            "energy_A": nA * nA / max(eA, 1e-30),
+            "energy_B": nB * nB / max(eB, 1e-30),
+            "agree_momentum": float(((dA > 0) & (dB > 0)).float().mean()),
+            "sign_agree": float((torch.sign(dA) == torch.sign(dB)).float().mean()),
+            "edge_ratio": edge,
+            "edge_unstable": bool(edge < 1.0 + gap_tol),
+        }
+    Uk, Vk = U[:, :k], V[:, :k]
+    rA = gA - Uk @ (Uk.T @ gA @ Vk) @ Vk.T
+    rB = gB - Uk @ (Uk.T @ gB @ Vk) @ Vk.T
+    nA, nB = float(rA.norm()), float(rB.norm())
+    out["residual"] = {"cos": float((rA * rB).sum()) / max(nA * nB, 1e-30),
+                       "energy_A": nA * nA / max(eA, 1e-30), "energy_B": nB * nB / max(eB, 1e-30),
+                       "beyond_rank": k}
+    return out
+
+
+@torch.no_grad()
+def momentum_spectra(opt, named_params: Iterable[tuple[str, Tensor]], k: int = 32) -> list[dict]:
+    """Singular values of the optimizer's pre-polar momentum buffers (reading only; nothing is mutated).
+
+    Returns per matrix: top-k singular values normalised by the largest, stable rank ||M||_F^2 / s_1^2, and
+    the top-1 energy share. This is the spectrum BEFORE Newton-Schulz; the update's own spectrum is flat
+    by construction (up to NorMuon's row scaling) and says nothing about the gradient's information.
+    """
+    rows = []
+    for name, p in named_params:
+        st = opt.state.get(p) if hasattr(opt, "state") else None
+        m = None if not st else st.get("momentum", st.get("m"))
+        if m is None or m.ndim != 2:
+            continue
+        s = torch.linalg.svdvals(m.float())
+        if s.numel() == 0 or float(s[0]) == 0.0:
+            continue
+        e = float((s * s).sum())
+        rows.append({"name": name, "shape": list(m.shape), "s_top": (s[:k] / s[0]).tolist(),
+                     "stable_rank": e / float(s[0] ** 2), "top1_energy": float(s[0] ** 2) / e})
+    return rows

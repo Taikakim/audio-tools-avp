@@ -259,6 +259,9 @@ class ModularOptimizer(Optimizer):
         # parameters (fp32 master copy; the bf16 parameter is written from it each step, as FusionOpt
         # does). For bf16 adapters this keeps the steps that bf16 storage rounds away (TRAINING.md F21).
         state_dtype: str = "param",
+        # ns_batch: run the Newton-Schulz of all same-shape spectral matrices of a group as one batched call
+        # (speed; same per-matrix arithmetic up to floating-point reassociation). Default off.
+        ns_batch: bool = False,
         # Global
         eps: float = 1e-12,
     ):
@@ -311,6 +314,7 @@ class ModularOptimizer(Optimizer):
             adam_eps=adam_eps,
             adam_momentum=adam_momentum,
             state_dtype=state_dtype,
+            ns_batch=ns_batch,
             eps=eps,
         )
         super().__init__(params, defaults)
@@ -526,17 +530,8 @@ class ModularOptimizer(Optimizer):
     # Per-group 6-stage pipeline
     # ------------------------------------------------------------------
 
-    def _spectral_sign_direction(self, state, grad, group, group_type, lmo, radius, n_blocks, beta1,
-                                 whitening, normuon_enabled, normuon_beta, eps):
-        """Stages 1-4 for the spectral / sign / colnorm groups. Returns (d_k, M, M_lmo).
-
-        With every C-series option at its default this is the historical inline code, unchanged.
-        """
-        normuon_mode = group.get("normuon_mode", "row_unit")
-        update_scale = group.get("update_scale", "native")
-        after_unwhiten = group.get("normuon_after_unwhiten", False)
-        is_spectral_2d = group_type == "spectral" and grad.ndim == 2
-
+    def _momentum_whiten(self, state, grad, beta1, whitening):
+        """Stages 1-2 (momentum, forward whitening). Pushes the pullback onto the state's LIFO stack."""
         # ── Stage 1: Momentum Accumulation ───────────────────────
         momentum = state["momentum"]
         momentum.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
@@ -560,11 +555,75 @@ class ModularOptimizer(Optimizer):
                     name=preconditioner.name,
                     inverse_fn=preconditioner.inverse_transform,
                 )
+        return d_k
+
+    def _batched_spectral_lmo(self, group, lmo) -> dict:
+        """ns_batch=True (KUANG 2026-10-17): run Stages 1-2 for every spectral parameter of the group, then the
+        Newton-Schulz of all same-shape matrices (and same-shape QKV/AdaLN blocks) as ONE batched call.
+        Returns {param: (d_k, M or None)}; M is None where the per-matrix path must still run (non-2-D).
+        The arithmetic per matrix is the per-matrix LMO's; only the call pattern changes.
+        """
+        from .lmo import newton_schulz_batched
+        param_names = group.get("param_names", [])
+        radii = group.get("radii", [])
+        blocks = group.get("blocks", [])
+        whitening = group.get("whitening", "none")
+        dion = group.get("normuon_mode", "row_unit") == "dion"
+        pre, items = {}, {}
+        for i, p in enumerate(group["params"]):
+            if p.grad is None:
+                continue
+            grad = p.grad
+            if group.get("state_dtype", "param") == "fp32" and p.dtype != torch.float32:
+                grad = grad.float()
+            state = self.state[p]
+            if len(state) == 0:
+                self._init_state(state, p, group, whitening)
+            d_k = self._momentum_whiten(state, grad, group["beta1"], whitening)
+            pre[p] = [d_k, None]
+            if d_k.ndim != 2:
+                continue
+            nb = blocks[i] if i < len(blocks) else 1
+            nb = nb if nb > 1 else 1
+            r = 1.0 if dion else (radii[i] if i < len(radii) else 1.0)
+            bs = d_k.shape[0] // nb
+            for b in range(nb):
+                sub = d_k[b * bs:(b + 1) * bs] if nb > 1 else d_k
+                items.setdefault((tuple(sub.shape), sub.dtype), []).append((p, b, nb, r, sub))
+        out_blocks: dict = {}
+        for _key, lst in items.items():
+            ortho = newton_schulz_batched(torch.stack([it[4] for it in lst]), algorithm=lmo.algorithm,
+                                          steps=lmo.steps, eps=lmo.eps, compute_dtype=lmo.compute_dtype)
+            for j, (p, b, nb, r, _sub) in enumerate(lst):
+                out_blocks.setdefault(p, [None] * nb)[b] = r * ortho[j]
+        for p, bl in out_blocks.items():
+            pre[p][1] = bl[0] if len(bl) == 1 else torch.cat(bl, dim=0)
+        return pre
+
+    def _spectral_sign_direction(self, state, grad, group, group_type, lmo, radius, n_blocks, beta1,
+                                 whitening, normuon_enabled, normuon_beta, eps, pre=None):
+        """Stages 1-4 for the spectral / sign / colnorm groups. Returns (d_k, M, M_lmo).
+
+        With every C-series option at its default this is the historical inline code, unchanged.
+        `pre` = (d_k, M) from _batched_spectral_lmo: Stages 1-2 (and Stage 3 when M is not None) are done.
+        """
+        normuon_mode = group.get("normuon_mode", "row_unit")
+        update_scale = group.get("update_scale", "native")
+        after_unwhiten = group.get("normuon_after_unwhiten", False)
+        is_spectral_2d = group_type == "spectral" and grad.ndim == 2
+
+        if pre is None:
+            d_k = self._momentum_whiten(state, grad, beta1, whitening)
+        else:
+            d_k = pre[0]
+        stack = state["stack"]
 
         # ── Stage 3: Core LMO Solver with Block Splitting ────────
         # dion mode takes dion's own lr rule (sqrt(d_out/d_in), applied below), so the radius is 1 here.
         lmo_radius = 1.0 if (is_spectral_2d and normuon_mode == "dion") else radius
-        if n_blocks > 1 and d_k.ndim == 2:
+        if pre is not None and pre[1] is not None:
+            M = pre[1]
+        elif n_blocks > 1 and d_k.ndim == 2:
             # Block-aware splitting (QKV or AdaLN)
             block_size = d_k.shape[0] // n_blocks
             lmo_blocks = []
@@ -650,6 +709,8 @@ class ModularOptimizer(Optimizer):
         sf_beta = group.get("sf_beta", 0.9)
 
         lmo = _get_lmo(group_type, ns_poly, group.get("ns_dtype", "fp32"))
+        pre_all = (self._batched_spectral_lmo(group, lmo)
+                   if group.get("ns_batch", False) and group_type == "spectral" else {})
 
         for i, p in enumerate(group["params"]):
             if p.grad is None:
@@ -682,7 +743,7 @@ class ModularOptimizer(Optimizer):
             else:
                 d_k, M, M_lmo = self._spectral_sign_direction(
                     state, grad, group, group_type, lmo, radius, n_blocks, beta1, whitening,
-                    normuon_enabled, normuon_beta, eps)
+                    normuon_enabled, normuon_beta, eps, pre=pre_all.get(p))
 
             # ── Stage 5: Prodigy Escape Velocity + SNR Gate ──────────
             ev_mult = 1.0

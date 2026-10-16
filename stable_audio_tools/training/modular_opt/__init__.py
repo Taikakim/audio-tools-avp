@@ -44,7 +44,7 @@ from .routing import (
     infer_attention_dim,
 )
 from .protocols import NormConstraint, Preconditioner
-from .grad_noise import GradNoiseMeter
+from .grad_noise import GradNoiseMeter, momentum_basis, direction_agreement, momentum_spectra
 
 __all__ = [
     # Core optimizer
@@ -78,4 +78,7 @@ __all__ = [
     "Preconditioner",
     # Half-batch gradient-noise meter (C6)
     "GradNoiseMeter",
+    "momentum_basis",
+    "direction_agreement",
+    "momentum_spectra",
 ]

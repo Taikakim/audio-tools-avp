@@ -303,3 +303,104 @@ def test_fp32_state_survives_resume():
     for k in ("momentum", "z", "x"):
         assert opt2.state[w2][k].dtype == torch.float32
         assert torch.equal(opt2.state[w2][k], opt.state[w][k])
+
+
+# ns_batch -----------------------------------------------------------------------------------------
+def _batch_model():
+    torch.manual_seed(0)
+    m = nn.Module()
+    m.a1, m.a2, m.a3 = nn.Linear(64, 64), nn.Linear(64, 64), nn.Linear(64, 64)  # one shape, batched together
+    m.up, m.down = nn.Linear(64, 256), nn.Linear(256, 64)                       # tall, wide
+    m.blk = nn.Module()
+    m.blk.to_qkv = nn.Linear(64, 192)                                           # 3 QKV blocks of 64x64
+    m.blk.to_out = nn.Linear(64, 64)
+    m.norm = nn.LayerNorm(64)
+    return m
+
+
+@pytest.mark.parametrize("kw", [dict(), dict(default_whitening="shampoo"), dict(normuon_mode="dion"),
+                                dict(update_scale="rms0.2"), dict(ns_poly="cubic5"), dict(schedule_free=False),
+                                dict(normuon=False)])
+def test_ns_batch_matches_per_matrix(kw):
+    kw = dict(kw)
+    wh = kw.pop("default_whitening", "none")
+    ma, mb = _batch_model(), _batch_model()
+    oa = ModularOptimizer(build_modular_param_groups(ma, default_whitening=wh), lr=1e-2, **kw)
+    ob = ModularOptimizer(build_modular_param_groups(mb, default_whitening=wh), lr=1e-2, ns_batch=True, **kw)
+    gen = torch.Generator().manual_seed(4)
+    for _ in range(15):
+        for pa, pb in zip(ma.parameters(), mb.parameters()):
+            g = torch.randn(pa.shape, generator=gen)
+            pa.grad, pb.grad = g.clone(), g.clone()
+        oa.step()
+        ob.step()
+    for pa, pb in zip(ma.parameters(), mb.parameters()):
+        assert torch.allclose(pa, pb, rtol=1e-5, atol=1e-6)
+
+
+def test_ns_batch_with_bf16_params_and_fp32_state():
+    ma, mb = _batch_model().to(torch.bfloat16), _batch_model().to(torch.bfloat16)
+    oa = ModularOptimizer(build_modular_param_groups(ma), lr=1e-3, state_dtype="fp32", ns_dtype="bf16")
+    ob = ModularOptimizer(build_modular_param_groups(mb), lr=1e-3, state_dtype="fp32", ns_dtype="bf16", ns_batch=True)
+    gen = torch.Generator().manual_seed(5)
+    for _ in range(10):
+        for pa, pb in zip(ma.parameters(), mb.parameters()):
+            g = torch.randn(pa.shape, generator=gen).to(torch.bfloat16)
+            pa.grad, pb.grad = g.clone(), g.clone()
+        oa.step()
+        ob.step()
+    for pa, pb in zip(ma.parameters(), mb.parameters()):
+        za, zb = oa.state[pa].get("z"), ob.state[pb].get("z")
+        if za is not None:
+            assert torch.allclose(za, zb, rtol=1e-3, atol=1e-5)
+
+
+# direction agreement / momentum spectra ----------------------------------------------------------
+def test_direction_agreement_signal_vs_noise():
+    """A shared signal in the top direction plus independent noise: rank 1 agrees strongly between two
+    independent gradients, the residual bulk (pure noise) does not."""
+    from stable_audio_tools.training.modular_opt import direction_agreement, momentum_basis
+    torch.manual_seed(0)
+    u, v = torch.randn(64, 1), torch.randn(32, 1)
+    signal = 3.0 * (u @ v.T) / (u.norm() * v.norm())
+    M = signal + 0.05 * torch.randn(64, 32)                 # momentum from a third sample group
+    basis = momentum_basis(M, k=8)
+    gA = signal + 0.02 * torch.randn(64, 32)
+    gB = signal + 0.02 * torch.randn(64, 32)
+    out = direction_agreement(gA, gB, basis, bands=((0, 1), (1, 8)))
+    assert out["r1-1"]["cos"] > 0.99 and out["r1-1"]["agree_momentum"] == 1.0
+    assert abs(out["residual"]["cos"]) < 0.2
+    assert out["residual"]["beyond_rank"] == 8
+
+
+def test_direction_agreement_band_is_rotation_invariant():
+    """Two (near-)equal singular values form one band: the band cosine must not depend on how the
+    degenerate pair is rotated."""
+    from stable_audio_tools.training.modular_opt import direction_agreement
+    torch.manual_seed(1)
+    U, _ = torch.linalg.qr(torch.randn(16, 4))
+    V, _ = torch.linalg.qr(torch.randn(12, 4))
+    S = torch.tensor([2.0, 1.0, 1.0, 0.5])
+    gA, gB = torch.randn(16, 12), torch.randn(16, 12)
+    c = torch.tensor(0.6)
+    R = torch.eye(4)
+    R[1:3, 1:3] = torch.tensor([[c, -(1 - c * c).sqrt()], [(1 - c * c).sqrt(), c]])
+    a = direction_agreement(gA, gB, {"U": U, "V": V, "S": S, "k": 4}, bands=((0, 1), (1, 3), (3, 4)))
+    b = direction_agreement(gA, gB, {"U": U @ R, "V": V @ R, "S": S, "k": 4}, bands=((0, 1), (1, 3), (3, 4)))
+    assert a["r2-3"]["cos"] == pytest.approx(b["r2-3"]["cos"], abs=1e-6)
+    assert a["r2-3"]["edge_unstable"] is False and a["r4-4"]["edge_ratio"] == pytest.approx(2.0)
+
+
+def test_momentum_spectra_reads_without_mutating():
+    from stable_audio_tools.training.modular_opt import momentum_spectra
+    m = _scalar_model()
+    opt = ModularOptimizer(build_modular_param_groups(m), lr=1e-2)
+    for p in m.parameters():
+        p.grad = torch.randn_like(p)
+    opt.step()
+    before = {k: v.clone() for k, v in opt.state[m.lin.weight].items() if torch.is_tensor(v)}
+    rows = momentum_spectra(opt, m.named_parameters(), k=4)
+    assert [r["name"] for r in rows] == ["lin.weight"]
+    assert rows[0]["s_top"][0] == pytest.approx(1.0) and 1.0 <= rows[0]["stable_rank"] <= 64
+    for k, v in before.items():
+        assert torch.equal(v, opt.state[m.lin.weight][k])

@@ -160,6 +160,45 @@ def newton_schulz_polar_express(
     return X.to(G.dtype)
 
 
+def newton_schulz_batched(
+    G: Tensor,
+    algorithm: str = "quintic",
+    steps: int = 5,
+    eps: float = 1e-12,
+    compute_dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Newton-Schulz on a stack of same-shape matrices G[b, m, n] in one call (KUANG 2026-10-17).
+
+    The per-matrix arithmetic of newton_schulz_quintic / _cubic5 / _cubic (each matrix normalised by
+    its OWN Frobenius norm), batched so a step issues one kernel per matrix product for every matrix
+    of that shape instead of one per matrix (microsoft/dion's megabatching idea, single-GPU form).
+    Results equal the per-matrix functions up to floating-point reassociation.
+    """
+    X = G.to(compute_dtype)
+    X = X / (X.flatten(1).norm(dim=1).view(-1, 1, 1) + eps)
+    transposed = X.shape[-2] > X.shape[-1]
+    if transposed:
+        X = X.transpose(-1, -2).contiguous()
+    if algorithm == "cubic5":
+        for a, b in _CUBIC5_COEFFS:
+            A = torch.bmm(X, X.transpose(-1, -2).contiguous())
+            X = torch.baddbmm(X, A, X, alpha=b, beta=a)
+    elif algorithm == "cubic":
+        for _ in range(steps):
+            A = X @ X.transpose(-1, -2)
+            X = 1.5 * X - 0.5 * (A @ X)
+    else:
+        a, b, c = 3.4445, -4.7750, 2.0315
+        for _ in range(steps):
+            A = X @ X.transpose(-1, -2)
+            AA = A @ A
+            B = b * A + c * AA
+            X = a * X + B @ X
+    if transposed:
+        X = X.transpose(-1, -2)
+    return X.to(G.dtype)
+
+
 def spectral_hardcap(
     X: Tensor,
     beta: float = 1.0,
