@@ -94,8 +94,16 @@ def build_modular_param_groups(
     force_sign: Iterable[str] = (),
     lora_a_lr_mult: float = 1.0,
     spectral_all: bool = False,
+    scalar_opt: str = "sign",
+    scalar_sf_beta: float | None = None,
 ) -> list[dict]:
     """Group model parameters according to Role-Based Norm Assignment.
+
+    scalar_opt (C3, KUANG 2026-10-17): "sign" (historical) or "adam". With "adam" every parameter the
+    rules below send to the sign group (1-D gains/biases/magnitudes, output head, AdaLN emitters) is
+    stepped by element-wise Adam instead (group_type="adam"), as the published SF-NorMuon recipe runs
+    them on Schedule-Free AdamW. sign_lr / sign_wd still set that group's lr / wd. scalar_sf_beta sets
+    its Schedule-Free interpolation (the paper uses 0.95 for these, 0.9 for matrices).
 
     Routing Rules:
     - Input Embeddings -> ColNorm
@@ -110,6 +118,8 @@ def build_modular_param_groups(
 
     Returns a list of param group dicts suitable for ModularOptimizer.
     """
+    if scalar_opt not in ("sign", "adam"):
+        raise ValueError(f"scalar_opt must be 'sign' or 'adam', got {scalar_opt!r}")
     named_trainable = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     attn_dim = infer_attention_dim(named_trainable) if split_qkv else None
     force_sign_pats = [re.compile(pat) for pat in force_sign]
@@ -193,7 +203,7 @@ def build_modular_param_groups(
     # 3. Sign Group (Output, AdaLN, 1D, Biases)
     if groups_dict["sign"]["params"]:
         g = {
-            "group_type": "sign",
+            "group_type": "adam" if scalar_opt == "adam" else "sign",
             "params": groups_dict["sign"]["params"],
             "param_names": groups_dict["sign"]["param_names"],
             "radii": groups_dict["sign"]["radii"],
@@ -204,6 +214,8 @@ def build_modular_param_groups(
         }
         if sign_lr is not None:
             g["lr"] = sign_lr
+        if scalar_sf_beta is not None:
+            g["sf_beta"] = scalar_sf_beta
         param_groups.append(g)
 
     return param_groups

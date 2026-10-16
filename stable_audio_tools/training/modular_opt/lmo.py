@@ -23,13 +23,14 @@ def newton_schulz_cubic(
     G: Tensor,
     steps: int = 5,
     eps: float = 1e-12,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     r"""Cubic Newton-Schulz orthogonalization: X_{t+1} = 1.5 * X_t - 0.5 * X_t @ X_t^T @ X_t.
 
     Guaranteed convergence when all singular values of X_0 lie in (0, \sqrt{3}).
     Initializing X_0 = G / (||G||_F + eps) ensures singular values lie in (0, 1] < \sqrt{3}.
     """
-    X = G.float()
+    X = G.to(compute_dtype)
     norm = X.norm() + eps
     X = X / norm
 
@@ -52,13 +53,14 @@ def newton_schulz_quintic(
     G: Tensor,
     steps: int = 5,
     eps: float = 1e-12,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     """Quintic Newton-Schulz orthogonalization (Muon NS5).
 
     Coefficients (3.4445, -4.7750, 2.0315) pull singular values rapidly into [0.7, 1.3].
     """
     a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.float()
+    X = G.to(compute_dtype)
     norm = X.norm() + eps
     X = X / norm
 
@@ -90,6 +92,7 @@ _CUBIC5_COEFFS = [
 def newton_schulz_cubic5(
     G: Tensor,
     eps: float = 1e-12,
+    compute_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     """Relaxed cubic Newton-Schulz orthogonalization (arXiv:2606.00371).
 
@@ -97,7 +100,7 @@ def newton_schulz_cubic5(
     multiplication (A @ A), reducing per-step matmuls from 3 to 2 (33% FLOP/memory
     traffic savings) and eliminating hipblasLt issues on ROCm.
     """
-    X = G.float()
+    X = G.to(compute_dtype)
     norm = X.norm() + eps
     X = X / norm
 
@@ -154,6 +157,45 @@ def newton_schulz_polar_express(
     if transposed:
         X = X.transpose(-1, -2)
 
+    return X.to(G.dtype)
+
+
+def newton_schulz_batched(
+    G: Tensor,
+    algorithm: str = "quintic",
+    steps: int = 5,
+    eps: float = 1e-12,
+    compute_dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Newton-Schulz on a stack of same-shape matrices G[b, m, n] in one call (KUANG 2026-10-17).
+
+    The per-matrix arithmetic of newton_schulz_quintic / _cubic5 / _cubic (each matrix normalised by
+    its OWN Frobenius norm), batched so a step issues one kernel per matrix product for every matrix
+    of that shape instead of one per matrix (microsoft/dion's megabatching idea, single-GPU form).
+    Results equal the per-matrix functions up to floating-point reassociation.
+    """
+    X = G.to(compute_dtype)
+    X = X / (X.flatten(1).norm(dim=1).view(-1, 1, 1) + eps)
+    transposed = X.shape[-2] > X.shape[-1]
+    if transposed:
+        X = X.transpose(-1, -2).contiguous()
+    if algorithm == "cubic5":
+        for a, b in _CUBIC5_COEFFS:
+            A = torch.bmm(X, X.transpose(-1, -2).contiguous())
+            X = torch.baddbmm(X, A, X, alpha=b, beta=a)
+    elif algorithm == "cubic":
+        for _ in range(steps):
+            A = X @ X.transpose(-1, -2)
+            X = 1.5 * X - 0.5 * (A @ X)
+    else:
+        a, b, c = 3.4445, -4.7750, 2.0315
+        for _ in range(steps):
+            A = X @ X.transpose(-1, -2)
+            AA = A @ A
+            B = b * A + c * AA
+            X = a * X + B @ X
+    if transposed:
+        X = X.transpose(-1, -2)
     return X.to(G.dtype)
 
 
@@ -263,10 +305,15 @@ class SpectralLMO(NormConstraint):
         algorithm: Literal["cubic", "quintic", "cubic5"] = "quintic",
         steps: int = 5,
         eps: float = 1e-12,
+        compute_dtype: torch.dtype = torch.float32,
     ) -> None:
         self.algorithm = algorithm
         self.steps = steps
         self.eps = eps
+        # dtype of the Newton-Schulz iteration only (C7, KUANG 2026-10-17). The result is cast back to
+        # the gradient's dtype. bf16 here is what dion and FusionOpt (hot_dtype="bf16") do; rounding
+        # matters where small updates are ADDED to weights, not inside the orthogonalisation.
+        self.compute_dtype = compute_dtype
 
     def compute_lmo(self, gradient: Tensor, radius: float = 1.0) -> Tensor:
         r"""Semi-orthogonal projection via iterative Newton-Schulz solver.
@@ -281,12 +328,13 @@ class SpectralLMO(NormConstraint):
         if gradient.ndim != 2:
             raise ValueError(f"SpectralLMO requires a 2D matrix, got shape {gradient.shape}")
 
+        cd = self.compute_dtype
         if self.algorithm == "cubic5":
-            ortho = newton_schulz_cubic5(gradient, eps=self.eps)
+            ortho = newton_schulz_cubic5(gradient, eps=self.eps, compute_dtype=cd)
         elif self.algorithm == "cubic":
-            ortho = newton_schulz_cubic(gradient, steps=self.steps, eps=self.eps)
+            ortho = newton_schulz_cubic(gradient, steps=self.steps, eps=self.eps, compute_dtype=cd)
         else:
-            ortho = newton_schulz_quintic(gradient, steps=self.steps, eps=self.eps)
+            ortho = newton_schulz_quintic(gradient, steps=self.steps, eps=self.eps, compute_dtype=cd)
 
         return radius * ortho
 

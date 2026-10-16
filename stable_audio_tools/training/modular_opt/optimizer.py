@@ -47,8 +47,20 @@ _SPECTRAL_LMO_CUBIC5 = SpectralLMO(algorithm="cubic5", steps=5)
 _SPECTRAL_LMO_CUBIC = SpectralLMO(algorithm="cubic", steps=12)
 
 
-def _get_lmo(group_type: str, ns_poly: str = "quintic") -> SignLMO | SpectralLMO | ColNormLMO:
+_NS_DTYPES = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
+_SPECTRAL_LMO_CACHE: dict[tuple[str, str], SpectralLMO] = {}
+
+
+def _get_lmo(group_type: str, ns_poly: str = "quintic", ns_dtype: str = "fp32") -> SignLMO | SpectralLMO | ColNormLMO:
     """Return the appropriate LMO for a parameter group type."""
+    if group_type == "spectral" and ns_dtype != "fp32":
+        # C7 (KUANG 2026-10-17): Newton-Schulz in bf16/fp16; fp32 keeps the singletons below.
+        key = (ns_poly, ns_dtype)
+        if key not in _SPECTRAL_LMO_CACHE:
+            algo = ns_poly if ns_poly in ("cubic5", "quintic") else "cubic"
+            _SPECTRAL_LMO_CACHE[key] = SpectralLMO(algorithm=algo, steps=12 if algo == "cubic" else 5,
+                                                   compute_dtype=_NS_DTYPES[ns_dtype])
+        return _SPECTRAL_LMO_CACHE[key]
     if group_type == "spectral":
         if ns_poly == "cubic5":
             return _SPECTRAL_LMO_CUBIC5
@@ -87,6 +99,76 @@ def _magnitude_step(t: Tensor, M: Tensor, step: float, group: dict, name: str) -
         t.mul_(torch.exp(M.to(t.dtype) * (-step)))
     else:
         t.add_(M, alpha=-step)
+
+
+def _normuon_rows(M: Tensor, state: dict, mode: str, beta: float, step_count: int, eps: float,
+                  n_blocks: int = 1) -> Tensor:
+    """Stage 3b, NorMuon per-neuron row scaling, in one of two forms (C2, KUANG 2026-10-17).
+
+    "row_unit" (the historical form, bit-identical): every row is divided by the square root of a
+    bias-corrected EMA of its SUM of squares, so rows come out unit length and the matrix's total size
+    is not restored. Same step size as dion on square/tall matrices; sqrt(d_in/d_out) larger on wide
+    ones (docs/TRAINING.md F23).
+
+    "dion" (microsoft/dion normuon.py::_normuon_normalization_core): EMA of the row MEAN square, divide,
+    then rescale to the input's Frobenius norm (per row block when the matrix is block-split, like
+    dion's split_sizes). Runs in fp32, as Dion3 section 6 found necessary.
+    """
+    if mode == "dion":
+        if "normuon_v" not in state:
+            state["normuon_v"] = torch.zeros(M.shape[0], device=M.device, dtype=torch.float32)
+        v = state["normuon_v"]
+        M32 = M.float()
+        v.lerp_((M32 * M32).mean(dim=-1), 1.0 - beta)
+        U = M32 / (v.sqrt() + 1e-8).unsqueeze(-1)
+        if n_blocks > 1 and M.shape[0] % n_blocks == 0:
+            Mb = M32.view(n_blocks, M.shape[0] // n_blocks, -1)
+            Ub = U.view_as(Mb)
+            U = (Ub * (Mb.norm(dim=(1, 2), keepdim=True)
+                       / Ub.norm(dim=(1, 2), keepdim=True).clamp_min(1e-8))).view_as(M32)
+        else:
+            U = U * (M32.norm() / U.norm().clamp_min(1e-8))
+        return U.to(M.dtype)
+    if "normuon_r" not in state:
+        state["normuon_r"] = torch.zeros(M.shape[0], device=M.device, dtype=torch.float32)
+    rn = state["normuon_r"]
+    row_ss = (M * M).sum(dim=-1).float()
+    rn.mul_(beta).add_(row_ss, alpha=(1.0 - beta))
+    bc_r = 1.0 - beta ** (step_count + 1)
+    r_hat = rn / max(bc_r, 1e-12)
+    return M / r_hat.clamp_min(eps).sqrt().unsqueeze(-1).to(M.dtype)
+
+
+def _adam_direction(state: dict, grad: Tensor, group: dict, step_count: int, sf_enabled: bool) -> Tensor:
+    """group_type="adam" (C3, KUANG 2026-10-17): element-wise Adam direction for the parameters the
+    published SF-NorMuon recipe (arXiv 2605.23061, Table 5) runs on Schedule-Free AdamW.
+
+    Under Schedule-Free there is NO momentum buffer (the y/z interpolation is the momentum, Defazio et
+    al. 2024, Alg. 2): the direction is g / (sqrt(v_hat) + eps). Without Schedule-Free it is plain Adam
+    with momentum group["adam_momentum"] (default: the group's beta1). Update RMS is a little below
+    lr per element, i.e. the scale the "rms0.2" spectral update is matched to.
+    """
+    b2 = group.get("adam_beta2", 0.99)
+    a_eps = group.get("adam_eps", 1e-8)
+    mom = group.get("adam_momentum")
+    if mom is None:
+        mom = 0.0 if sf_enabled else group["beta1"]
+    g = grad.float()
+    if "adam_v" not in state:
+        state["adam_v"] = torch.zeros_like(g)
+    v = state["adam_v"]
+    v.mul_(b2).addcmul_(g, g, value=1.0 - b2)
+    v_hat = v / (1.0 - b2 ** (step_count + 1))
+    if mom > 0:
+        if "adam_m" not in state:
+            state["adam_m"] = torch.zeros_like(g)
+        m = state["adam_m"]
+        m.mul_(mom).add_(g, alpha=1.0 - mom)
+        d = m / (1.0 - mom ** (step_count + 1))
+    else:
+        d = g
+    return (d / (v_hat.sqrt() + a_eps)).to(grad.dtype)
+
 
 class ModularOptimizer(Optimizer):
     """Modular Stage-Based Optimizer implementing the 6-stage Transform-Solve-Invert pipeline.
@@ -155,9 +237,42 @@ class ModularOptimizer(Optimizer):
         # "multiplicative" (m *= exp(-eta*M): a step in log m -- scale-relative, and m can never
         # cross zero). See _magnitude_step.
         magnitude_update: str = "additive",
+        # C-series options (KUANG 2026-10-17, docs/modular-opt-test-plan-2026-10-17.md). Every default
+        # reproduces the historical step bit-for-bit (tests/test_modular_c_series.py).
+        # normuon_mode: "row_unit" (historical) | "dion" (microsoft/dion NorMuon + spectral_norm lr).
+        normuon_mode: str = "row_unit",
+        # update_scale: "native" (radius / NorMuon decide the size) | "rms0.2" (SF-NorMuon Alg. 1 line 13:
+        # every spectral matrix's update rescaled to RMS 0.2*lr per element, Adam-matched).
+        update_scale: str = "native",
+        # normuon_after_unwhiten: run NorMuon after the Shampoo pullback, so the per-neuron equalisation
+        # is what reaches the weights (historical: before, in the whitened frame).
+        normuon_after_unwhiten: bool = False,
+        # ns_dtype: dtype of the Newton-Schulz iteration only: "fp32" | "bf16" | "fp16" (C7, WINTERMUTE).
+        ns_dtype: str = "fp32",
+        # group_type="adam" groups (routing scalar_opt="adam"): second-moment beta, eps, momentum
+        # (None = none under Schedule-Free, beta1 otherwise).
+        adam_beta2: float = 0.99,
+        adam_eps: float = 1e-8,
+        adam_momentum: float | None = None,
+        # state_dtype (C1, KUANG 2026-10-17): "param" (historical: momentum and Schedule-Free z/x in the
+        # parameter's dtype) | "fp32": optimizer state and the update arithmetic in fp32 for low-precision
+        # parameters (fp32 master copy; the bf16 parameter is written from it each step, as FusionOpt
+        # does). For bf16 adapters this keeps the steps that bf16 storage rounds away (TRAINING.md F21).
+        state_dtype: str = "param",
+        # ns_batch: run the Newton-Schulz of all same-shape spectral matrices of a group as one batched call
+        # (speed; same per-matrix arithmetic up to floating-point reassociation). Default off.
+        ns_batch: bool = False,
         # Global
         eps: float = 1e-12,
     ):
+        if state_dtype not in ("param", "fp32"):
+            raise ValueError(f"state_dtype must be 'param' or 'fp32', got {state_dtype!r}")
+        if normuon_mode not in ("row_unit", "dion"):
+            raise ValueError(f"normuon_mode must be 'row_unit' or 'dion', got {normuon_mode!r}")
+        if update_scale not in ("native", "rms0.2"):
+            raise ValueError(f"update_scale must be 'native' or 'rms0.2', got {update_scale!r}")
+        if ns_dtype not in _NS_DTYPES:
+            raise ValueError(f"ns_dtype must be one of {sorted(_NS_DTYPES)}, got {ns_dtype!r}")
         defaults = dict(
             lr=lr,
             beta1=beta1,
@@ -191,6 +306,15 @@ class ModularOptimizer(Optimizer):
             var_wd_boost=var_wd_boost,
             radial_brake=radial_brake,
             magnitude_update=magnitude_update,
+            normuon_mode=normuon_mode,
+            update_scale=update_scale,
+            normuon_after_unwhiten=normuon_after_unwhiten,
+            ns_dtype=ns_dtype,
+            adam_beta2=adam_beta2,
+            adam_eps=adam_eps,
+            adam_momentum=adam_momentum,
+            state_dtype=state_dtype,
+            ns_batch=ns_batch,
             eps=eps,
         )
         super().__init__(params, defaults)
@@ -207,9 +331,9 @@ class ModularOptimizer(Optimizer):
         # Validate groups
         for g in self.param_groups:
             gtype = g.get("group_type")
-            if gtype not in ("spectral", "sign", "colnorm"):
+            if gtype not in ("spectral", "sign", "colnorm", "adam"):
                 raise ValueError(
-                    f"ModularOptimizer param groups must set group_type='spectral'|'sign'|'colnorm', "
+                    f"ModularOptimizer param groups must set group_type='spectral'|'sign'|'colnorm'|'adam', "
                     f"got '{gtype}'"
                 )
 
@@ -227,7 +351,26 @@ class ModularOptimizer(Optimizer):
         run kept C/P/L/R on the CPU and died on the first step (tests/test_modular_resume_device.py)."""
         state_dict = dict(state_dict)
         step_count = state_dict.pop("modular_step_count", None)
+        # state_dtype="fp32": torch's load_state_dict casts every floating state tensor to the PARAMETER's
+        # dtype, which would turn the fp32 master state back into bf16 on resume. Keep the saved fp32
+        # tensors and put them back after the base class has run.
+        keep = {}
+        saved_groups = state_dict.get("param_groups", [])
+        if any(g.get("state_dtype") == "fp32" for g in saved_groups):
+            idx2p = {}
+            for sg, g in zip(saved_groups, self.param_groups):
+                for i, p in zip(sg["params"], g["params"]):
+                    idx2p[i] = p
+            for i, st in state_dict.get("state", {}).items():
+                p = idx2p.get(i)
+                if p is None or p.dtype == torch.float32:
+                    continue
+                for k, v in st.items():
+                    if torch.is_tensor(v) and v.dtype == torch.float32 and v.ndim > 0:
+                        keep[(p, k)] = v
         super().load_state_dict(state_dict)
+        for (p, k), v in keep.items():
+            self.state[p][k] = v.to(p.device).clone()
         if step_count is not None:
             self._step_count = int(step_count)
         for p, st in self.state.items():
@@ -320,10 +463,11 @@ class ModularOptimizer(Optimizer):
             "eff_wd_list": [],
             "wd_decay_list": [],
             "ck_list": [],
+            "groups": {},
         } if self._telem_on else None
 
-        for group in self.param_groups:
-            self._group_step(group, warm_factor, telem=telem)
+        for gi, group in enumerate(self.param_groups):
+            self._group_step(group, warm_factor, telem=telem, gkey=f"g{gi}_{group['group_type']}")
 
         if self._telem_on and telem and telem["n_params"] > 0:
             mom_norm = math.sqrt(telem["mom_sq"])
@@ -351,6 +495,17 @@ class ModularOptimizer(Optimizer):
                 "comp/wd_decay_factor": sum(telem["wd_decay_list"]) / len(telem["wd_decay_list"]) if telem["wd_decay_list"] else 0.0,
                 "comp/sf_ck": sum(telem["ck_list"]) / len(telem["ck_list"]) if telem["ck_list"] else 1.0,
             }
+            # C4 (KUANG 2026-10-17): per-group step size vs weight size. The pooled numbers above
+            # cannot tell a damped group from a hot one (docs/TRAINING.md F24).
+            for k, (u_sq, w_sq, n) in telem["groups"].items():
+                self._comp_telem[f"comp/{k}/update_rms"] = math.sqrt(u_sq / max(n, 1))
+                self._comp_telem[f"comp/{k}/weight_rms"] = math.sqrt(w_sq / max(n, 1))
+                self._comp_telem[f"comp/{k}/rel_update"] = math.sqrt(u_sq / max(w_sq, 1e-30))
+            fails = 0
+            for st in self.state.values():
+                pc = st.get("preconditioner") if isinstance(st, dict) else None
+                fails += int(getattr(pc, "eigh_failures", 0) or 0)
+            self._comp_telem["comp/eigh_failures"] = float(fails)
 
         # Schedule-Free: write y back to p.data for next forward pass
         if self._mode == "train":
@@ -362,7 +517,11 @@ class ModularOptimizer(Optimizer):
                     st = self.state.get(p)
                     if st is None or "z" not in st:
                         continue
-                    p.data.copy_(st["z"]).mul_(1.0 - sf_beta).add_(st["x"], alpha=sf_beta)
+                    if st["z"].dtype != p.dtype:
+                        # state_dtype="fp32": form y in fp32, round once into the bf16 parameter
+                        p.data.copy_(st["z"].mul(1.0 - sf_beta).add_(st["x"], alpha=sf_beta))
+                    else:
+                        p.data.copy_(st["z"]).mul_(1.0 - sf_beta).add_(st["x"], alpha=sf_beta)
 
         self._step_count += 1
         return loss
@@ -371,7 +530,158 @@ class ModularOptimizer(Optimizer):
     # Per-group 6-stage pipeline
     # ------------------------------------------------------------------
 
-    def _group_step(self, group: dict, warm_factor: float, telem: dict | None = None) -> None:
+    def _momentum_whiten(self, state, grad, beta1, whitening):
+        """Stages 1-2 (momentum, forward whitening). Pushes the pullback onto the state's LIFO stack."""
+        # ── Stage 1: Momentum Accumulation ───────────────────────
+        momentum = state["momentum"]
+        momentum.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
+        # Bias-corrected momentum direction
+        bc1 = 1.0 - beta1 ** (self._step_count + 1)
+        d_k = momentum / bc1
+
+        # ── Stage 2: Forward Whitening ───────────────────────────
+        stack = state["stack"]
+        stack.clear()  # Safety: ensure clean stack each step
+
+        preconditioner = state.get("preconditioner")
+        if preconditioner is not None and whitening != "none":
+            # Update covariance accumulators from raw gradient
+            if grad.ndim == 2:
+                preconditioner.update_accumulators(grad)
+                # Forward transform (whitening)
+                d_k = preconditioner.transform(d_k)
+                # Push inverse onto LIFO stack
+                stack.push(
+                    name=preconditioner.name,
+                    inverse_fn=preconditioner.inverse_transform,
+                )
+        return d_k
+
+    def _batched_spectral_lmo(self, group, lmo) -> dict:
+        """ns_batch=True (KUANG 2026-10-17): run Stages 1-2 for every spectral parameter of the group, then the
+        Newton-Schulz of all same-shape matrices (and same-shape QKV/AdaLN blocks) as ONE batched call.
+        Returns {param: (d_k, M or None)}; M is None where the per-matrix path must still run (non-2-D).
+        The arithmetic per matrix is the per-matrix LMO's; only the call pattern changes.
+        """
+        from .lmo import newton_schulz_batched
+        param_names = group.get("param_names", [])
+        radii = group.get("radii", [])
+        blocks = group.get("blocks", [])
+        whitening = group.get("whitening", "none")
+        dion = group.get("normuon_mode", "row_unit") == "dion"
+        pre, items = {}, {}
+        for i, p in enumerate(group["params"]):
+            if p.grad is None:
+                continue
+            grad = p.grad
+            if group.get("state_dtype", "param") == "fp32" and p.dtype != torch.float32:
+                grad = grad.float()
+            state = self.state[p]
+            if len(state) == 0:
+                self._init_state(state, p, group, whitening)
+            d_k = self._momentum_whiten(state, grad, group["beta1"], whitening)
+            pre[p] = [d_k, None]
+            if d_k.ndim != 2:
+                continue
+            nb = blocks[i] if i < len(blocks) else 1
+            nb = nb if nb > 1 else 1
+            r = 1.0 if dion else (radii[i] if i < len(radii) else 1.0)
+            bs = d_k.shape[0] // nb
+            for b in range(nb):
+                sub = d_k[b * bs:(b + 1) * bs] if nb > 1 else d_k
+                items.setdefault((tuple(sub.shape), sub.dtype), []).append((p, b, nb, r, sub))
+        out_blocks: dict = {}
+        for _key, lst in items.items():
+            ortho = newton_schulz_batched(torch.stack([it[4] for it in lst]), algorithm=lmo.algorithm,
+                                          steps=lmo.steps, eps=lmo.eps, compute_dtype=lmo.compute_dtype)
+            for j, (p, b, nb, r, _sub) in enumerate(lst):
+                out_blocks.setdefault(p, [None] * nb)[b] = r * ortho[j]
+        for p, bl in out_blocks.items():
+            pre[p][1] = bl[0] if len(bl) == 1 else torch.cat(bl, dim=0)
+        return pre
+
+    def _spectral_sign_direction(self, state, grad, group, group_type, lmo, radius, n_blocks, beta1,
+                                 whitening, normuon_enabled, normuon_beta, eps, pre=None):
+        """Stages 1-4 for the spectral / sign / colnorm groups. Returns (d_k, M, M_lmo).
+
+        With every C-series option at its default this is the historical inline code, unchanged.
+        `pre` = (d_k, M) from _batched_spectral_lmo: Stages 1-2 (and Stage 3 when M is not None) are done.
+        """
+        normuon_mode = group.get("normuon_mode", "row_unit")
+        update_scale = group.get("update_scale", "native")
+        after_unwhiten = group.get("normuon_after_unwhiten", False)
+        is_spectral_2d = group_type == "spectral" and grad.ndim == 2
+
+        if pre is None:
+            d_k = self._momentum_whiten(state, grad, beta1, whitening)
+        else:
+            d_k = pre[0]
+        stack = state["stack"]
+
+        # ── Stage 3: Core LMO Solver with Block Splitting ────────
+        # dion mode takes dion's own lr rule (sqrt(d_out/d_in), applied below), so the radius is 1 here.
+        lmo_radius = 1.0 if (is_spectral_2d and normuon_mode == "dion") else radius
+        if pre is not None and pre[1] is not None:
+            M = pre[1]
+        elif n_blocks > 1 and d_k.ndim == 2:
+            # Block-aware splitting (QKV or AdaLN)
+            block_size = d_k.shape[0] // n_blocks
+            lmo_blocks = []
+            for b_idx in range(n_blocks):
+                start = b_idx * block_size
+                end = start + block_size
+                block_grad = d_k[start:end]
+                lmo_result = lmo.compute_lmo(block_grad, radius=lmo_radius)  # same radius per block
+                lmo_blocks.append(lmo_result)
+            M = torch.cat(lmo_blocks, dim=0)
+        else:
+            # Standard single-block LMO
+            if group_type == "spectral" and d_k.ndim != 2:
+                # Spectral LMO requires 2D — fall back to Sign for non-2D
+                M = _SIGN_LMO.compute_lmo(d_k, radius=radius)
+            else:
+                M = lmo.compute_lmo(d_k, radius=lmo_radius)
+        M_lmo = M
+
+        do_normuon = normuon_enabled and group_type == "spectral" and M.ndim == 2
+
+        # ── Stage 3b: NorMuon Per-Neuron Row Scaling ─────────────
+        # (Li & Han 2026 arXiv:2608.20818, Section 3.2 / FusionOpt)
+        # Normalizes each neuron row to unit variance under EMA.
+        # Bounds per-neuron velocity in DiTs, preventing harsh timbres and glitches.
+        if do_normuon and not (after_unwhiten and not stack.is_empty()):
+            M = _normuon_rows(M, state, normuon_mode, normuon_beta, self._step_count, eps, n_blocks)
+
+        # ── Stage 4: Reverse Unwhitening (Pullback) ──────────────
+        if not stack.is_empty():
+            # Mousse (arXiv:2603.09697) Algorithm 1 lines 8 and 10. The whitening is
+            # applied on the way in AND again on the way out (line 9 reuses the same
+            # negative powers, which is correct -- see preconditioners.py), so the
+            # magnitude the LMO produced is destroyed by the pullback. Save it and
+            # restore it, or the step size is whatever the curvature happens to be.
+            # Its absence is the likeliest reason naive whitening blows up.
+            gamma = M.norm()
+            M = stack.unwhiten(M)
+            M = M * (gamma / M.norm().clamp_min(eps))
+            # C5: NorMuon after the pullback, so the per-neuron equalisation reaches the weights
+            # (the left-side pullback re-mixes the rows of square/wide matrices).
+            if do_normuon and after_unwhiten:
+                M = _normuon_rows(M, state, normuon_mode, normuon_beta, self._step_count, eps, n_blocks)
+
+        # ── Stage 4b: step-size convention for spectral matrices (C2/C3) ──
+        if is_spectral_2d:
+            if update_scale == "rms0.2":
+                # SF-NorMuon Alg. 1 line 13: eta_hat = 0.2 * eta * sqrt(m*n) / ||P||_F, i.e. update RMS
+                # 0.2*lr per element whatever the shape (Adam-matched; replaces radius and dion's rule).
+                m_, n_ = M.shape
+                M = M * (0.2 * math.sqrt(m_ * n_) / M.float().norm().clamp_min(1e-12)).to(M.dtype)
+            elif normuon_mode == "dion":
+                # dion adjust_lr="spectral_norm": lr * sqrt(d_out / d_in), per row block when split.
+                d_out = M.shape[0] // n_blocks if n_blocks > 1 else M.shape[0]
+                M = M * math.sqrt(d_out / M.shape[1])
+        return d_k, M, M_lmo
+
+    def _group_step(self, group: dict, warm_factor: float, telem: dict | None = None, gkey: str = "") -> None:
         """Run the full 6-stage pipeline for a single parameter group."""
         group_type: str = group["group_type"]
         param_names: list[str] = group.get("param_names", [])
@@ -398,13 +708,19 @@ class ModularOptimizer(Optimizer):
         sf_enabled = group.get("schedule_free", True)
         sf_beta = group.get("sf_beta", 0.9)
 
-        lmo = _get_lmo(group_type, ns_poly)
+        lmo = _get_lmo(group_type, ns_poly, group.get("ns_dtype", "fp32"))
+        pre_all = (self._batched_spectral_lmo(group, lmo)
+                   if group.get("ns_batch", False) and group_type == "spectral" else {})
 
         for i, p in enumerate(group["params"]):
             if p.grad is None:
                 continue
 
             grad = p.grad
+            # C1: state_dtype="fp32" runs every stage in fp32 for a low-precision parameter.
+            master32 = group.get("state_dtype", "param") == "fp32" and p.dtype != torch.float32
+            if master32:
+                grad = grad.float()
             name = param_names[i] if i < len(param_names) else f"param_{i}"
             radius = radii[i] if i < len(radii) else 1.0
             lr_mult = lr_mults[i] if i < len(lr_mults) else 1.0
@@ -416,77 +732,18 @@ class ModularOptimizer(Optimizer):
             if len(state) == 0:
                 self._init_state(state, p, group, whitening)
 
-            # ── Stage 1: Momentum Accumulation ───────────────────────
-            momentum = state["momentum"]
-            momentum.mul_(beta1).add_(grad, alpha=(1.0 - beta1))
-            # Bias-corrected momentum direction
-            bc1 = 1.0 - beta1 ** (self._step_count + 1)
-            d_k = momentum / bc1
-
-            # ── Stage 2: Forward Whitening ───────────────────────────
-            stack = state["stack"]
-            stack.clear()  # Safety: ensure clean stack each step
-
-            preconditioner = state.get("preconditioner")
-            if preconditioner is not None and whitening != "none":
-                # Update covariance accumulators from raw gradient
-                if grad.ndim == 2:
-                    preconditioner.update_accumulators(grad)
-                    # Forward transform (whitening)
-                    d_k = preconditioner.transform(d_k)
-                    # Push inverse onto LIFO stack
-                    stack.push(
-                        name=preconditioner.name,
-                        inverse_fn=preconditioner.inverse_transform,
-                    )
-
-            # ── Stage 3: Core LMO Solver with Block Splitting ────────
-            if n_blocks > 1 and d_k.ndim == 2:
-                # Block-aware splitting (QKV or AdaLN)
-                block_size = d_k.shape[0] // n_blocks
-                lmo_blocks = []
-                for b_idx in range(n_blocks):
-                    start = b_idx * block_size
-                    end = start + block_size
-                    block_grad = d_k[start:end]
-                    block_radius = radius  # Same radius for each sub-block
-                    lmo_result = lmo.compute_lmo(block_grad, radius=block_radius)
-                    lmo_blocks.append(lmo_result)
-                M = torch.cat(lmo_blocks, dim=0)
+            if group_type == "adam":
+                # C3: element-wise Adam direction; no whitening, no LMO, no NorMuon. Stages 5-6 below
+                # (lr, warmup, wd at z, Schedule-Free averaging) are shared with the other groups.
+                d_k = grad
+                M = _adam_direction(state, grad, group, self._step_count, sf_enabled)
+                M_lmo = M
+                stack = state["stack"]
+                stack.clear()
             else:
-                # Standard single-block LMO
-                if group_type == "spectral" and d_k.ndim != 2:
-                    # Spectral LMO requires 2D — fall back to Sign for non-2D
-                    M = _SIGN_LMO.compute_lmo(d_k, radius=radius)
-                else:
-                    M = lmo.compute_lmo(d_k, radius=radius)
-            M_lmo = M
-
-            # ── Stage 3b: NorMuon Per-Neuron Row Scaling ─────────────
-            # (Li & Han 2026 arXiv:2608.20818, Section 3.2 / FusionOpt)
-            # Normalizes each neuron row to unit variance under EMA.
-            # Bounds per-neuron velocity in DiTs, preventing harsh timbres and glitches.
-            if normuon_enabled and group_type == "spectral" and M.ndim == 2:
-                if "normuon_r" not in state:
-                    state["normuon_r"] = torch.zeros(M.shape[0], device=M.device, dtype=torch.float32)
-                rn = state["normuon_r"]
-                row_ss = (M * M).sum(dim=-1).float()
-                rn.mul_(normuon_beta).add_(row_ss, alpha=(1.0 - normuon_beta))
-                bc_r = 1.0 - normuon_beta ** (self._step_count + 1)
-                r_hat = rn / max(bc_r, 1e-12)
-                M = M / r_hat.clamp_min(eps).sqrt().unsqueeze(-1).to(M.dtype)
-
-            # ── Stage 4: Reverse Unwhitening (Pullback) ──────────────
-            if not stack.is_empty():
-                # Mousse (arXiv:2603.09697) Algorithm 1 lines 8 and 10. The whitening is
-                # applied on the way in AND again on the way out (line 9 reuses the same
-                # negative powers, which is correct -- see preconditioners.py), so the
-                # magnitude the LMO produced is destroyed by the pullback. Save it and
-                # restore it, or the step size is whatever the curvature happens to be.
-                # Its absence is the likeliest reason naive whitening blows up.
-                gamma = M.norm()
-                M = stack.unwhiten(M)
-                M = M * (gamma / M.norm().clamp_min(eps))
+                d_k, M, M_lmo = self._spectral_sign_direction(
+                    state, grad, group, group_type, lmo, radius, n_blocks, beta1, whitening,
+                    normuon_enabled, normuon_beta, eps, pre=pre_all.get(p))
 
             # ── Stage 5: Prodigy Escape Velocity + SNR Gate ──────────
             ev_mult = 1.0
@@ -595,22 +852,25 @@ class ModularOptimizer(Optimizer):
 
                 x.mul_(1.0 - ck).add_(z, alpha=ck)
             else:
-                # Standard non-SF update
+                # Standard non-SF update (on the fp32 master copy when state_dtype="fp32")
+                w = state["w32"] if master32 else p.data
                 if wd_decay_factor > 0:
-                    p.data.add_(p.data, alpha=-wd_decay_factor)
+                    w.add_(w, alpha=-wd_decay_factor)
 
                 r_brake = group.get("radial_brake", 1.0)
-                p_old_norm = p.data.norm() if r_brake < 1.0 else None
+                p_old_norm = w.norm() if r_brake < 1.0 else None
                 radial_scale = 1.0
 
-                _magnitude_step(p.data, M, eta * lr_mult, group, name)
+                _magnitude_step(w, M, eta * lr_mult, group, name)
 
                 if r_brake < 1.0:
-                    p_new_norm = p.data.norm()
+                    p_new_norm = w.norm()
                     if p_new_norm > p_old_norm:
                         p_target = p_old_norm + r_brake * (p_new_norm - p_old_norm)
                         radial_scale = float((p_target / p_new_norm.clamp_min(1e-12)).item())
-                        p.data.mul_(radial_scale)
+                        w.mul_(radial_scale)
+                if master32:
+                    p.data.copy_(w)
 
             if telem is not None:
                 telem["n_params"] += 1
@@ -633,6 +893,12 @@ class ModularOptimizer(Optimizer):
                 telem["eff_wd_list"].append(float(eff_wd))
                 telem["wd_decay_list"].append(float(wd_decay_factor))
                 telem["ck_list"].append(float(ck if sf_enabled else 1.0))
+                # C4: per-group step and weight size (weights = z under Schedule-Free).
+                acc = telem["groups"].setdefault(gkey or group_type, [0.0, 0.0, 0])
+                acc[0] += float((M.float() * (eta * lr_mult)).pow(2).sum().item())
+                w_ref = z if sf_enabled else p.data
+                acc[1] += float(w_ref.float().pow(2).sum().item())
+                acc[2] += p.numel()
 
     # ------------------------------------------------------------------
     # State initialization
@@ -646,8 +912,13 @@ class ModularOptimizer(Optimizer):
         whitening: str,
     ) -> None:
         """Initialize per-parameter optimizer state."""
-        # Momentum buffer (same dtype/device as parameter)
-        state["momentum"] = torch.zeros_like(p.data)
+        # C1: state_dtype="fp32" keeps every state tensor of a low-precision parameter in fp32.
+        master32 = group.get("state_dtype", "param") == "fp32" and p.dtype != torch.float32
+        sd = torch.float32 if master32 else p.dtype
+        # Momentum buffer (parameter's dtype, or fp32 under state_dtype="fp32")
+        state["momentum"] = torch.zeros_like(p.data, dtype=sd)
+        if master32 and not group.get("schedule_free", False):
+            state["w32"] = p.data.float().clone()  # fp32 master weights (non-Schedule-Free path)
 
         # LIFO stack for whitening/unwhitening
         state["stack"] = LIFOTransformationStack()
@@ -669,7 +940,7 @@ class ModularOptimizer(Optimizer):
                 state["preconditioner"] = ShampooPreconditioner(
                     shape=shape,
                     device=p.device,
-                    dtype=p.dtype,
+                    dtype=sd,
                     beta=beta_p,
                     delta=delta,
                     update_freq=freq,
@@ -681,7 +952,7 @@ class ModularOptimizer(Optimizer):
                 state["preconditioner"] = RotatedSOAPPreconditioner(
                     shape=shape,
                     device=p.device,
-                    dtype=p.dtype,
+                    dtype=sd,
                     beta=beta_p,
                     delta=delta,
                     update_freq=freq,
@@ -693,20 +964,20 @@ class ModularOptimizer(Optimizer):
 
         # Escape velocity state
         if group.get("escape_velocity", False):
-            state["w0"] = p.data.clone()  # Initial weights
+            state["w0"] = p.data.to(sd).clone()  # Initial weights
             state["ev_numerator"] = 0.0  # Running numerator
             state["ev_denominator"] = 0.0  # Running denominator
             state["ev_d"] = 1.0  # Current escape velocity multiplier
 
         # SNR gate state
         if group.get("snr_gate", False):
-            state["snr_ema"] = torch.zeros_like(p.data)
-            state["snr_sq_ema"] = torch.zeros_like(p.data)
+            state["snr_ema"] = torch.zeros_like(p.data, dtype=sd)
+            state["snr_sq_ema"] = torch.zeros_like(p.data, dtype=sd)
 
         # Schedule-Free state
         if group.get("schedule_free", False):
-            state["z"] = p.data.clone()  # Fast iterate
-            state["x"] = p.data.clone()  # Averaged iterate
+            state["z"] = p.data.to(sd).clone()  # Fast iterate
+            state["x"] = p.data.to(sd).clone()  # Averaged iterate
 
         # NorMuon per-neuron row scaling state
         if group.get("normuon", True) and group.get("group_type") == "spectral" and p.ndim == 2:
