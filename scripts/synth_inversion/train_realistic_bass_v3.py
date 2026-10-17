@@ -486,6 +486,12 @@ def build_parser():
                     help="optimizer choice: modular (ModularOptimizer with SCION LMOs), adamw, or fusion")
     ap.add_argument("--whitening", choices=["shampoo", "soap", "none"], default="none",
                     help="whitening preconditioner for ModularOptimizer (default: none; shampoo requires large B>=128)")
+    ap.add_argument("--scalar_opt", choices=["sign", "adam"], default="adam",
+                    help="optimizer for 1D parameters/biases: adam (SF-AdamW matched RMS) or sign (default: adam)")
+    ap.add_argument("--scalar_sf_beta", type=float, default=0.95,
+                    help="Schedule-Free beta for 1D adam parameters (default: 0.95)")
+    ap.add_argument("--grad_clip", type=float, default=1.2,
+                    help="gradient clipping max norm (default: 1.2; 0 to disable)")
     ap.add_argument("--random_patch_frac", type=float, default=0.05,
                     help="fraction of training draws from unconstrained random parameter space (default: 0.05)")
     ap.add_argument("--snr_gate", action="store_true", default=False,
@@ -665,6 +671,8 @@ def train(args):
             spectral_wd=args.wd_jepa,
             sign_wd=0.0,
             colnorm_wd=0.0,
+            scalar_opt=args.scalar_opt,
+            scalar_sf_beta=args.scalar_sf_beta,
         )
         flow_groups = build_modular_param_groups(
             flow,
@@ -675,6 +683,8 @@ def train(args):
             spectral_wd=args.wd_flow,
             sign_wd=0.0,
             colnorm_wd=0.0,
+            scalar_opt=args.scalar_opt,
+            scalar_sf_beta=args.scalar_sf_beta,
         )
         opt_jepa = ModularOptimizer(
             jepa_groups,
@@ -705,6 +715,7 @@ def train(args):
             warmup_steps=args.warmup_steps,
         )
         log(f"Optimizer: ModularOptimizer (ns_poly={args.ns_poly}, whitening={args.whitening}, "
+            f"scalar_opt={args.scalar_opt}, grad_clip={args.grad_clip}, "
             f"radial_brake={args.radial_brake}, var_damp={args.var_dampening}, sf_c_warmup={args.sf_c_warmup}, "
             f"wd_ot={args.wd_overtraining}, snr_gate={args.snr_gate})")
     elif args.optimizer == "fusion":
@@ -1053,7 +1064,7 @@ def train(args):
         else:
             j_loss = lp + la + args.lambda_sig * (sa + sp) + i_loss
         j_loss.backward()
-        gn = nn.utils.clip_grad_norm_(jepa.parameters(), 1.0)
+        gn = nn.utils.clip_grad_norm_(jepa.parameters(), args.grad_clip) if args.grad_clip > 0 else torch.tensor(0.0)
         if torch.isfinite(j_loss) and torch.isfinite(gn):
             opt_jepa.step()
             bad["jepa"] = 0
@@ -1065,7 +1076,7 @@ def train(args):
         f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
                            clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss)
         f_loss.backward()
-        gn = nn.utils.clip_grad_norm_(flow.parameters(), 1.0)
+        gn = nn.utils.clip_grad_norm_(flow.parameters(), args.grad_clip) if args.grad_clip > 0 else torch.tensor(0.0)
         if torch.isfinite(f_loss) and torch.isfinite(gn):
             opt_flow.step()
             bad["flow"] = 0
