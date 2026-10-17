@@ -484,8 +484,8 @@ def build_parser():
     ap.add_argument("--resume_from", default="", help="explicit checkpoint path to resume from (overrides latest)")
     ap.add_argument("--optimizer", choices=["modular", "adamw", "fusion"], default="modular",
                     help="optimizer choice: modular (ModularOptimizer with SCION LMOs), adamw, or fusion")
-    ap.add_argument("--whitening", choices=["shampoo", "soap", "none"], default="shampoo",
-                    help="whitening preconditioner for ModularOptimizer (default: shampoo)")
+    ap.add_argument("--whitening", choices=["shampoo", "soap", "none"], default="none",
+                    help="whitening preconditioner for ModularOptimizer (default: none; shampoo requires large B>=128)")
     ap.add_argument("--random_patch_frac", type=float, default=0.05,
                     help="fraction of training draws from unconstrained random parameter space (default: 0.05)")
     ap.add_argument("--snr_gate", action="store_true", default=False,
@@ -508,8 +508,8 @@ def build_parser():
                     help="weight decay on Flow spectral weights (default: 1e-4)")
     ap.add_argument("--wd_overtraining", action="store_true", default=True,
                     help="enable overtraining-aware weight decay scaling (default: True)")
-    ap.add_argument("--fusion_components", default="shampoo,sf,normuon,ns5,mona",
-                    help="comma-separated list of FusionOpt components to enable")
+    ap.add_argument("--fusion_components", default="sf,normuon,ns5",
+                    help="comma-separated list of FusionOpt components to enable (default: sf,normuon,ns5; mona/shampoo omitted for B=32)")
     ap.add_argument("--flow_dim", type=int, default=512, help="Flow hidden dim")
     ap.add_argument("--flow_encoder", default="conv", choices=("conv", "temporal_asp", "temporal_segments", "temporal_queries"),
                     help="flow audio encoder: conv = the v3 pooled encoder (default, unchanged); temporal_* = models_v4 (keeps the time axis)")
