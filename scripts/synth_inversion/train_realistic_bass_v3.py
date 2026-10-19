@@ -481,6 +481,9 @@ def build_parser():
     ap.add_argument("--min_batch_size", type=int, default=2, help="minimum batch size when decaying batch size")
     ap.add_argument("--batch_schedule", choices=["constant", "linear_decay", "power2_decay"], default="constant",
                     help="batch size schedule over the time budget: constant, linear_decay, or power2_decay")
+    ap.add_argument("--legacy_jepa_params", action="store_true",
+                    help="build the pre-2026-10-19 JEPA whose parameter encoder sees only 20 continuous / 3 categorical "
+                         "parameters (to resume or reproduce A-series runs); default: the full layout")
     ap.add_argument("--resume_from", default="", help="explicit checkpoint path to resume from (overrides latest)")
     ap.add_argument("--optimizer", choices=["modular", "adamw", "fusion"], default="modular",
                     help="optimizer choice: modular (ModularOptimizer with SCION LMOs), adamw, or fusion")
@@ -628,6 +631,12 @@ def train(args):
         raise SystemExit("--flow_xattn needs a temporal_* --flow_encoder (the conv encoder has no time tokens)")
     jepa_kwargs = dict(embed_dim=args.embed_dim, predictor_hidden=args.predictor_hidden, num_audio_layers=args.jepa_layers,
                        num_param_layers=args.jepa_layers, num_slices_sigreg=64, ff_dim=args.ff_dim, in_frames=81)
+    if args.legacy_jepa_params:
+        jepa_kwargs["legacy_param_truncation"] = True        # the pre-2026-10-19 JEPA: 20 continuous / 3 categoricals
+    else:
+        # KUANG 2026-10-19: without these the JEPA took surge_spec (v1) sizes and ignored 23 continuous and
+        # 7 categorical parameters of this layout (octaves, osc 2 / 3 volumes, filter 2, routings, envelope modes)
+        jepa_kwargs.update(num_continuous=len(CONT_INDICES), cat_sizes=[k for _, k in CAT_INDICES])
     if args.inharm_weight > 0:
         jepa_kwargs["inharmonicity_head"] = True
     jepa = SynthJEPA(**jepa_kwargs).to(device)
@@ -840,6 +849,11 @@ def train(args):
         if ckpt["prior_md5"] != prior_md5 and not args.allow_prior_change:
             raise SystemExit(f"{ckpt_target} was trained on a different manifold (md5 {ckpt['prior_md5'][:10]}); "
                              "use a new --out_dir, or --allow_prior_change to continue anyway.")
+        ckpt_legacy = "num_continuous" not in (ckpt.get("jepa_kwargs") or {})
+        if ckpt_legacy != bool(args.legacy_jepa_params):
+            raise SystemExit(f"{ckpt_target} has a {'legacy (20 continuous / 3 categorical)' if ckpt_legacy else 'full'} "
+                             f"JEPA parameter encoder; resume with{'' if ckpt_legacy else 'out'} --legacy_jepa_params, "
+                             "or start a new --out_dir")
         ckpt_head_state = any(k.startswith("inharmonicity_head") for k in ckpt["jepa_state_dict"].keys())
         run_head_state = args.inharm_weight > 0
         if ckpt_head_state != run_head_state:

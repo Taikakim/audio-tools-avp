@@ -1,6 +1,8 @@
 # Owner: KUANG (created 2026-10-13)
 """Batch rendering of parameter vectors through real Surge XT, in parallel worker processes (one persistent plugin
-per worker), exactly as the trainer renders: surge_spec_v3.render_patch(synth, vector_to_patch(vec), midi, dur).
+per worker), exactly as the trainer renders: surge_spec_vN.render_patch(synth, vector_to_patch(vec), midi, dur).
+`spec` picks the layout ("v3" default, "v4", "v5"; layout_v6.py maps a flow to its layout). It must match the
+vectors: a v5 vector rendered through the v3 spec is a different patch.
 
 Used by render_bank_v5.py, ladder_metric_check_v5.py, dpo_pairs_v5.py and audio_eval_v5.py.
 
@@ -20,11 +22,16 @@ import numpy as np
 _W = {}
 
 
-def _init_worker(plugin, inharm_config):
+def _spec(name):
+    import importlib
+    return importlib.import_module(f"surge_spec_{name}")
+
+
+def _init_worker(plugin, inharm_config, spec="v3"):
     import signal
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    from surge_spec_v3 import init_synth
-    _W["synth"] = init_synth(plugin, verify=False)
+    _W["spec"] = _spec(spec)
+    _W["synth"] = _W["spec"].init_synth(plugin, verify=False)
     _W["ext"] = None
     if inharm_config:
         from inharmonicity_target import InharmonicityConfig, InharmonicityExtractor
@@ -33,10 +40,10 @@ def _init_worker(plugin, inharm_config):
 
 def _render_chunk(args):
     vecs, midi, labels = args
-    from surge_spec_v3 import render_patch, vector_to_patch
+    sp = _W["spec"]
     out, inh, val = [], [], []
     for v, m in zip(vecs, midi):
-        a = render_patch(_W["synth"], vector_to_patch(v), int(m), 0.3)
+        a = sp.render_patch(_W["synth"], sp.vector_to_patch(v), int(m), 0.3)
         out.append(a.astype(np.float32))
         if labels:
             r = _W["ext"].process_phrase(a, int(m))
@@ -46,26 +53,26 @@ def _render_chunk(args):
 
 
 class RenderPool:
-    def __init__(self, plugin=None, workers=0, inharm_config=None, render_fn=None, chunk=16, verify=True):
+    def __init__(self, plugin=None, workers=0, inharm_config=None, render_fn=None, chunk=16, verify=True, spec="v3"):
         self.plugin, self.workers, self.inharm_config = plugin, int(workers), inharm_config
+        self.spec = spec
         self.render_fn, self.chunk, self.verify = render_fn, int(chunk), verify
         self._pool = None
 
     def __enter__(self):
         if self.render_fn is None:
+            sp = _spec(self.spec)
             if self.plugin is None:
-                from surge_spec_v3 import DEFAULT_PLUGIN_PATH
-                self.plugin = DEFAULT_PLUGIN_PATH
+                self.plugin = sp.DEFAULT_PLUGIN_PATH
             if self.verify:
-                from surge_spec_v3 import init_synth
-                del_synth = init_synth(self.plugin, verify=True)     # one enum-mapping check, then drop it
+                del_synth = sp.init_synth(self.plugin, verify=True)  # one enum-mapping check, then drop it
                 del del_synth
             if self.workers > 0:
                 import multiprocessing as mp
                 self._pool = mp.get_context("spawn").Pool(self.workers, initializer=_init_worker,
-                                                          initargs=(self.plugin, self.inharm_config))
+                                                          initargs=(self.plugin, self.inharm_config, self.spec))
             else:
-                _init_worker(self.plugin, self.inharm_config)
+                _init_worker(self.plugin, self.inharm_config, self.spec)
         return self
 
     def __exit__(self, *exc):

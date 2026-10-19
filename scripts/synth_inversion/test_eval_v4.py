@@ -180,8 +180,10 @@ def _models(v4=False, aux=True, seed=0):
     from synth_jepa_model import SynthJEPA
     from synth_jepa_search_v3 import WelfordNormalizer
     torch.manual_seed(seed)
+    from surge_spec_v3 import CAT_INDICES, CONT_INDICES
     kw = dict(embed_dim=64, predictor_hidden=64, num_audio_layers=1, num_param_layers=1, num_slices_sigreg=8,
-              ff_dim=64, in_frames=81, inharmonicity_head=aux)
+              ff_dim=64, in_frames=81, inharmonicity_head=aux,
+              num_continuous=len(CONT_INDICES), cat_sizes=[k for _, k in CAT_INDICES])   # the v3 trainer's sizes
     jepa = SynthJEPA(**kw).eval()
     norm = WelfordNormalizer(n_mels=128)
     norm.update(np.random.default_rng(seed).normal(size=(16, 128, 81)))

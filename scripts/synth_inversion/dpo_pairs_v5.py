@@ -20,6 +20,10 @@ true vectors and noise floors for synth) and manifest.json (flow file + md5 + st
 and the HEADROOM summary: mean score of candidate 0 vs best-of-K vs worst-of-K. If best-of-K is barely better than
 candidate 0, there is little for DPO to learn).
 
+Layouts (KUANG 2026-10-19): the flow's layout (layout_v6: 92 -> v3, 108 -> v4, 126 -> v5) picks the spec Surge
+renders with and the prior. v3 flows use --manifold (realistic_bass_prior_v3); v4 / v5 flows use the soundset prior
+of their trainer (realistic_prior_v4.UnifiedSoundsetPrior, --bass_manifold and --all_manifold).
+
 Usage (desktop):
   python dpo_pairs_v5.py --flow RUN/flow_ema_latest.pt --manifold M.npz --plugin "Surge XT.vst3" \\
       --source synth --n 8192 --k 8 --tau 1.0 --workers 14 --out dpo_pairs_a3p_s0 --device cuda:0
@@ -76,6 +80,20 @@ def build_shard(flow, pool, device, targets, midi, k, steps, tau, seed, metrics,
     return out
 
 
+def make_prior(layout_name, a):
+    """-> (prior with sample_patch_and_midi(rng), md5 string) for the flow's layout, training split."""
+    if layout_name == "v3":
+        from realistic_bass_prior_v3 import RealisticBassPrior, manifold_md5
+        if not a.manifold:
+            raise SystemExit("--source synth with a v3 flow needs --manifold")
+        return RealisticBassPrior(a.manifold, split="train"), manifold_md5(a.manifold)
+    from realistic_prior_v4 import UnifiedSoundsetPrior, manifold_md5
+    if not (a.bass_manifold and a.all_manifold):
+        raise SystemExit(f"--source synth with a {layout_name} flow needs --bass_manifold and --all_manifold")
+    return (UnifiedSoundsetPrior(a.bass_manifold, a.all_manifold, split="train"),
+            manifold_md5(a.bass_manifold) + "+" + manifold_md5(a.all_manifold))
+
+
 def headroom(shards, metric):
     s = np.concatenate([sh[f"score__{metric}"] for sh in shards])
     res = {"metric": metric, "n": int(len(s)), "draw0": float(np.nanmean(s[:, 0])), "best": float(np.nanmean(np.nanmin(s, 1))),
@@ -92,7 +110,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--flow", required=True, help="flow_*.pt to sample from (the DPO reference and initial policy)")
     ap.add_argument("--source", choices=("synth", "audio"), default="synth")
-    ap.add_argument("--manifold", help="prior for --source synth")
+    ap.add_argument("--manifold", help="prior for --source synth (v3 flows)")
+    ap.add_argument("--bass_manifold", help="soundset prior for --source synth (v4 / v5 flows)")
+    ap.add_argument("--all_manifold", help="soundset prior for --source synth (v4 / v5 flows)")
     ap.add_argument("--audio_csv", help="path,midi_note rows for --source audio")
     ap.add_argument("--plugin", default=None)
     ap.add_argument("--n", type=int, default=8192, help="conditions (synth)")
@@ -109,16 +129,16 @@ def main(argv=None):
     a = ap.parse_args(argv)
     import torch
     from flow_sampling_v5 import file_md5
+    from layout_v6 import layout_for_flow
     from models_v4 import load_inverter_v4
     from render_pool_v5 import RenderPool, to_int16
     os.makedirs(a.out, exist_ok=True)
     flow = load_inverter_v4(a.flow, device=a.device)
+    layout = layout_for_flow(flow)
     meta_f = torch.load(a.flow, map_location="cpu", weights_only=False)
+    prior_md5 = None
     if a.source == "synth":
-        from realistic_bass_prior_v3 import RealisticBassPrior, manifold_md5
-        if not a.manifold:
-            raise SystemExit("--source synth needs --manifold")
-        prior = RealisticBassPrior(a.manifold, split="train")
+        prior, prior_md5 = make_prior(layout.name, a)
         n_total, rows = a.n, None
     else:
         if not a.audio_csv:
@@ -127,11 +147,12 @@ def main(argv=None):
             rows = list(csv.DictReader(f))
         n_total = len(rows)
     manifest = {"flow": a.flow, "flow_md5": file_md5(a.flow), "flow_step": meta_f.get("step"), "source": a.source,
-                "manifold": a.manifold, "prior_md5": manifold_md5(a.manifold) if a.source == "synth" else None,
+                "layout": layout.name, "manifold": a.manifold, "bass_manifold": a.bass_manifold,
+                "all_manifold": a.all_manifold, "prior_md5": prior_md5,
                 "audio_csv": a.audio_csv, "n": n_total, "k": a.k, "steps": a.steps, "tau": a.tau, "metrics": a.metrics,
                 "seed": a.seed, "shard": a.shard, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
     shards, t0 = [], time.time()
-    with RenderPool(a.plugin, workers=a.workers) as pool:
+    with RenderPool(a.plugin, workers=a.workers, spec=layout.name) as pool:
         for s in range(math.ceil(n_total / a.shard)):
             path = os.path.join(a.out, f"shard_{s:05d}.npz")
             if os.path.exists(path):

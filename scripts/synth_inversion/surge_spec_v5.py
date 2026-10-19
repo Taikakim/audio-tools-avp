@@ -270,9 +270,11 @@ def vector_to_patch(p) -> dict:
     unison_voices = unison_cls + 1
     unison = unison_voices > 1
 
-    oct1_cls = ordinal_to_class(p[30], 7)
-    oct2_cls = ordinal_to_class(p[31], 7)
-    oct3_cls = ordinal_to_class(p[32], 7)
+    # Surge's own thresholds, as param_codec_v5.target_classes (KUANG 2026-10-19: rounding disagreed with the codec's
+    # labels on raw prior values near a boundary; for stored class / 6 values both give the same class)
+    oct1_cls = raw_to_octave_class(p[30])
+    oct2_cls = raw_to_octave_class(p[31])
+    oct3_cls = raw_to_octave_class(p[32])
 
     return dict(
         midi_note=int(round(NOTE_LOW + p[0] * (NOTE_HIGH - NOTE_LOW))),

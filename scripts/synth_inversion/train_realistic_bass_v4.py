@@ -293,8 +293,12 @@ def sample_unconstrained_random_patch(rng=None):
 class RealisticOnlineDataset(Dataset):
     """Renders prior draws online; one persistent Surge instance per worker (persistent_workers)."""
 
-    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, random_patch_frac=0.0, inharm_cfg=None):
+    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, random_patch_frac=0.0, inharm_cfg=None,
+                 all_manifold_path=ALL_MANIFOLD_PATH):
+        # manifold_path is the BASS manifold of the soundset prior (KUANG 2026-10-19: this used an unimported,
+        # v3-layout RealisticBassPrior, so live training could not start; the bank path was the only working one)
         self.manifold_path = manifold_path
+        self.all_manifold_path = all_manifold_path
         self.plugin_path = plugin_path
         self.length = length
         self.random_patch_frac = float(random_patch_frac)
@@ -309,11 +313,11 @@ class RealisticOnlineDataset(Dataset):
     def __getitem__(self, idx):
         if self._synth is None:
             self._synth = init_synth(self.plugin_path, verify=False)  # enums verified once in the main process
-            self._prior = RealisticBassPrior(self.manifold_path, split="train")
+            self._prior = UnifiedSoundsetPrior(self.manifold_path, self.all_manifold_path, split="train")
             if self.inharm_cfg is not None:
                 self._extractor = InharmonicityExtractor(self.inharm_cfg)
         if self.random_patch_frac > 0.0 and np.random.rand() < self.random_patch_frac:
-            patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()
+            patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()   # this module's own sampler
         else:
             patch, vec, midi_note, note_dur = self._prior.sample_patch_and_midi()
         audio = render_patch(self._synth, patch, midi_note, note_dur)
@@ -784,10 +788,12 @@ def train(args):
         from torch.utils.data import RandomSampler
         from render_bank_v4 import BankLadderDataset, BankMainDataset, check_compatible, cycle, read_manifest
         manifest = read_manifest(args.bank)
-        probs = check_compatible(manifest, prior_md5, args.inharm_weight, args.inharm_config, args.ladder_steps,
-                                 args.ladder_every, args.random_patch_frac)
-        if probs and not args.allow_prior_change:
-            raise SystemExit("--bank does not fit this run:\n  " + "\n  ".join(probs))
+        hard, soft = check_compatible(manifest, args.bass_manifold, args.all_manifold, args.inharm_weight,
+                                      args.inharm_config, args.ladder_every)
+        if hard:
+            raise SystemExit("--bank cannot serve this run:\n  " + "\n  ".join(hard))
+        if soft and not args.allow_prior_change:
+            raise SystemExit("--bank does not fit this run (--allow_prior_change to accept):\n  " + "\n  ".join(soft))
         main_ds = BankMainDataset(args.bank)
         need = (args.max_steps or 0) * args.batch_size * (1.0 - (1.0 / args.ladder_every if args.ladder_every else 0.0))
         log(f"Training clips from bank {args.bank} ({len(main_ds)} items, seed {args.bank_seed}); this run needs "
@@ -799,7 +805,8 @@ def train(args):
                             persistent_workers=args.num_workers > 0)
         batches = cycle(loader)
     else:
-        loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin, random_patch_frac=args.random_patch_frac, inharm_cfg=inharm_cfg),
+        loader = DataLoader(RealisticOnlineDataset(args.bass_manifold, args.plugin, random_patch_frac=args.random_patch_frac,
+                                                   inharm_cfg=inharm_cfg, all_manifold_path=args.all_manifold),
                             batch_size=args.batch_size,
                             num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
                             prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,

@@ -108,7 +108,15 @@ def load_synth_jepa(ckpt_path: str, device: str = "cpu"):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if "normalizer" not in ckpt or "model_kwargs" not in ckpt:
         raise ValueError(f"{ckpt_path}: no normalizer/model_kwargs in checkpoint (written by train_synth_jepa.py v1?)")
-    model = SynthJEPA(**ckpt["model_kwargs"])
+    kwargs = dict(ckpt["model_kwargs"])
+    if "num_continuous" not in kwargs:
+        # Written by a trainer that did not pass its layout's sizes (the v3 trainer before 2026-10-19): the parameter
+        # encoder was trained on the first 20 continuous and 3 categorical parameters only. Load it as trained.
+        import warnings
+        warnings.warn(f"{ckpt_path}: legacy JEPA (parameter encoder saw 20 continuous / 3 categorical parameters); "
+                      "loading with legacy_param_truncation=True")
+        kwargs["legacy_param_truncation"] = True
+    model = SynthJEPA(**kwargs)
     model.load_state_dict(ckpt["model_state_dict"])
     return model.to(device).eval(), WelfordNormalizer.from_state_dict(ckpt["normalizer"])
 

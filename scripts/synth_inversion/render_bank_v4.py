@@ -11,8 +11,15 @@ Composition:
 - Full resonance [0.0, 1.0]
 - Anti-glitch spectral dominance gate: (peak_power_ratio > 0.88) or (total_energy < 1e-4)
 
+Inharmonicity labels (KUANG 2026-10-19): with --inharm_config the bank stores real labels (the A1 / A3 aux head);
+without it the labels are stored as 0 with valid = 0, and a trainer run with --inharm_weight > 0 refuses the bank
+(check_compatible) instead of silently training the aux head on nothing. Banks built before this change have no
+"inharm_labels" field and count as unlabelled. This builder renders no ladders: runs with --ladder_every > 0 cannot
+use a bank (BankLadderDataset is empty) and are refused too.
+
 Usage:
-  python render_bank_v4.py build --out /home/kim/sao_runs/bank_v5_expanded --n_items 786432 --workers 14
+  python render_bank_v4.py build --out /home/kim/sao_runs/bank_v5_expanded --n_items 786432 --workers 14 \
+      --inharm_config scripts/synth_inversion/inharm_config.json
   python render_bank_v4.py verify --bank /home/kim/sao_runs/bank_v5_expanded --n 32
 """
 import argparse
@@ -66,6 +73,10 @@ def build(a, log=print):
         "sample_rate": SAMPLE_RATE,
         "audio_len": AUDIO_LEN,
         "num_params": NUM_PARAMS,
+        "bass_manifold_md5": file_md5(a.bass_manifold),
+        "all_manifold_md5": file_md5(a.all_manifold),
+        "inharm_labels": bool(getattr(a, "inharm_config", None)),
+        "inharm_config_md5": file_md5(getattr(a, "inharm_config", None)),
         "distribution": "60% random, 30% bass-manifold, 10% all-manifold; 10% waveshaped (>50% >18dB)",
     }
     mpath = os.path.join(a.out, "manifest.json")
@@ -83,7 +94,8 @@ def build(a, log=print):
     n_main = math.ceil(a.n_items / a.shard_size)
     t0, done = time.time(), 0
 
-    with RenderPoolV4(a.plugin, workers=a.workers) as pool:
+    labels = bool(getattr(a, "inharm_config", None))
+    with RenderPoolV4(a.plugin, workers=a.workers, inharm_config=getattr(a, "inharm_config", None)) as pool:
         for k in range(n_main):
             if os.path.exists(_paths(a.out, "main", k)[0]):
                 done += min((k + 1) * a.shard_size, a.n_items) - k * a.shard_size
@@ -95,12 +107,19 @@ def build(a, log=print):
             midi = np.array([d[1] for d in draws], np.int16)
             sources = np.array([d[2] for d in draws])
 
-            # Render through pool with anti-glitch gate
-            audio, final_vecs = pool.render(vecs, midi)
-            dummy_inh = np.zeros(len(idx), dtype=np.float32)
-            dummy_val = np.zeros(len(idx), dtype=np.float32)
+            # Render through pool with anti-glitch gate (a glitching draw is replaced by a random patch, possibly on
+            # another note: store the note each clip was actually rendered at)
+            if labels:
+                audio, inh, val, final_vecs = pool.render(vecs, midi, labels=True)
+            else:
+                audio, final_vecs = pool.render(vecs, midi)
+                inh = np.zeros(len(idx), dtype=np.float32)
+                val = np.zeros(len(idx), dtype=np.float32)
+            redrawn = np.any(final_vecs != vecs, axis=1)
+            sources = np.where(redrawn, "redraw", sources)
 
-            _save_shard(a.out, "main", k, to_int16(audio), vec=final_vecs, midi=midi, source=sources, inharm=dummy_inh, inharm_valid=dummy_val)
+            _save_shard(a.out, "main", k, to_int16(audio), vec=final_vecs, midi=pool.last_midi, source=sources,
+                        inharm=inh, inharm_valid=val)
             done += len(idx)
             el = time.time() - t0
             speed = done / max(el, 1e-9)
@@ -176,11 +195,32 @@ def cycle(loader):
             yield batch
 
 
-def check_compatible(manifest, prior_md5=None, inharm_weight=0.0, inharm_config=None, ladder_steps=0, ladder_every=0, random_patch_frac=0.0):
-    probs = []
+def check_compatible(manifest, bass_manifold=None, all_manifold=None, inharm_weight=0.0, inharm_config=None,
+                     ladder_every=0):
+    """-> (hard, soft) problem lists. hard: the bank cannot serve the run (wrong format or layout, aux labels or
+    ladders it does not have). soft: it was built from other manifolds (overridable with --allow_prior_change)."""
+    hard, soft = [], []
     if manifest.get("format") != FORMAT:
-        probs.append(f"bank format {manifest.get('format')} != {FORMAT}")
-    return probs
+        hard.append(f"bank format {manifest.get('format')} != {FORMAT}")
+    if int(manifest.get("num_params", NUM_PARAMS)) != NUM_PARAMS:
+        hard.append(f"bank has {manifest.get('num_params')} params, this layout {NUM_PARAMS}")
+    if inharm_weight > 0:
+        if not manifest.get("inharm_labels"):
+            hard.append("--inharm_weight > 0 but the bank has no inharmonicity labels (rebuild with --inharm_config)")
+        elif inharm_config and manifest.get("inharm_config_md5") != file_md5(inharm_config):
+            hard.append("the bank's inharmonicity labels were made with another --inharm_config")
+    if ladder_every and ladder_every > 0:
+        hard.append("--ladder_every > 0 but render_bank_v4 banks hold no ladders (use --ladder_every 0 or live mode)")
+    for key, path in (("bass_manifold", bass_manifold), ("all_manifold", all_manifold)):
+        if path is None:
+            continue
+        want, have = file_md5(path), manifest.get(f"{key}_md5")
+        if have is None:
+            if os.path.abspath(str(manifest.get(key))) != os.path.abspath(str(path)):
+                soft.append(f"{key}: bank {manifest.get(key)} (no md5 stored) vs run {path}")
+        elif want != have:
+            soft.append(f"{key}: bank md5 {str(have)[:10]} vs run {str(want)[:10]} ({path})")
+    return hard, soft
 
 
 def verify(a, log=print):
@@ -215,6 +255,7 @@ def main():
     b.add_argument("--shard_size", type=int, default=4096)
     b.add_argument("--workers", type=int, default=14)
     b.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
+    b.add_argument("--inharm_config", default=None, help="store real inharmonicity labels (needed for --inharm_weight)")
 
     v = sub.add_parser("verify")
     v.add_argument("--bank", required=True)

@@ -34,6 +34,11 @@ Status: CPU-tested on tiny random models (delta = 0 at init, the loss falls on a
 stays frozen, export round trip). NOT run on real pairs; whether it improves rendered audio is what audio_eval_v5 and
 the listening test decide.
 
+Layouts (KUANG 2026-10-19): codec and domain weights follow the flow's layout (layout_v6), so v3, v4 and v5 flows
+all work; the pairs must come from the same flow (checked by md5, or --allow_offpolicy).
+--metric may be a weighted sum of stored metrics, e.g. "mss=1,modspec_dist=0.5": candidates are ranked by the sum and
+the render-noise margin uses the same weighted sum of the per-metric floors (only if every term has a floor).
+
 Usage (desktop):
   python train_flow_dpo_v5.py --flow RUN/flow_ema_latest.pt --pairs dpo_pairs_a3p_s0 --out dpo_a3p_b100 \\
       --beta 100 --lr 1e-5 --steps 2000 --batch 64 --link_run RUN --link_kind ema --device cuda:0
@@ -54,14 +59,32 @@ import torch.nn.functional as F
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-import param_codec_v3 as codec  # noqa: E402
-from surge_spec_v3 import domain_weights  # noqa: E402
+from layout_v6 import layout_for_flow  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------------------ data
+def parse_metric(spec, default):
+    """"mss" -> {"mss": 1.0}; "mss=1,modspec_dist=0.5" -> weights. None -> {default: 1.0}."""
+    if not spec:
+        return {default: 1.0}
+    out = {}
+    for part in spec.split(","):
+        name, _, w = part.strip().partition("=")
+        out[name.strip()] = float(w) if w else 1.0
+    return out
+
+
+def combined(z, weights, prefix):
+    """Weighted sum of stored arrays prefix + name; None if any term is missing."""
+    keys = [f"{prefix}{n}" for n in weights]
+    if not all(k in z for k in keys):
+        return None
+    return sum(w * np.asarray(z[k], dtype=np.float64) for k, w in zip(keys, weights.values()))
+
+
 def load_pairs(dirs, metric=None, mode="best_worst", margin=0.0, noise_mult=1.0, max_per_cond=8):
     """-> dict: cond_audio int16 [C, N], midi [C], true [C, P] or None, and pair arrays cond [M], w [M, P], l [M, P],
-    gap [M]; plus the manifests."""
+    gap [M]; plus the manifests. metric: one stored metric or a weighted sum (see parse_metric)."""
     audio, midi, true, man = [], [], [], []
     cond, w, l, gap = [], [], [], []
     offset = 0
@@ -69,14 +92,19 @@ def load_pairs(dirs, metric=None, mode="best_worst", margin=0.0, noise_mult=1.0,
         with open(os.path.join(d, "manifest.json")) as f:
             m = json.load(f)
         man.append(m)
-        name = metric or m["metrics"][0]
+        weights = parse_metric(metric, m["metrics"][0])
+        missing = [n for n in weights if n not in m["metrics"]]
+        if missing:
+            raise SystemExit(f"{d} has no scores for {missing} (it has {m['metrics']})")
         for p in sorted(glob.glob(os.path.join(d, "shard_*.npz"))):
             with np.load(p) as z:
-                s, v = z[f"score__{name}"], z["cand_vecs"]
-                floor = z[f"noise__{name}"] if f"noise__{name}" in z.files else np.zeros(len(s))
-                audio.append(z["target_audio"])
-                midi.append(z["midi"])
-                true.append(z["true_vecs"] if "true_vecs" in z.files else np.full(v[:, 0].shape, np.nan, np.float32))
+                zz = {k: z[k] for k in z.files}
+                s, v = combined(zz, weights, "score__"), zz["cand_vecs"]
+                floor = combined(zz, weights, "noise__")
+                floor = np.zeros(len(s)) if floor is None else floor
+                audio.append(zz["target_audio"])
+                midi.append(zz["midi"])
+                true.append(zz["true_vecs"] if "true_vecs" in zz else np.full(v[:, 0].shape, np.nan, np.float32))
             for i in range(len(s)):
                 thr = margin + noise_mult * float(floor[i])
                 order = np.argsort(s[i])
@@ -112,8 +140,9 @@ def _err(v, u, w_enc):
     return ((w_enc * (v - u) ** 2).sum(dim=1)) / w_enc.sum()
 
 
-def dpo_terms(policy, ref, mel, vec_w, vec_l, w_enc, beta, gen, tau=1.0):
-    """-> (loss, stats). mel [B, 128, 81]; vec_* [B, P] in the ordinal storage layout."""
+def dpo_terms(policy, ref, mel, vec_w, vec_l, w_enc, beta, gen, tau=1.0, codec=None):
+    """-> (loss, stats). mel [B, 128, 81]; vec_* [B, P] in the ordinal storage layout of the policy's layout."""
+    codec = codec or layout_for_flow(policy).codec
     x1w, x1l = codec.encode(vec_w), codec.encode(vec_l)
     B, D = x1w.shape
     dev = x1w.device
@@ -139,7 +168,8 @@ def dpo_terms(policy, ref, mel, vec_w, vec_l, w_enc, beta, gen, tau=1.0):
     return loss, stats
 
 
-def sft_term(policy, mel, vec, w_enc, gen, loss_type="mae"):
+def sft_term(policy, mel, vec, w_enc, gen, loss_type="mae", codec=None):
+    codec = codec or layout_for_flow(policy).codec
     x1 = codec.encode(vec)
     x0 = torch.randn(x1.shape, device=x1.device, generator=gen)
     t = torch.rand(x1.shape[0], device=x1.device, generator=gen)
@@ -152,6 +182,7 @@ def sft_term(policy, mel, vec, w_enc, gen, loss_type="mae"):
 
 # ---------------------------------------------------------------------------------------------------- export
 def export(policy, src_ckpt, path, dpo_meta, step=None):
+    codec = layout_for_flow(policy).codec
     obj = {"model_state": policy.state_dict(), "prior_bounds": src_ckpt.get("prior_bounds"),
            "args": {"model_type": "flow", "param_encoding": codec.ENCODING_V2, "time_scale": 1000.0,
                     "v4_config": getattr(policy, "v4_config", None)},
@@ -184,6 +215,8 @@ def train(a, log=print):
     os.makedirs(a.out, exist_ok=True)
     src = torch.load(a.flow, map_location="cpu", weights_only=False)
     policy = load_inverter_v4(a.flow, device=a.device)
+    layout = layout_for_flow(policy)
+    codec = layout.codec
     ref = copy.deepcopy(policy).eval()
     for p in ref.parameters():
         p.requires_grad_(False)
@@ -205,7 +238,9 @@ def train(a, log=print):
     log(f"{len(data['cond'])} pairs from {n_cond} conditions ({len(tr_idx)} train / {len(va_idx)} validation pairs); "
         f"median score gap {np.median(data['gap']):.4f}")
     mel_all = mel_of(data["cond_audio"].astype(np.float32) / 32767.0, dev).to(dev)
-    w_enc = codec.encoded_weights(torch.from_numpy(domain_weights()).to(dev))
+    w_enc = codec.encoded_weights(torch.from_numpy(layout.spec.domain_weights()).to(dev))
+    log(f"layout {layout.name} ({layout.encoded_dim}-d); ranking by "
+        f"{parse_metric(a.metric, data['manifests'][0]['metrics'][0])}")
     W = torch.from_numpy(data["w"]).to(dev)
     L = torch.from_numpy(data["l"]).to(dev)
     C = torch.from_numpy(data["cond"]).long().to(dev)
@@ -215,7 +250,7 @@ def train(a, log=print):
     opt = torch.optim.AdamW([p for p in policy.parameters() if p.requires_grad], lr=a.lr, weight_decay=a.weight_decay)
     gen = torch.Generator(device=dev).manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    meta = {"flow": a.flow, "flow_md5": md5, "pairs": a.pairs, "beta": a.beta, "lr": a.lr, "batch": a.batch,
+    meta = {"flow": a.flow, "flow_md5": md5, "layout": layout.name, "metric": a.metric, "pairs": a.pairs, "beta": a.beta, "lr": a.lr, "batch": a.batch,
             "pair_mode": a.pair_mode, "margin": a.margin, "noise_mult": a.noise_mult, "sft_weight": a.sft_weight,
             "sft_target": a.sft_target, "tau": a.tau, "seed": a.seed}
     logf = open(os.path.join(a.out, "dpo_log.jsonl"), "a")
@@ -228,7 +263,7 @@ def train(a, log=print):
         with torch.no_grad():
             for s in range(0, len(va_idx), a.batch):
                 b = torch.from_numpy(va_idx[s:s + a.batch]).to(dev)
-                _, st = dpo_terms(policy, ref, mel_all[C[b]], W[b], L[b], w_enc, a.beta, g, a.tau)
+                _, st = dpo_terms(policy, ref, mel_all[C[b]], W[b], L[b], w_enc, a.beta, g, a.tau, codec)
                 for k, v in st.items():
                     agg[k] = agg.get(k, 0.0) + v * len(b)
                 n += len(b)
@@ -243,10 +278,10 @@ def train(a, log=print):
             g_["lr"] = lr
         b = torch.from_numpy(rng.choice(tr_idx, size=min(a.batch, len(tr_idx)), replace=False)).to(dev)
         mel = mel_all[C[b]]
-        loss, st = dpo_terms(policy, ref, mel, W[b], L[b], w_enc, a.beta, gen, a.tau)
+        loss, st = dpo_terms(policy, ref, mel, W[b], L[b], w_enc, a.beta, gen, a.tau, codec)
         if a.sft_weight > 0:
             tgt = W[b] if a.sft_target == "winner" else T[C[b]]
-            sft = sft_term(policy, mel, tgt, w_enc, gen, a.sft_loss)
+            sft = sft_term(policy, mel, tgt, w_enc, gen, a.sft_loss, codec)
             loss = loss + a.sft_weight * sft
             st["sft"] = float(sft.detach())
         opt.zero_grad(set_to_none=True)
@@ -279,7 +314,8 @@ def build_parser():
     ap.add_argument("--flow", required=True, help="flow_*.pt the pairs were sampled from (policy init and reference)")
     ap.add_argument("--pairs", nargs="+", required=True, help="dpo_pairs_v5.py output directories")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--metric", default=None, help="score to rank candidates by (default: the pairs' first metric)")
+    ap.add_argument("--metric", default=None, help="score to rank candidates by (default: the pairs' first metric); "
+                                                   "a weighted sum is written name=w,name=w")
     ap.add_argument("--pair_mode", choices=("best_worst", "all_margin"), default="best_worst")
     ap.add_argument("--margin", type=float, default=0.0, help="minimum score gap (metric units)")
     ap.add_argument("--noise_mult", type=float, default=1.0, help="plus this many render-noise floors (synthetic pairs)")

@@ -129,11 +129,18 @@ class PerceiverParameterEncoder(nn.Module):
         num_blocks: int = 8,
         num_heads: int = 8,
         ff_dim: int = 2048,
+        legacy_truncate: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_continuous = num_continuous
         self.cat_sizes = cat_sizes
+        # legacy_truncate (KUANG 2026-10-19): before a079a5f this encoder silently used only its first num_continuous
+        # continuous and first len(cat_sizes) categorical inputs. The defaults come from surge_spec (v1: 20 continuous,
+        # 3 categoricals), and the v3 trainer did not pass its own sizes, so every v3-trainer JEPA (A-series, A1-A3)
+        # saw 20 of 43 continuous and 3 of 10 categorical parameters. True reproduces that, for loading those
+        # checkpoints as they were trained; new models must be built with their layout's sizes.
+        self.legacy_truncate = bool(legacy_truncate)
         total_tokens = num_continuous + len(cat_sizes)
 
         # Continuous params (in [-1, 1]): one linear projection per parameter
@@ -153,8 +160,12 @@ class PerceiverParameterEncoder(nn.Module):
     def forward(self, cont_params: torch.Tensor, cat_onehots: List[torch.Tensor]) -> torch.Tensor:
         # cont_params: [B, num_continuous] in [-1, 1]; cat_onehots: list of [B, k]
         B = cont_params.shape[0]
+        if self.legacy_truncate and (cont_params.shape[1] > self.num_continuous or len(cat_onehots) > len(self.cat_sizes)):
+            cont_params, cat_onehots = cont_params[:, :self.num_continuous], list(cat_onehots)[:len(self.cat_sizes)]
         if cont_params.shape[1] != self.num_continuous:
-            raise ValueError(f"PerceiverParameterEncoder expected {self.num_continuous} continuous params, got {cont_params.shape[1]}")
+            raise ValueError(f"PerceiverParameterEncoder expected {self.num_continuous} continuous params, got "
+                             f"{cont_params.shape[1]} (build SynthJEPA with num_continuous / cat_sizes of the layout; "
+                             f"legacy_param_truncation=True only to reproduce an old v3-trainer checkpoint)")
         if len(cat_onehots) != len(self.cat_sizes):
             raise ValueError(f"PerceiverParameterEncoder expected {len(self.cat_sizes)} categorical one-hots, got {len(cat_onehots)}")
         tokens = [proj(cont_params[:, i:i + 1]) + self.param_biases[i] for i, proj in enumerate(self.cont_projs)]
@@ -253,6 +264,7 @@ class SynthJEPA(nn.Module):
         inharmonicity_head: bool = False,
         num_continuous: int = None,
         cat_sizes: List[int] = None,
+        legacy_param_truncation: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -263,6 +275,8 @@ class SynthJEPA(nn.Module):
             enc_kwargs["num_continuous"] = num_continuous
         if cat_sizes is not None:
             enc_kwargs["cat_sizes"] = cat_sizes
+        if legacy_param_truncation:
+            enc_kwargs["legacy_truncate"] = True
         self.param_encoder = PerceiverParameterEncoder(**enc_kwargs)
         self.f_a2p = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.f_p2a = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)

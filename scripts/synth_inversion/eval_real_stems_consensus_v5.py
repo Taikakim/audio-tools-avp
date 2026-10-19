@@ -9,6 +9,19 @@ Key Innovations:
    - Categorical Parameters: Mode (majority vote) across note predictions (filter type, waveshaper, unison, osc type).
 4. Full-Phrase Reranking: Validates the consensus patch and top candidates against the entire real stem playback.
 5. Dual-Codec Support: Dynamically evaluates 99-d (S0/S1, v3) and 108-d (Stage 3, v4) flow inverters.
+
+Fixes (KUANG 2026-10-19, V6_REVIEW.md):
+- The note pinned along the ODE path was normalised with a 12..96 range; every layout trains on 28..50, so the
+  model was told a note up to an octave below the one it heard (and raised the octave to compensate). The range now
+  comes from the model's layout (layout_v6), and notes outside it are folded by whole octaves, with the sampled
+  oscillators shifted back so the patch plays at the stem's real notes.
+- The second phrase note (the training phrase is note, then note + 12) is the stem's own note an octave up when the
+  transcription has one; the librosa pitch shift (phase-vocoder smearing the model never saw) is the fallback only.
+  results record which source each note used.
+- Per model and stem, results record the oscillator-1 octave of every candidate and of the winner.
+- --occam_tol: after reranking, features of the winner (waveshaper, osc 2 / 3, sub, unison, ring, noise, feedback,
+  detune, drift) are switched off one at a time while the phrase score stays within the tolerance (ablation_v6).
+- The private scratch directory is no longer on sys.path (it could shadow repo modules).
 """
 import argparse
 import json
@@ -29,8 +42,7 @@ import numpy as np
 from scipy import stats
 import soundfile as sf
 
-sys.path.insert(0, "/home/kim/Projects/SAO/stable-audio-tools/scripts/synth_inversion")
-sys.path.insert(0, "/home/kim/.gemini/antigravity/brain/62fc5213-e94b-4c13-86bf-69147f02f03c/scratch")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import param_codec_v3 as codec_v3
 import param_codec_v4 as codec_v4
@@ -39,6 +51,7 @@ import surge_spec_v3 as spec_v3
 import surge_spec_v4 as spec_v4
 import surge_spec_v5 as spec_v5
 from models_v4 import load_inverter_v4
+from layout_v6 import fold_note, layout_for_dim, octave_class, shift_octaves
 from audio_utils import MultiScaleSTFTLoss, make_mel_spec, extract_pitch_and_envelope
 from invert_stem_collection_v3_cpu import STEM_CATALOG, resolve_mantu
 import audio_metrics_v5 as am
@@ -122,14 +135,34 @@ def select_representative_notes(notes, max_notes=6):
     return selected
 
 
-def build_conditioning_targets(chunk, sixteenth_s, sr=SAMPLE_RATE):
-    """Build matched 2-note octave phrase and rhythmic rolling pattern to fill 0.8s buffer."""
+def cut_note(y_mono, n, sr=SAMPLE_RATE):
+    """One transcribed note -> peak-normalised chunk (80..240 ms, 5 ms fade out) and its length in seconds."""
+    s_idx = max(0, int(round(n["start"] * sr)))
+    chunk_dur = min(0.24, max(0.08, n["dur"]))
+    chunk = y_mono[s_idx: s_idx + int(round(chunk_dur * sr))].copy()
+    fade_len = int(sr * 0.005)
+    if len(chunk) > fade_len:
+        chunk[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)
+    return chunk / (np.max(np.abs(chunk)) + 1e-7), chunk_dur
+
+
+def octave_partner(n, notes):
+    """The longest transcribed note exactly 12 semitones above n, or None."""
+    up = [m for m in notes if m["note"] == n["note"] + 12]
+    return max(up, key=lambda m: m["dur"]) if up else None
+
+
+def build_conditioning_targets(chunk, sixteenth_s, sr=SAMPLE_RATE, chunk_oct=None):
+    """Build matched 2-note octave phrase and rhythmic rolling pattern to fill 0.8s buffer.
+    chunk_oct: the real note an octave up (preferred); None -> phase-vocoder pitch shift of chunk."""
     s2 = int(0.250 * sr)
     l1 = min(len(chunk), s2)
     t_phrase = np.zeros(AUDIO_LEN, dtype=np.float32)
     t_phrase[:l1] = chunk[:l1]
-    
-    chunk_oct = librosa.effects.pitch_shift(chunk[:l1], sr=sr, n_steps=12)
+
+    if chunk_oct is None:
+        chunk_oct = librosa.effects.pitch_shift(chunk[:l1], sr=sr, n_steps=12)
+    chunk_oct = np.asarray(chunk_oct, dtype=np.float32)[:l1].copy()
     chunk_oct /= (np.max(np.abs(chunk_oct)) + 1e-7)
     l2 = min(len(chunk_oct), AUDIO_LEN - s2)
     t_phrase[s2 : s2 + l2] = chunk_oct[:l2]
@@ -156,15 +189,17 @@ def get_centroid(y, sr=SAMPLE_RATE):
 
 @torch.no_grad()
 def sample_candidates_adaptive(model, mel, midi_note, k=4, steps=25, seed=42):
-    """Adaptive candidate sampler supporting both 99-d (v3) and 108-d (v4) flow models."""
+    """Adaptive candidate sampler for 92-d (v3), 108-d (v4) and 126-d (v5) flow models. The note is folded into
+    the layout's trained range by whole octaves and the oscillators are shifted back afterwards, so the returned
+    vectors play right at midi_note. -> (vectors [k, P], octaves folded)."""
     device = next(model.parameters()).device
     model.eval()
     mel = mel.to(device)
     gen = torch.Generator(device=device).manual_seed(int(seed))
-    
-    note_low, note_high = (12.0, 96.0)
-    note_norm = np.clip((float(midi_note) - note_low) / (note_high - note_low), 0.0, 1.0)
-    note_t = torch.full((k,), float(note_norm), device=device)
+
+    layout = layout_for_dim(model.param_dim)
+    model_note, folded = fold_note(midi_note, layout)
+    note_t = torch.full((k,), float(layout.note_unit(model_note)), device=device)
     
     mel_k = mel.repeat(k, 1, 1)
     emb = model.encoder(mel_k)
@@ -178,14 +213,10 @@ def sample_candidates_adaptive(model, mel, midi_note, k=4, steps=25, seed=42):
     
     x[:, 0] = note_t
     
-    if model.param_dim == 126:
-        p_ord = codec_v5.decode(x).cpu().numpy()
-    elif model.param_dim == 108:
-        p_ord = codec_v4.decode(x).cpu().numpy()
-    else:
-        p_ord = codec_v3.decode(x).cpu().numpy()
-    
-    return p_ord
+    p_ord = layout.codec.decode(x).cpu().numpy()
+    if folded:
+        p_ord, _ = shift_octaves(p_ord, -folded, layout)
+    return p_ord, folded
 
 
 def build_consensus_vector(param_vectors, param_dim=99):
@@ -303,7 +334,8 @@ def compute_stereo_metrics(y, is_channels_first=False):
     return width, corr
 
 
-def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k_per_note=2, steps=25, seed=42):
+def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k_per_note=2, steps=25, seed=42,
+                              second_note="auto", occam_tol=None, occam_abs=0.0):
     E = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval")
     audio_ref_dir = os.path.join(E, "audio")
     midi_muscriptor_dir = os.path.join(E, "midi_muscriptor")
@@ -413,24 +445,21 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             param_dim = model.param_dim
 
             # Collect candidates across all selected notes
-            cand_vecs = []
+            cand_vecs, note_info = [], []
             for n_idx, n in enumerate(selected_notes):
-                s_idx = max(0, int(round(n["start"] * sr)))
-                chunk_dur = min(0.24, max(0.08, n["dur"]))
-                n_len = int(round(chunk_dur * sr))
-                chunk = y_real_mono[s_idx : s_idx + n_len].copy()
-                fade_len = int(sr * 0.005)
-                if len(chunk) > fade_len:
-                    chunk[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)
-                chunk /= (np.max(np.abs(chunk)) + 1e-7)
+                chunk, chunk_dur = cut_note(y_real_mono, n, sr)
                 sixteenth_s = chunk_dur
+                partner = octave_partner(n, all_notes) if second_note == "auto" else None
+                chunk_oct = cut_note(y_real_mono, partner, sr)[0] if partner is not None else None
 
-                t_phrase, t_rolling = build_conditioning_targets(chunk, sixteenth_s, sr=sr)
+                t_phrase, t_rolling = build_conditioning_targets(chunk, sixteenth_s, sr=sr, chunk_oct=chunk_oct)
                 mel_p = torch.from_numpy(make_mel_spec(t_phrase)).unsqueeze(0).float()
                 mel_r = torch.from_numpy(make_mel_spec(t_rolling)).unsqueeze(0).float()
 
-                vecs_p = sample_candidates_adaptive(model, mel_p, n["note"], k=k_per_note, steps=steps, seed=seed + idx * 100 + n_idx)
-                vecs_r = sample_candidates_adaptive(model, mel_r, n["note"], k=k_per_note, steps=steps, seed=seed + idx * 100 + n_idx + 50)
+                vecs_p, folded = sample_candidates_adaptive(model, mel_p, n["note"], k=k_per_note, steps=steps, seed=seed + idx * 100 + n_idx)
+                vecs_r, _ = sample_candidates_adaptive(model, mel_r, n["note"], k=k_per_note, steps=steps, seed=seed + idx * 100 + n_idx + 50)
+                note_info.append({"note": int(n["note"]), "second_note": "real" if partner is not None else "pitch_shift",
+                                  "octaves_folded": int(folded)})
 
                 for c in range(k_per_note):
                     cand_vecs.append(vecs_p[c])
@@ -443,75 +472,106 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             
             # Pool: consensus patch + all individual note candidate patches
             pool_vecs = [consensus_vec] + list(cand_vecs)
-            pool_patches = [vector_to_patch_adaptive(v, param_dim=param_dim) for v in pool_vecs]
-
             # 32nd-note BPM-adaptive release ceiling: guarantees notes decay cleanly before next 16th note
             max_rel_raw = bpm_to_max_release_raw(bpm)
-            for p in pool_patches:
+
+            def capped_patch(v):
+                p = vector_to_patch_adaptive(v, param_dim=param_dim)
                 p["aeg_release"] = min(float(p.get("aeg_release", 0.23)), max_rel_raw)
                 p["feg_release"] = min(float(p.get("feg_release", p["aeg_release"])), max_rel_raw)
+                return p
+
+            pool_patches = [capped_patch(v) for v in pool_vecs]
+
+            def phrase_score(p, retrig):
+                """Render the stem's MIDI phrase with patch p -> (score, stereo audio, width, corr)."""
+                spec_v4.flush_synth(synth)
+                apply_patch_adaptive(synth, p, param_dim=param_dim)
+                synth.parameters["a_osc_1_retrigger"].raw_value = 1.0 if retrig else 0.0
+                synth.parameters["a_osc_2_retrigger"].raw_value = 1.0 if retrig else 0.0
+                synth.parameters["a_osc_3_retrigger"].raw_value = 1.0 if retrig else 0.0
+
+                pred_audio = synth.process(events, duration=phrase_dur, sample_rate=SAMPLE_RATE, num_channels=2)
+                pred_L, pred_R = pred_audio[0], pred_audio[1]
+                pred_mid = (pred_L + pred_R) / np.sqrt(2.0)
+                pred_side = (pred_L - pred_R) / np.sqrt(2.0)
+                pred_width, pred_corr = compute_stereo_metrics(pred_audio, is_channels_first=True)
+
+                pred_mid_norm = pred_mid / (np.max(np.abs(pred_mid)) + 1e-7)
+                l = min(len(pred_mid_norm), len(real_mid_norm))
+                stft_mid = float(loss_fn(pred_mid_norm[:l], real_mid_norm[:l]))
+
+                # Sub-octave penalty
+                fft_c = np.abs(np.fft.rfft(pred_mid_norm))
+                freqs_c = np.fft.rfftfreq(len(pred_mid_norm), 1.0 / sr)
+                c_sub = float(np.sum(fft_c[freqs_c < sub_thresh]**2) / (np.sum(fft_c**2) + 1e-9))
+                sub_pen = max(0.0, c_sub - 0.10) * 2.0 if t_sub < 0.06 else 0.0
+
+                # Binaural balance and spectral asymmetry penalty (protects against single-sided dual filter muting)
+                pred_rms_L = np.sqrt(np.mean(pred_L**2))
+                pred_rms_R = np.sqrt(np.mean(pred_R**2))
+                pred_bal = abs(pred_rms_L - pred_rms_R) / (pred_rms_L + pred_rms_R + 1e-6)
+                bal_pen = max(0.0, pred_bal - real_bal - 0.08) * 3.0
+
+                pred_cent_L = get_centroid(pred_L, sr)
+                pred_cent_R = get_centroid(pred_R, sr)
+                cent_asym = abs(pred_cent_L - pred_cent_R) / max(pred_cent_L, pred_cent_R, 1.0)
+                cent_bal_pen = max(0.0, cent_asym - real_cent_asym - 0.12) * 2.0
+
+                # Stereo-aware score
+                if real_width > 0.03:
+                    pred_side_norm = pred_side / (np.max(np.abs(pred_mid)) + 1e-7)
+                    stft_side = float(loss_fn(pred_side_norm[:l], real_side_norm[:l]))
+                    width_err = abs(pred_width - real_width)
+                    score = stft_mid + 0.4 * stft_side + 0.6 * width_err + sub_pen + bal_pen + cent_bal_pen
+                else:
+                    score = stft_mid + 1.2 * pred_width + sub_pen + bal_pen + cent_bal_pen
+                return score, pred_audio, pred_width, pred_corr
 
             # Re-rank candidates on full phrase in Surge XT (with stereo & retrigger search)
             best_score = float("inf")
             best_patch = None
             best_audio = None
             best_type = "Consensus"
+            best_idx = 0
             best_retrig = True
             best_width = 0.0
             best_corr = 1.0
 
             for p_idx, p in enumerate(pool_patches):
                 for retrig in [True, False]:
-                    spec_v4.flush_synth(synth)
-                    apply_patch_adaptive(synth, p, param_dim=param_dim)
-                    synth.parameters["a_osc_1_retrigger"].raw_value = 1.0 if retrig else 0.0
-                    synth.parameters["a_osc_2_retrigger"].raw_value = 1.0 if retrig else 0.0
-                    synth.parameters["a_osc_3_retrigger"].raw_value = 1.0 if retrig else 0.0
-
-                    pred_audio = synth.process(events, duration=phrase_dur, sample_rate=SAMPLE_RATE, num_channels=2)
-                    pred_L, pred_R = pred_audio[0], pred_audio[1]
-                    pred_mid = (pred_L + pred_R) / np.sqrt(2.0)
-                    pred_side = (pred_L - pred_R) / np.sqrt(2.0)
-                    pred_width, pred_corr = compute_stereo_metrics(pred_audio, is_channels_first=True)
-
-                    pred_mid_norm = pred_mid / (np.max(np.abs(pred_mid)) + 1e-7)
-                    l = min(len(pred_mid_norm), len(real_mid_norm))
-                    stft_mid = float(loss_fn(pred_mid_norm[:l], real_mid_norm[:l]))
-
-                    # Sub-octave penalty
-                    fft_c = np.abs(np.fft.rfft(pred_mid_norm))
-                    freqs_c = np.fft.rfftfreq(len(pred_mid_norm), 1.0 / sr)
-                    c_sub = float(np.sum(fft_c[freqs_c < sub_thresh]**2) / (np.sum(fft_c**2) + 1e-9))
-                    sub_pen = max(0.0, c_sub - 0.10) * 2.0 if t_sub < 0.06 else 0.0
-
-                    # Binaural balance and spectral asymmetry penalty (protects against single-sided dual filter muting)
-                    pred_rms_L = np.sqrt(np.mean(pred_L**2))
-                    pred_rms_R = np.sqrt(np.mean(pred_R**2))
-                    pred_bal = abs(pred_rms_L - pred_rms_R) / (pred_rms_L + pred_rms_R + 1e-6)
-                    bal_pen = max(0.0, pred_bal - real_bal - 0.08) * 3.0
-
-                    pred_cent_L = get_centroid(pred_L, sr)
-                    pred_cent_R = get_centroid(pred_R, sr)
-                    cent_asym = abs(pred_cent_L - pred_cent_R) / max(pred_cent_L, pred_cent_R, 1.0)
-                    cent_bal_pen = max(0.0, cent_asym - real_cent_asym - 0.12) * 2.0
-
-                    # Stereo-aware score
-                    if real_width > 0.03:
-                        pred_side_norm = pred_side / (np.max(np.abs(pred_mid)) + 1e-7)
-                        stft_side = float(loss_fn(pred_side_norm[:l], real_side_norm[:l]))
-                        width_err = abs(pred_width - real_width)
-                        score = stft_mid + 0.4 * stft_side + 0.6 * width_err + sub_pen + bal_pen + cent_bal_pen
-                    else:
-                        score = stft_mid + 1.2 * pred_width + sub_pen + bal_pen + cent_bal_pen
-
+                    score, pred_audio, pred_width, pred_corr = phrase_score(p, retrig)
                     if score < best_score:
                         best_score = score
                         best_patch = p
                         best_audio = pred_audio
                         best_type = "Consensus" if p_idx == 0 else f"NoteCandidate_{p_idx}"
+                        best_idx = p_idx
                         best_retrig = retrig
                         best_width = pred_width
                         best_corr = pred_corr
+
+            lay = layout_for_dim(param_dim)
+            win_vec = np.array(pool_vecs[best_idx], np.float32)
+            occam_log, score_before_occam = [], best_score
+            if occam_tol is not None:
+                # Occam (ablation_v6): switch off features whose removal does not make the phrase score worse by
+                # more than max(occam_abs, occam_tol * score); greedy, best removal first, up to 6 rounds.
+                from ablation_v6 import DEFAULT_OCCAM, active, simplify
+                for _ in range(6):
+                    trials = []
+                    for fname in DEFAULT_OCCAM:
+                        if active(win_vec, fname, lay.spec):
+                            v2 = simplify(win_vec, fname, lay.spec)
+                            p2 = capped_patch(v2)
+                            trials.append((*phrase_score(p2, best_retrig), fname, v2, p2))
+                    if not trials:
+                        break
+                    s2, a2, w2, c2, fname, v2, p2 = min(trials, key=lambda tr: tr[0])
+                    if s2 > best_score + max(occam_abs, occam_tol * best_score):
+                        break
+                    occam_log.append({"removed": fname, "score": round(float(s2), 4)})
+                    best_score, best_audio, best_width, best_corr, win_vec, best_patch = s2, a2, w2, c2, v2, p2
 
             el = time.time() - t0
 
@@ -529,6 +589,10 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             pred_stereo_norm = (best_audio / (np.max(np.abs(best_audio)) + 1e-7)).astype(np.float32)
             sf.write(cand_dest, pred_stereo_norm.T, sr, subtype="PCM_16")
 
+            oct_i = lay.spec.PARAM_INDEX["osc_1_octave"]
+            cand_oct = [int(c) - 3 for c in octave_class(cand_vecs[:, oct_i], lay)]
+            win_oct = int(octave_class(win_vec[oct_i], lay)) - 3
+
             patch_summary = format_patch_details(best_patch, param_dim=param_dim)
             patch_summary += f" | Retrig: {'On' if best_retrig else 'Off'}"
 
@@ -542,6 +606,11 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                 "width_delta": round(best_width - real_width, 3),
                 "retrigger": "On" if best_retrig else "Off",
                 "winner_type": best_type,
+                "osc1_octave_candidates": cand_oct,
+                "osc1_octave_winner": win_oct,
+                "occam": occam_log,
+                "phrase_score_before_occam": round(float(score_before_occam), 3),
+                "notes": note_info,
                 "elapsed_s": round(el, 2),
                 "audio_file": cand_filename,
                 "patch_summary": patch_summary,
@@ -765,8 +834,16 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--second_note", choices=("auto", "pitch_shift"), default="auto",
+                        help="auto: the stem's own note an octave up when transcribed, else pitch shift; "
+                             "pitch_shift: always (the pre-2026-10-19 behaviour)")
+    parser.add_argument("--occam_tol", type=float, default=None,
+                        help="switch off features of the winner while the phrase score rises by at most this share "
+                             "(e.g. 0.02); off by default")
+    parser.add_argument("--occam_abs", type=float, default=0.0, help="absolute score tolerance for --occam_tol")
     args = parser.parse_args()
 
     models = {name: path for name, path in args.model}
     evaluate_models_consensus(models, args.out_dir, device=args.device, max_notes=args.max_notes,
-                              k_per_note=args.k, steps=args.steps, seed=args.seed)
+                              k_per_note=args.k, steps=args.steps, seed=args.seed, second_note=args.second_note,
+                              occam_tol=args.occam_tol, occam_abs=args.occam_abs)

@@ -9,12 +9,15 @@ tau < 1 its candidates are not independent draws of the smoothed posterior (EVAL
   vecs = sample_candidates(flow, mel [B, 128, 81], midi [B], k=8, steps=25, seed=0, tau=1.0)   # -> [B, k, P]
 Candidate j of target b uses the generator stream of one seeded torch.Generator, so a (seed, B, k) triple is
 reproducible on one device.
+
+The codec and note range come from the flow's own layout (layout_v6.layout_for_flow: 92 -> v3, 108 -> v4,
+126 -> v5); the returned vectors are in that layout's ordinal storage, to be rendered with the same spec.
 """
 import numpy as np
 import torch
 
-import param_codec_v3 as codec
-from surge_spec_v3 import NOTE_HIGH, NOTE_LOW
+import param_codec_v3 as codec_v3
+from layout_v6 import layout_for_dim
 
 
 @torch.no_grad()
@@ -26,7 +29,10 @@ def sample_candidates(flow, mel, midi, k=8, steps=25, seed=0, tau=1.0, chunk=512
     B = mel.shape[0]
     midi = np.asarray(midi, dtype=np.float64).reshape(B)
     gen = torch.Generator(device=device).manual_seed(int(seed))
-    note = torch.from_numpy(np.clip((midi - NOTE_LOW) / (NOTE_HIGH - NOTE_LOW), 0.0, 1.0)).float().to(device)
+    ordinal = getattr(flow, "encoding", codec_v3.ENCODING_V2) == codec_v3.ENCODING_V1
+    lay = None if ordinal else layout_for_dim(flow.param_dim)
+    lo, hi = lay.note_range if lay is not None else (28, 50)        # ordinal (v1) flows are v3-era: 28..50
+    note = torch.from_numpy(np.clip((midi - lo) / (hi - lo), 0.0, 1.0)).float().to(device)
     mel_k = mel.repeat_interleave(k, dim=0)                      # [B * k, ...]: target b's candidates are rows b*k..
     note_k = note.repeat_interleave(k)
     out = []
@@ -50,7 +56,7 @@ def sample_candidates(flow, mel, midi, k=8, steps=25, seed=0, tau=1.0, chunk=512
             x = x + flow(x, t, audio_emb=emb, tau=tau_t) * (1.0 / steps)
         x[:, 0] = n
         x = torch.clamp(x, 0.0, 1.0)
-        out.append(codec.decode(x) if getattr(flow, "encoding", codec.ENCODING_V2) != codec.ENCODING_V1 else x)
+        out.append(x if ordinal else lay.codec.decode(x))
     flow.train(was)
     return torch.cat(out).cpu().numpy().reshape(B, k, -1).astype(np.float32)
 

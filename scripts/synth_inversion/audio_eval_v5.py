@@ -19,6 +19,13 @@ Listening pack (--listen N): the first N items as listen/<item>__<system>.wav pl
 index.html with the scores beside each clip; the layout listening_test_v5.py make reads (--clips listen --refs
 listen/refs).
 
+Layouts (KUANG 2026-10-19): all --flow systems must share one layout (layout_v6: 92 -> v3, 108 -> v4, 126 -> v5);
+targets and candidates are rendered with that layout's spec. v3 draws held-out items from --manifold (val split,
+clustered by archetype preset). v4 / v5 draw from the soundset prior of their trainer (--bass_manifold, --all_manifold,
+val split): its draws are 60 % unconstrained random patches, 30 % bass presets, 10 % all presets, so every random
+item is its own cluster and preset items cluster by "bass:<i>" / "all:<i>". The report gives the source share.
+--jepa systems are v3-only (synth_jepa_search_v3) and are refused for other layouts.
+
 Usage (desktop):
   python audio_eval_v5.py --manifold M.npz --plugin "Surge XT.vst3" --n 256 --k 8 --workers 14 \\
       --flow A3p=RUN_A3P/flow_ema_latest.pt --flow A3pDPO=dpo_a3p_b100/flow_dpo_latest.pt \\
@@ -37,6 +44,55 @@ sys.path.insert(0, SCRIPT_DIR)
 
 import audio_metrics_v5 as am  # noqa: E402
 import eval_stats_v4 as st  # noqa: E402
+
+
+class SoundsetRecorder:
+    """RandomState proxy that records the preset index a SubManifoldPrior draw picks (its first randint(0, N)).
+    Every call passes through, so the stream equals a plain RandomState's."""
+
+    def __init__(self, rng, sizes):
+        self._rng, self._sizes, self.last = rng, set(int(s) for s in sizes), None
+
+    def randint(self, *args, **kwargs):
+        v = self._rng.randint(*args, **kwargs)
+        if self.last is None and len(args) >= 2 and args[0] == 0 and int(args[1]) in self._sizes \
+                and kwargs.get("size") is None:
+            self.last = int(v)
+        return v
+
+    def __getattr__(self, name):
+        return getattr(self._rng, name)
+
+
+def draw_items_soundset(prior, n, seed):
+    """Held-out items from realistic_prior_v4.UnifiedSoundsetPrior -> dict like heldout_eval_v4.draw_items, with
+    preset = cluster label and source = random / bass_prior / all_prior."""
+    rng = np.random.RandomState(seed)
+    vecs, midi, preset, source = [], [], [], []
+    for i in range(n):
+        rec = SoundsetRecorder(rng, (prior.bass_prior.N, prior.all_prior.N))
+        v, m, src = prior.sample_vector(rec)
+        vecs.append(np.asarray(v, np.float32))
+        midi.append(int(m))
+        source.append(src)
+        if src == "random" or rec.last is None:
+            preset.append(f"r{i}")
+        else:
+            preset.append(f"{src.split('_')[0]}:{rec.last}")
+    return {"vecs": np.stack(vecs), "midi": np.array(midi), "preset": np.array(preset), "source": np.array(source)}
+
+
+def flows_layout(specs, device):
+    """All --flow checkpoints must share one layout; -> Layout (v3 if there are no flows)."""
+    import torch
+    from layout_v6 import layout_for_dim, layout_named
+    names = set()
+    for _, path in specs:
+        state = torch.load(path, map_location="cpu", weights_only=False)["model_state"]
+        names.add(layout_for_dim(state["head.weight"].shape[0]).name)
+    if len(names) > 1:
+        raise SystemExit(f"--flow checkpoints mix layouts {sorted(names)}; evaluate each layout separately")
+    return layout_named(names.pop() if names else "v3")
 
 
 def parse_specs(specs):
@@ -135,8 +191,10 @@ def write_listen_pack(out, targets, chosen_audio, per_view, metrics, n_items, sr
 
 def main(argv=None, pool=None, prior=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--manifold", required=True)
+    ap.add_argument("--manifold", default=None, help="v3 flows: archetype manifold (val split)")
     ap.add_argument("--plugin", default=None)
+    ap.add_argument("--bass_manifold", default=None, help="v4 / v5 flows: soundset prior (val split)")
+    ap.add_argument("--all_manifold", default=None, help="v4 / v5 flows: soundset prior (val split)")
     ap.add_argument("--flow", action="append", default=[], metavar="NAME=PATH")
     ap.add_argument("--jepa", action="append", default=[], metavar="NAME=PATH")
     ap.add_argument("--n", type=int, default=256)
@@ -159,13 +217,25 @@ def main(argv=None, pool=None, prior=None):
     from heldout_eval_v4 import draw_items
     from render_pool_v5 import RenderPool, to_int16
     os.makedirs(a.out, exist_ok=True)
+    layout = flows_layout(parse_specs(a.flow), a.device) if a.flow else None
+    lname = layout.name if layout is not None else "v3"
+    if lname != "v3" and a.jepa:
+        raise SystemExit("--jepa (synth_jepa_search_v3) only covers v3 layouts")
     if prior is None:
-        from realistic_bass_prior_v3 import RealisticBassPrior
-        prior = RealisticBassPrior(a.manifold, split="val")
-    items = draw_items(prior, a.n, a.seed)
+        if lname == "v3":
+            from realistic_bass_prior_v3 import RealisticBassPrior
+            if not a.manifold:
+                raise SystemExit("v3 flows need --manifold")
+            prior = RealisticBassPrior(a.manifold, split="val")
+        else:
+            from realistic_prior_v4 import UnifiedSoundsetPrior
+            if not (a.bass_manifold and a.all_manifold):
+                raise SystemExit(f"{lname} flows need --bass_manifold and --all_manifold")
+            prior = UnifiedSoundsetPrior(a.bass_manifold, a.all_manifold, split="val")
+    items = draw_items(prior, a.n, a.seed) if lname == "v3" else draw_items_soundset(prior, a.n, a.seed)
     midi, clusters = items["midi"], items["preset"]
     t0 = time.time()
-    ctx = pool if pool is not None else RenderPool(a.plugin, workers=a.workers)
+    ctx = pool if pool is not None else RenderPool(a.plugin, workers=a.workers, spec=lname)
     per_view, chosen_audio, raw = {}, {}, {}
     with ctx as p:
         targets = p.render(items["vecs"], midi)
@@ -188,7 +258,9 @@ def main(argv=None, pool=None, prior=None):
             print(f"{name}: done at {time.time() - t0:.0f} s", flush=True)
     metrics = list(a.metrics) + (["clap_dist"] if a.clap_ckpt else [])
     summary = summarize(per_view, clusters, metrics)
-    summary["meta"] = {"n": a.n, "seed": a.seed, "k": a.k, "steps": a.steps, "tau": a.tau, "select": a.select,
+    if "source" in items:
+        summary["source_share"] = {s: float(np.mean(items["source"] == s)) for s in sorted(set(items["source"]))}
+    summary["meta"] = {"layout": lname, "n": a.n, "seed": a.seed, "k": a.k, "steps": a.steps, "tau": a.tau, "select": a.select,
                        "systems": systems, "time_s": time.time() - t0, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
     with open(os.path.join(a.out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1, default=str)

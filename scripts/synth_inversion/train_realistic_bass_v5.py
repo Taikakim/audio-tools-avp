@@ -293,8 +293,12 @@ def sample_unconstrained_random_patch(rng=None):
 class RealisticOnlineDataset(Dataset):
     """Renders prior draws online; one persistent Surge instance per worker (persistent_workers)."""
 
-    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, random_patch_frac=0.0, inharm_cfg=None):
+    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, random_patch_frac=0.0, inharm_cfg=None,
+                 all_manifold_path=ALL_MANIFOLD_PATH):
+        # manifold_path is the BASS manifold of the soundset prior (KUANG 2026-10-19: this used an unimported,
+        # v3-layout RealisticBassPrior, so live training could not start; the bank path was the only working one)
         self.manifold_path = manifold_path
+        self.all_manifold_path = all_manifold_path
         self.plugin_path = plugin_path
         self.length = length
         self.random_patch_frac = float(random_patch_frac)
@@ -309,11 +313,11 @@ class RealisticOnlineDataset(Dataset):
     def __getitem__(self, idx):
         if self._synth is None:
             self._synth = init_synth(self.plugin_path, verify=False)  # enums verified once in the main process
-            self._prior = RealisticBassPrior(self.manifold_path, split="train")
+            self._prior = UnifiedSoundsetPrior(self.manifold_path, self.all_manifold_path, split="train")
             if self.inharm_cfg is not None:
                 self._extractor = InharmonicityExtractor(self.inharm_cfg)
         if self.random_patch_frac > 0.0 and np.random.rand() < self.random_patch_frac:
-            patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()
+            patch, vec, midi_note, note_dur = sample_unconstrained_random_patch()   # this module's own sampler
         else:
             patch, vec, midi_note, note_dur = self._prior.sample_patch_and_midi()
         audio = render_patch(self._synth, patch, midi_note, note_dur)
@@ -406,7 +410,8 @@ def prepare_jepa_inputs(params: torch.Tensor):
     return cont, cat_onehots
 
 
-def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3, loss_type="mse", return_pred=False):
+def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3, loss_type="mse", return_pred=False,
+              return_t=False):
     """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout.
     ot=True pairs noise and targets by minibatch optimal transport (training_controls_v3.ot_couple).
     cond_noise=True (H6): each sample's audio condition is noised to level tau (1 = clean, share clean_frac;
@@ -429,8 +434,40 @@ def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=Fa
     f_loss = ((w_enc * err).sum(dim=1) / w_enc.sum()).mean()
     if return_pred:
         x_hat_1 = xt + (1.0 - t.unsqueeze(1)) * pred
-        return f_loss, x_hat_1
+        return (f_loss, x_hat_1, t) if return_t else (f_loss, x_hat_1)
     return f_loss
+
+
+def acoustic_consistency(jepa, x_hat_1, za, t, temp=0.5, cat_mode="soft", t_min=0.0, t_weight="none"):
+    """1 - cos(JEPA predictor(params(x_hat_1)), za), the Stage 5 loss, with two opt-in corrections (KUANG 2026-10-19):
+    t_min / t_weight: x_hat_1 at small t is a blurred posterior mean, not a patch; scoring it pulls the velocity field
+      toward acoustically 'safe' averages. t_min drops items with t < t_min; t_weight="t" weights by t.
+    cat_mode="st": straight-through categoricals (hard one-hot forward, softmax gradient backward), so the JEPA sees
+      the one-hot inputs it was trained on; "soft" (Stage 5) feeds softmax(x / temp), never a one-hot.
+    The JEPA's weights are frozen for this term (gradients reach x_hat_1 only). -> (loss, share of items used)."""
+    cont_hat, cat_blocks = codec.split_encoded(x_hat_1)
+    cont_input = cont_hat.clamp(0.0, 1.0) * 2.0 - 1.0
+    cats = []
+    for b in cat_blocks:
+        soft = F.softmax(b / temp, dim=-1)
+        if cat_mode == "st":
+            hard = F.one_hot(soft.argmax(dim=-1), soft.shape[-1]).to(soft.dtype)
+            soft = hard + soft - soft.detach()
+        cats.append(soft)
+    req = [p.requires_grad for p in jepa.parameters()]
+    for p in jepa.parameters():
+        p.requires_grad_(False)
+    try:
+        za_hat = jepa.predict_audio_latent(jepa.encode_params(cont_input, cats))
+    finally:
+        for p, r in zip(jepa.parameters(), req):
+            p.requires_grad_(r)
+    per = 1.0 - F.cosine_similarity(za_hat, za.detach(), dim=-1)
+    w = (t >= t_min).to(per.dtype)
+    if t_weight == "t":
+        w = w * t
+    used = float((w > 0).float().mean())
+    return (w * per).sum() / w.sum().clamp_min(1e-8), used
 
 
 def lr_factor(step, frac, warmup_steps, decay_frac):
@@ -591,6 +628,12 @@ def build_parser():
                     help="weight of differentiable Synth-JEPA acoustic consistency loss in flow training (default: 0.0)")
     ap.add_argument("--acoustic_temp", type=float, default=0.5,
                     help="softmax temperature for soft categorical probabilities in acoustic loss (default: 0.5)")
+    ap.add_argument("--acoustic_cat", choices=("soft", "st"), default="soft",
+                    help="acoustic loss categoricals: soft = softmax(x/temp) (Stage 5); st = straight-through one-hot")
+    ap.add_argument("--acoustic_t_min", type=float, default=0.0,
+                    help="acoustic loss only on items with flow time t >= this (0 = all, Stage 5); 0.5 suggested")
+    ap.add_argument("--acoustic_t_weight", choices=("none", "t"), default="none",
+                    help="weight the acoustic loss per item by t (x_hat_1 is a cleaner patch estimate near t = 1)")
     return ap
 
 
@@ -792,12 +835,14 @@ def train(args):
         from torch.utils.data import RandomSampler
         from render_bank_v4 import BankLadderDataset, BankMainDataset, check_compatible, cycle, read_manifest
         manifest = read_manifest(args.bank)
-        # Allow both format 4 and 5 banks
-        probs = []
-        if manifest.get("format") not in (4, 5):
-            probs.append(f"bank format {manifest.get('format')} not in (4, 5)")
-        if probs and not args.allow_prior_change:
-            raise SystemExit("--bank does not fit this run:\n  " + "\n  ".join(probs))
+        # KUANG 2026-10-19: the format-only check let a bank built for another prior, or without inharmonicity labels,
+        # train silently. render_bank_v4 banks use the same 60-d storage as v5 (octaves digitised identically).
+        hard, soft = check_compatible(manifest, args.bass_manifold, args.all_manifold, args.inharm_weight,
+                                      args.inharm_config, args.ladder_every)
+        if hard:
+            raise SystemExit("--bank cannot serve this run:\n  " + "\n  ".join(hard))
+        if soft and not args.allow_prior_change:
+            raise SystemExit("--bank does not fit this run (--allow_prior_change to accept):\n  " + "\n  ".join(soft))
         main_ds = BankMainDataset(args.bank)
         need = (args.max_steps or 0) * args.batch_size * (1.0 - (1.0 / args.ladder_every if args.ladder_every else 0.0))
         log(f"Training clips from bank {args.bank} ({len(main_ds)} items, seed {args.bank_seed}); this run needs "
@@ -809,7 +854,8 @@ def train(args):
                             persistent_workers=args.num_workers > 0)
         batches = cycle(loader)
     else:
-        loader = DataLoader(RealisticOnlineDataset(args.manifold, args.plugin, random_patch_frac=args.random_patch_frac, inharm_cfg=inharm_cfg),
+        loader = DataLoader(RealisticOnlineDataset(args.bass_manifold, args.plugin, random_patch_frac=args.random_patch_frac,
+                                                   inharm_cfg=inharm_cfg, all_manifold_path=args.all_manifold),
                             batch_size=args.batch_size,
                             num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
                             prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
@@ -1086,20 +1132,13 @@ def train(args):
 
         opt_flow.zero_grad(set_to_none=True)
         if args.lambda_acoustic > 0.0:
-            f_loss, x_hat_1 = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
-                                        clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss, return_pred=True)
-            for p in jepa.parameters():
-                p.requires_grad = False
-            cont_hat, cat_blocks = codec.split_encoded(x_hat_1)
-            cont_input = cont_hat.clamp(0.0, 1.0) * 2.0 - 1.0
-            cat_soft = [F.softmax(b / args.acoustic_temp, dim=-1) for b in cat_blocks]
-            zp_hat = jepa.encode_params(cont_input, cat_soft)
-            za_hat = jepa.predict_audio_latent(zp_hat)
-            cos_sim = F.cosine_similarity(za_hat, za.detach(), dim=-1)
-            ac_loss = (1.0 - cos_sim).mean()
+            f_loss, x_hat_1, t_fl = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
+                                              clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss,
+                                              return_pred=True, return_t=True)
+            ac_loss, _ac_used = acoustic_consistency(jepa, x_hat_1, za, t_fl, temp=args.acoustic_temp,
+                                                     cat_mode=args.acoustic_cat, t_min=args.acoustic_t_min,
+                                                     t_weight=args.acoustic_t_weight)
             total_flow_loss = f_loss + args.lambda_acoustic * ac_loss
-            for p in jepa.parameters():
-                p.requires_grad = True
         else:
             f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
                                clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss, return_pred=False)

@@ -22,24 +22,31 @@ def _render_chunk(args):
     vecs, midi, labels = args
     from surge_spec_v4 import render_patch, vector_to_patch, check_glitch
     from realistic_prior_v4 import sample_unconstrained_random_patch
-    out, inh, val, final_vecs = [], [], [], []
+    import zlib
+    out, inh, val, final_vecs, final_midi = [], [], [], [], []
     for v, m in zip(vecs, midi):
         a = render_patch(_W["synth"], vector_to_patch(v), int(m), 0.3)
         tries = 0
         cur_v, cur_m = v.copy(), int(m)
+        # The redraw seed comes from the item's own vector (KUANG 2026-10-19). It was a function of the MIDI note
+        # only, so every glitching item on the same note got the same replacement patch: at most ~5 distinct
+        # replacements per note in the whole bank.
+        base_seed = zlib.crc32(np.ascontiguousarray(v, dtype=np.float32).tobytes())
         while check_glitch(a) and tries < 5:
             # Degenerate whistle or silence detected: redraw clean unconstrained random patch
-            rng = np.random.RandomState(int(cur_m) * 10007 + tries * 137 + 42)
+            rng = np.random.RandomState((base_seed + 7919 * (tries + 1)) % (2 ** 32))
             cur_v, cur_m = sample_unconstrained_random_patch(rng)
             a = render_patch(_W["synth"], vector_to_patch(cur_v), int(cur_m), 0.3)
             tries += 1
         out.append(a.astype(np.float32))
         final_vecs.append(cur_v)
+        final_midi.append(int(cur_m))
         if labels:
             r = _W["ext"].process_phrase(a, int(cur_m))
             inh.append(float(r["value"]) if r["valid"] else 0.0)
             val.append(1.0 if r["valid"] else 0.0)
-    return np.stack(out), np.array(inh, np.float32), np.array(val, np.float32), np.stack(final_vecs)
+    return (np.stack(out), np.array(inh, np.float32), np.array(val, np.float32), np.stack(final_vecs),
+            np.array(final_midi, np.int16))
 
 
 class RenderPoolV4:
@@ -76,6 +83,7 @@ class RenderPoolV4:
         parts = self._pool.map(_render_chunk, jobs) if self._pool is not None else [_render_chunk(j) for j in jobs]
         audio = np.concatenate([p[0] for p in parts])
         final_vecs = np.concatenate([p[3] for p in parts])
+        self.last_midi = np.concatenate([p[4] for p in parts])      # the note each clip was rendered at (redraws)
         if labels:
             return audio, np.concatenate([p[1] for p in parts]), np.concatenate([p[2] for p in parts]), final_vecs
         return audio, final_vecs
