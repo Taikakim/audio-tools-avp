@@ -426,6 +426,9 @@ def apply_patch(plugin, patch: dict) -> None:
     P["a_osc_2_octave"].raw_value = patch["osc_2_octave"]
     P["a_osc_3_octave"].raw_value = patch["osc_3_octave"]
     P["a_noise_color"].raw_value = patch["noise_color"]
+    P["a_osc_1_mute"].raw_value = 0.0
+    P["a_osc_2_mute"].raw_value = 0.0
+    P["a_osc_3_mute"].raw_value = 0.0
     P["a_osc_1_volume"].raw_value = patch["osc_1_volume"]
     P["a_osc_2_volume"].raw_value = patch["osc_2_volume"]
     P["a_osc_3_volume"].raw_value = patch["osc_3_volume"]
