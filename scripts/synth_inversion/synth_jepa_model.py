@@ -153,6 +153,10 @@ class PerceiverParameterEncoder(nn.Module):
     def forward(self, cont_params: torch.Tensor, cat_onehots: List[torch.Tensor]) -> torch.Tensor:
         # cont_params: [B, num_continuous] in [-1, 1]; cat_onehots: list of [B, k]
         B = cont_params.shape[0]
+        if cont_params.shape[1] != self.num_continuous:
+            raise ValueError(f"PerceiverParameterEncoder expected {self.num_continuous} continuous params, got {cont_params.shape[1]}")
+        if len(cat_onehots) != len(self.cat_sizes):
+            raise ValueError(f"PerceiverParameterEncoder expected {len(self.cat_sizes)} categorical one-hots, got {len(cat_onehots)}")
         tokens = [proj(cont_params[:, i:i + 1]) + self.param_biases[i] for i, proj in enumerate(self.cont_projs)]
         offset = self.num_continuous
         tokens += [proj(oh) + self.param_biases[offset + j] for j, (proj, oh) in enumerate(zip(self.cat_projs, cat_onehots))]
@@ -247,12 +251,19 @@ class SynthJEPA(nn.Module):
         ff_dim: int = 1024,
         in_frames: int = 81,
         inharmonicity_head: bool = False,
+        num_continuous: int = None,
+        cat_sizes: List[int] = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.audio_encoder = AudioTransformerEncoder(embed_dim=embed_dim, num_layers=num_audio_layers,
                                                      ff_dim=ff_dim, in_frames=in_frames)
-        self.param_encoder = PerceiverParameterEncoder(embed_dim=embed_dim, num_blocks=num_param_layers, ff_dim=ff_dim)
+        enc_kwargs = dict(embed_dim=embed_dim, num_blocks=num_param_layers, ff_dim=ff_dim)
+        if num_continuous is not None:
+            enc_kwargs["num_continuous"] = num_continuous
+        if cat_sizes is not None:
+            enc_kwargs["cat_sizes"] = cat_sizes
+        self.param_encoder = PerceiverParameterEncoder(**enc_kwargs)
         self.f_a2p = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.f_p2a = CrossDomainPredictor(in_dim=embed_dim, hidden_dim=predictor_hidden, out_dim=embed_dim)
         self.sigreg = SIGRegLoss(num_slices=num_slices_sigreg)

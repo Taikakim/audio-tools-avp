@@ -250,7 +250,7 @@ class FlowMatchingResMLPV4(FlowMatchingResMLP):
         return maps
 
 
-def build_model_v4(model_type="flow", hidden_dim=512, num_layers=8, encoding=codec.ENCODING_V2, time_scale=1000.0,
+def build_model_v4(model_type="flow", param_dim=None, hidden_dim=512, num_layers=8, encoding=codec.ENCODING_V2, time_scale=1000.0,
                    cond_noise=False, encoder="temporal_asp", film=False, film_rank=128, enc_kwargs=None,
                    xattn=False, xattn_dim=None, xattn_heads=4):
     """Same signature as `models_v3.build_model` plus the encoder choice. `encoder="conv"` with film=False returns the
@@ -258,9 +258,9 @@ def build_model_v4(model_type="flow", hidden_dim=512, num_layers=8, encoding=cod
     if model_type != "flow":
         raise ValueError("build_model_v4 builds the flow model only")
     if encoder == "conv" and not film and not xattn:
-        return FlowMatchingResMLP(hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding,
+        return FlowMatchingResMLP(param_dim=param_dim, hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding,
                                   time_scale=time_scale, cond_noise=cond_noise)
-    return FlowMatchingResMLPV4(hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding, time_scale=time_scale,
+    return FlowMatchingResMLPV4(param_dim=param_dim, hidden_dim=hidden_dim, num_layers=num_layers, encoding=encoding, time_scale=time_scale,
                                 cond_noise=cond_noise, encoder=encoder, film=film, film_rank=film_rank, enc_kwargs=enc_kwargs,
                                 xattn=xattn, xattn_dim=xattn_dim, xattn_heads=xattn_heads)
 
@@ -276,6 +276,7 @@ def load_inverter_v4(ckpt_path, device="cpu", v4_config=None):
     if "encoder.tok_proj.weight" not in state:
         from models_v3 import load_inverter
         return load_inverter(ckpt_path, device=device)
+    param_dim = state["head.weight"].shape[0]
     hidden = state["head.weight"].shape[1]
     num_layers = len({k.split(".")[1] for k in state if k.startswith("blocks.")})
     cfg = dict(v4_config or (ckpt.get("args") or {}).get("v4_config") or {})
@@ -293,7 +294,7 @@ def load_inverter_v4(ckpt_path, device="cpu", v4_config=None):
         cfg = dict(encoder=kind, film=any(k.startswith("film.") for k in state), film_rank=128,
                    enc_kwargs=dict(d_model=d_model, n_layers=n_layers), xattn=has_x,
                    xattn_dim=state["xattn.0.q.weight"].shape[0] if has_x else None, xattn_heads=4)
-    model = FlowMatchingResMLPV4(hidden_dim=hidden, num_layers=num_layers, cond_noise="tau_embed.1.weight" in state, **cfg)
+    model = FlowMatchingResMLPV4(param_dim=param_dim, hidden_dim=hidden, num_layers=num_layers, cond_noise="tau_embed.1.weight" in state, **cfg)
     model.load_state_dict(state)
     return model.to(device).eval()
 
