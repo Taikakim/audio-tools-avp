@@ -370,3 +370,99 @@ condition). The plan says the pipeline has not run yet. Code-read and CPU checks
 **Run:** `run_v6_1_pipeline.sh` (replaces the unversioned `scratch/run_v6_dpo_pipeline.sh`): tests, Surge checks
 with the shape scan, guided pairs, DPO β 100 / 300, **the held-out synthetic gate** (`audio_eval_v5.py`; the S5 DPO
 skipped it), the real-stem evaluation of S5 / S5-DPO / V6_C / V6_C-DPO in one run, paired statistics, audition page.
+
+## 10. October 20, 2026: Kim's listening test (`HUMAN_EVALUATION_SYNTHESIS.md`, commit `a4076e3`) and code for it
+
+Kim ranked five systems (S5, S5 DPO β 300, V6_A, V6_B, V6_C) on 24 real stems of the foundation run and wrote down
+what each one gets wrong. Antigravity compiled it into `HUMAN_EVALUATION_SYNTHESIS.md`. [V] = recomputed here from the
+rank tables in that file (21 stems with all five ranked; stems 10, 15 and 18 are missing one model).
+
+**What the ranks say** [V]
+- **No system is better than another on these stems.** Friedman test over the 21 complete stems: χ² = 2.0, p = 0.73.
+  Mean ranks run from 2.76 (DPO) to 3.38 (S5). Win counts and "tied for first" are not evidence of a difference
+  with 24 stems and five systems.
+- **The phrase score that picks the winners does not agree with the listener.** Within each stem, the Spearman
+  correlation between Kim's rank and the reported phrase MSS has median 0.05 (agrees on 11 of 21 stems; Wilcoxon p =
+  0.35). The distance between the winner's and the real stem's spectral centroid, |log2 ratio|, does: median 0.36,
+  agrees on 18 of 21, p = 0.0004. Spectral balance is what the ear ranks by here; the MSS fine structure is not.
+  This supports Kim's band ideas below, and is the single most useful number from the test.
+- **The document's numbers and the tables do not always match.** For example, stem 1's commentary says V6_C picked
+  "LP 12 dB, cutoff 0.44, FEG decay 0.28", while its table shows a diode ladder at 0.45. Stem 24 is called a Roland
+  SH-101 from Cosmosis' *Synergy* in the commentary, but Chakra & Edi Mis' *The Final Mission* in the commit and
+  catalog. The "controlled test" behind the waveshaper claim (stem 14, "+0.01 to +0.34 MSS") is not in the repository.
+  Treat the technical commentary as unverified until the tables or a script back it.
+
+**Corrections to the technical claims**
+- "**shape = 0.00 is the symmetric square**" is most likely a triangle. The scan's own numbers are parity 0 at shape 0
+  and 0.289 at shape 0.5. 0.289 is exactly a saw's value over 10 harmonics. That matches Surge's classic oscillator
+  going from triangle (−100 %) through saw (0 %) to pulse (+100 %; a square at width 50 %). Parity cannot tell a
+  triangle from a square, since both have odd harmonics only. The odd-harmonic slope can: square amplitudes fall as
+  1/k, a triangle's as 1/k². `check_v6_spec.py --shape_scan` now reports the slope and labels each shape. It only
+  proposes `--square_shape` for an odd-only 1/k spectrum. **Consequence:** the old default `--square_shape 0.5`
+  pushed square targets toward a saw. It has no default now, and the parity rules are off unless the scan supplies a
+  value. `check_v6_spec`'s pitch checks used shape 0 and measured harmonic 8, which a triangle does not have. They now
+  use shape 0.5 (saw) and harmonic 7.
+- **Parity on a near-sine.** A filtered-down bass (stem 11) has parity ≈ 0 because it has almost no harmonics, not
+  because it is square. Parity now needs harmonic richness ≥ 0.05 (harmonics 2–10 over the fundamental; a square
+  has 0.18) and is `nan` otherwise.
+- "**Digital waveshaper phase scatter degrades the STFT loss**": the multi-scale STFT loss compares magnitudes, so
+  phase is not the mechanism. A waveshaper whose harmonic levels differ from the target's (different curve, different
+  drive) adds magnitude error across many bins, and Occam's full-band tolerance then removes it. Kim's question
+  (stem 14), whether one parameter can flip the whole sound, has the answer yes. `waveshaper_type` is categorical,
+  and a flow that is unsure between "off" and five shapes will often land on "off". Look at
+  `occam` in the results JSON to tell "predicted off" from "removed by Occam". Under the band hierarchy below,
+  Occam keeps a waveshaper whenever removing it makes the body band worse.
+
+**Kim's ideas, implemented** [T] (`test_v6_listening.py`, CPU, fake synth; nothing has run on Surge)
+1. **Ignore what separation leaves above ~4 kHz:** `eval_real_stems_consensus_v6.py --max_eval_freq 4000` lowpasses
+   the real and the rendered audio (zero-phase, 8th order) before every score: rerank, polish, Occam and the reported
+   metrics. The saved audio stays full band. `--cond_lowpass` would also lowpass what the inverter hears. That is a
+   distribution shift for models trained on full-band renders, so it is an experiment only. The right fix there is to
+   train with random lowpass augmentation.
+2. **Band hierarchy, sub > body > air** (stem 24): `--select lexi` scores each candidate per band, below 120 Hz,
+   120–2 500 Hz and 2 500–4 000 Hz. Each band is a 1/f-weighted mean |dB difference| of STFT magnitudes, with
+   n_fft 8 192 for the sub band. Bands are compared in priority order: a band decides only when the difference is
+   above 5 % + 0.2 dB, otherwise the next band decides, and finally the old composite score (stereo, penalties)
+   (`am6.LexiScore`). Occam accepts a removal only if no band gets worse beyond that tolerance (`lexi_no_worse`):
+   "not allowed to make the lower level much worse". It is a selection rule for the reranker, not a training loss.
+   Surge is not differentiable (§5), so a lexicographic *training* loss would need a learned audio proxy or DPO
+   pairs chosen by this rule. Choosing DPO pairs this way is the natural next step if 5b below sounds better.
+3. **Resonance vs clean harmonics** (stem 17): `am6.resonance_excess_db` measures how far the loudest harmonic
+   stands above a local fit of its neighbours, on a log-frequency axis (±0.5 octave Gaussian, linear fit so the
+   −6 dB/octave slope is not a peak). On test signals: plain filtered saw < 3 dB, resonant filter > 5 dB at the
+   resonance, square < 1 dB (odd-only spectra are measured on the odd harmonics). Stored per stem and per winner
+   (`real_resonance_db`, `resonance_db`). It is not in the score yet: first see whether it tracks the listening ranks
+   (item 5).
+4. **Shoulder position as one number:** `am6.spectral_emd_oct`, the earth mover's distance between the long-term
+   magnitude spectra on a log2 axis, in octaves. It generalises the centroid ratio, the one measure that did track
+   the ranks. Stored per winner.
+5. **Which metric matches the ear:** `human_pref_agreement.py` reads `human_preferences.json` and the run's summary.
+   It reports the Friedman test and, per metric, the within-stem rank agreement. `--recompute LISTEN_DIR` computes
+   the new metrics on the exact audio that was ranked. Run it on the foundation run before trusting any of 2–4 in a
+   score (it is in the pipeline, after step 6).
+6. **Wrong export tempo** (stems 4 and 21): `--midi_scale STEM_ID=FACTOR` (100/141 = 0.7092, 110/140 = 0.7857). The
+   commit says the files were rescaled, so the pipeline leaves `MIDI_FIX` empty. Every stem is now also checked:
+   onset strength at the transcribed onsets under time scales 0.6–1.5. The eval prints a WARNING with the factor
+   when another scale fits clearly better, so a double rescale or a missed one shows in the log.
+
+**Run order** (`run_v6_1_pipeline.sh`, updated): as before, plus step 5b, the same systems with `--max_eval_freq
+4000 --select lexi` into `stems_v6_c_lexi4k`, and the agreement report on the foundation run. To decide whether the
+band rule is better, Kim listens to 5 and 5b side by side. A metric cannot decide it, because item 5 shows the
+current metric does not predict the ranks.
+
+**Addendum, commit `1acabcf` (Antigravity; documentation only).** It adds a cumulative-spectrum EMD loss
+(V6_1_PLAN.md 4.2), 1/f^γ frequency-decay weighting for the STFT loss (4.3) and a three-stage "frequency cascade"
+predictor (4.4, V6.2 roadmap).
+- 4.3 is now code: `am6.DecayMultiScaleSTFTLoss` and `--freq_decay GAMMA --decay_knee HZ`. γ = 0 reproduces the plain
+  loss [T]. Pipeline step 5c runs it below 4 kHz, as a separate arm from 5b (lexi), so the two ideas can be heard
+  apart. The weighting lowers how much the air counts. It does not add sub-bass resolution: at n_fft 256 the first
+  bin is 172 Hz wide. That is why `band_dists` uses n_fft 8 192 for the sub band.
+- 4.2 as written (power CDF on a linear Hz axis) is `am6.spectral_emd_linear`, kept so the stem 24 numbers
+  (0.2671 vs 0.0096) can be reproduced. That test's script is not in the repository [unverified]. The eval stores
+  `spectral_emd_oct` (magnitude, log2 axis) instead. On a bass, power is almost all in the fundamental, so the power
+  CDF hardly moves with the filter (§10 item 4). `human_pref_agreement.py` can compare both.
+- 4.4: "no gradient path from stage 3 to stages 1 and 2" does not stop air from moving the cutoff. Only the INPUT
+  does: stage 1 and 2 encoders must be fed band-limited audio, and trained that way. Training with random-lowpass
+  augmentation of the conditioning audio is the cheaper first step and makes `--cond_lowpass` safe to use.
+  Do this only if 5b / 5c show that ignoring the air helps on the separated stems.
+- V6_1_PLAN.md still says "shape = 0.000 is the symmetric square"; see the correction above.

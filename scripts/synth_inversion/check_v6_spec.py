@@ -10,8 +10,12 @@ measures the frequency of a harmonic peak with parabolic interpolation.
 Prints measured vs expected and exits 1 if any check is off by more than --tol_cents (default 3 cents).
 
 --shape_scan (V6.1): renders osc 1 alone at shape 0, 0.125, ..., 1 (width 0.5) and prints the harmonic parity
-(even / odd harmonic power; ~0 = odd harmonics only, a symmetric square). The shape with the lowest parity is the
-value for --square_shape in render_pairs_dpo_v6.py and eval_real_stems_consensus_v6.py (they assume 0.5).
+(even / odd harmonic power; ~0 = odd harmonics only), the harmonic richness and the odd-harmonic slope. KUANG
+2026-10-20: parity ~0 does not mean square: a triangle is odd-only too. Antigravity's scan found parity 0 at shape 0
+and 0.289 at 0.5 (a saw's value), which fits Surge's classic oscillator going triangle (-100 %) -> saw (0 %) ->
+pulse (+100 %), i.e. shape 0 a triangle and the square at 1.0. The slope tells them apart (square amplitudes 1/k:
+slope ~-2 in log power; triangle 1/k^2: ~-4). The scan picks the odd-only shape with a square's slope and prints
+"use --square_shape X" only if there is one (render_pairs_dpo_v6.py / eval_real_stems_consensus_v6.py take it).
 """
 import argparse
 import sys
@@ -46,8 +50,9 @@ def base_vector(note):
     v[I["midi_note"]] = (note - S.NOTE_LOW) / (S.NOTE_HIGH - S.NOTE_LOW)
     for n in ("waveshaper_type", "drive", "unison", "unison_detune", "sub_mix", "sync", "fm_depth", "fm_routing",
               "ring_1x2_volume", "ring_2x3_volume", "noise_volume", "drift", "chorus_mix", "delay_mix", "delay_fb",
-              "filter_configuration", "resonance", "feg_amount", "filter_2_resonance", "osc_3_volume", "shape"):
-        v[I[n]] = 0.0                                          # shape 0 = saw in the classic oscillator
+              "filter_configuration", "resonance", "feg_amount", "filter_2_resonance", "osc_3_volume"):
+        v[I[n]] = 0.0
+    v[I["shape"]] = 0.5                                        # a saw (all harmonics; shape 0 has no even ones)
     v[I["filter_feedback"]] = 0.5
     v[I["cutoff"]] = v[I["filter_2_cutoff"]] = 0.95
     v[I["aeg_sustain"]] = 0.85
@@ -68,7 +73,7 @@ def render_sustained(plugin, vec, note, seconds=2.0):
     return y[int(0.25 * SR):int((seconds - 0.05) * SR)]        # skip the attack
 
 
-def run(render, note, harmonic=8, tol=3.0, log=print):
+def run(render, note, harmonic=7, tol=3.0, log=print):
     """render(vec) -> mono audio. -> list of (name, measured cents, expected cents, ok)."""
     I = S.PARAM_INDEX
     f0 = 440.0 * 2 ** ((note - 69) / 12)
@@ -93,8 +98,15 @@ def run(render, note, harmonic=8, tol=3.0, log=print):
     return out
 
 
+def classify_wave(parity, slope):
+    """odd-only with a 1/k spectrum -> "square"; odd-only steeper (1/k^2) -> "triangle"; else "saw/mixed"."""
+    if not parity < 0.12:
+        return "saw/mixed"
+    return "square" if slope > -3.0 else "triangle"
+
+
 def shape_scan(render, note, shapes=tuple(np.linspace(0.0, 1.0, 9)), log=print):
-    """-> [(shape, parity)] for osc 1 alone, width 0.5; the lowest parity marks the symmetric square."""
+    """-> [(shape, parity, odd slope, label)] for osc 1 alone, width 0.5, and the square's shape (or None)."""
     import audio_metrics_v6 as am6
     I = S.PARAM_INDEX
     f0 = 440.0 * 2 ** ((note - 69) / 12)
@@ -103,13 +115,18 @@ def shape_scan(render, note, shapes=tuple(np.linspace(0.0, 1.0, 9)), log=print):
         v = base_vector(note)
         v[I["osc_1_volume"]], v[I["osc_2_volume"]] = 1.0, 0.0
         v[I["shape"]], v[I["width"]] = float(sh), 0.5
-        par = am6.compute_harmonic_parity(render(v), f0, SR)
-        out.append((float(sh), float(par)))
-        log(f"shape {sh:5.3f}: parity {par:.4f}")
-    best = min(out, key=lambda r: r[1])
-    log(f"lowest parity at shape {best[0]:.3f} -> use --square_shape {best[0]:.3f}"
-        + ("" if best[1] < 0.12 else " (but no shape reaches < 0.12: no odd-only waveform at width 0.5)"))
-    return out
+        y = render(v)
+        par, slope = am6.compute_harmonic_parity(y, f0, SR), am6.odd_harmonic_slope(y, f0, SR)
+        lab = classify_wave(par, slope)
+        out.append((float(sh), float(par), float(slope), lab))
+        log(f"shape {sh:5.3f}: parity {par:.4f} | odd slope {slope:+.2f} | {lab}")
+    squares = [r for r in out if r[3] == "square"]
+    if squares:
+        best = min(squares, key=lambda r: r[1])
+        log(f"symmetric square at shape {best[0]:.3f} -> use --square_shape {best[0]:.3f}")
+        return out, best[0]
+    log("no shape gives an odd-only 1/k spectrum at width 0.5: no --square_shape (the parity rules stay off)")
+    return out, None
 
 
 def main(argv=None):

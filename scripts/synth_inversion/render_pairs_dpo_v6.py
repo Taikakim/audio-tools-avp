@@ -5,7 +5,7 @@ Generates pairs (winner, loser) by combining:
 2. Active guided cutoff & waveshape polish:
    - Shifts filter 1 & 2 cutoff in the direction of the target spectral centroid / shoulder error.
    - Damps artificial filter 2 resonance if cutoff was over-choked.
-   - Guides oscillator shape to 0.50 (symmetric square) if the target exhibits strong odd-harmonic parity (<0.12).
+   - Guides oscillator shape to --square_shape (symmetric square) if the target exhibits strong odd-harmonic parity (<0.12).
 3. Renders all candidates through Surge XT in parallel (RenderPool).
 4. Scores candidates with logmel_l1, mss, and mel_ssim_dist for Flow-DPO training.
 
@@ -18,7 +18,9 @@ KUANG 2026-10-19 (V6_REVIEW.md section 9):
 - The guided candidate is only an extra candidate; pairs are still chosen by the rendered score, so a heuristic
   that is wrong simply loses. The manifest reports how often it wins (guided_best_share) and the usual headroom,
   and is written before the first shard, so train_flow_dpo_v5 can read a partial run.
-- --square_shape: the osc shape value of a symmetric square (0.5 is an assumption; check_v6_spec.py --shape_scan).
+- --square_shape: the osc shape value of a symmetric square (check_v6_spec.py --shape_scan). KUANG 2026-10-20: no
+  default any more. 0.5 is a saw in the classic oscillator (Antigravity's scan, parity 0.289); without the value the
+  parity rule does not fire. Parity also needs harmonics to read (am6.phrase_parity is nan on a near sine).
 """
 import argparse
 import json
@@ -53,7 +55,7 @@ def synth_conditions(prior, start, n, seed):
         midi.append(int(m))
     return np.stack(vecs), np.array(midi)
 
-def guide_candidate_vector(cand_vec, cand_audio, target_audio, midi_note, sr=44100, square_shape=0.5,
+def guide_candidate_vector(cand_vec, cand_audio, target_audio, midi_note, sr=44100, square_shape=None,
                            centroid_tol_hz=120.0):
     """Guided variant of a flow candidate (V6_1_PLAN.md 2.3), in the v6 stored vector:
       1. parity: target's first note has odd harmonics only (< 0.12) -> shape = square_shape, ring and noise off,
@@ -69,7 +71,7 @@ def guide_candidate_vector(cand_vec, cand_audio, target_audio, midi_note, sr=441
     fired = []
     c_tgt = am6.get_centroid(target_audio, sr)
     c_cand = am6.get_centroid(cand_audio, sr)
-    if am6.phrase_parity(target_audio, midi_note, sr) < 0.12:
+    if square_shape is not None and am6.phrase_parity(target_audio, midi_note, sr) < 0.12:
         v[I["shape"]] = square_shape
         v[I["ring_1x2_volume"]] = v[I["ring_2x3_volume"]] = v[I["noise_volume"]] = 0.0
         v[I["filter_2_resonance"]] = 0.0
@@ -99,7 +101,7 @@ def guide_candidate_vector(cand_vec, cand_audio, target_audio, midi_note, sr=441
 
 
 def build_shard(flow, pool, device, targets, midi, k_passive=4, steps=25, tau=1.0, seed=0, true_vecs=None,
-                metrics=("logmel_l1", "mss", "mel_ssim_dist"), square_shape=0.5, sample_fn=None):
+                metrics=("logmel_l1", "mss", "mel_ssim_dist"), square_shape=None, sample_fn=None):
     """Passive flow candidates + one guided candidate (from passive candidate 0 and its render) -> [n, K, P],
     scores {metric: [n, K]}, guided_rules [n] (which rules fired). The guided candidate is the last column."""
     mel = mel_of(targets, device)
@@ -153,8 +155,8 @@ def main(argv=None, pool=None, flow=None):
     ap.add_argument("--shard", type=int, default=512)
     ap.add_argument("--workers", type=int, default=14)
     ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--square_shape", type=float, default=0.5,
-                    help="osc shape value of a symmetric square (check_v6_spec.py --shape_scan)")
+    ap.add_argument("--square_shape", type=float, default=None,
+                    help="osc shape value of a symmetric square (check_v6_spec.py --shape_scan); parity rule off without it")
     ap.add_argument("--out", required=True, help="output directory for DPO preference shards")
     a = ap.parse_args(argv)
 

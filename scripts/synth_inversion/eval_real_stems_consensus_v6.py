@@ -22,6 +22,26 @@ Fixes (KUANG 2026-10-19, V6_REVIEW.md):
 - --occam_tol: after reranking, features of the winner (waveshaper, osc 2 / 3, sub, unison, ring, noise, feedback,
   detune, drift) are switched off one at a time while the phrase score stays within the tolerance (ablation_v6).
 - The private scratch directory is no longer on sys.path (it could shadow repo modules).
+
+KUANG 2026-10-20, from Kim's 24-stem listening test (HUMAN_EVALUATION_SYNTHESIS.md); all off by default:
+- --max_eval_freq HZ: score (rerank, polish, Occam, reported metrics) on lowpassed real AND rendered audio; the saved
+  audio stays full band. Separation leaves hiss above ~4 kHz that a full-band loss rewards filling.
+- --cond_lowpass HZ: also lowpass the audio the inverter is conditioned on. The models were trained on full-band
+  renders, so this is a distribution shift: an experiment, not a fix.
+- --select lexi: the phrase score becomes am6.LexiScore: per band (sub < 120 Hz, body 120..2500 Hz, air
+  2500..4000 Hz) dB distances on the mid channel, compared in that order with tolerances (--lexi_rel, --lexi_abs),
+  the old composite score (stereo, penalties) last. Occam then removes a feature only if no band gets worse beyond
+  the tolerance (am6.lexi_no_worse) and the composite stays within --occam_tol.
+- --midi_scale STEM_ID=FACTOR: multiply the stem's MIDI times by FACTOR (a MIDI exported at the wrong project tempo:
+  100 BPM for a 141 BPM song -> 100/141). Every stem's MIDI is also checked against the audio onsets
+  (onset_scale_check) and a warning printed when another tempo scale fits clearly better.
+- Results add real / winner resonance (am6.resonance_over_notes), spectral_emd_oct and band_dists for every model, so
+  human_pref_agreement.py can test them against the listening ranks.
+- --freq_decay GAMMA (--decay_knee HZ): the phrase score's multi-scale STFT loss weights each bin by
+  (1 + f / knee)^-gamma (am6.DecayMultiScaleSTFTLoss; V6_1_PLAN.md 4.3). Scores are then not comparable with
+  unweighted runs; results record the setting.
+- --square_shape has no default now: 0.5 is a saw in Surge's classic oscillator (Antigravity's scan: parity 0.289),
+  so the old default pushed square targets toward a saw. The parity penalty is off unless the value is given.
 """
 import argparse
 import json
@@ -60,6 +80,33 @@ import audio_metrics_v6 as am6
 DEFAULT_PLUGIN_PATH = spec_v4.DEFAULT_PLUGIN_PATH
 SAMPLE_RATE = 44100
 AUDIO_LEN = 35280  # 0.8s
+
+
+def scale_notes(notes, factor):
+    """MIDI note times * factor (wrong export tempo; see --midi_scale)."""
+    return [dict(n, start=n["start"] * factor, dur=n["dur"] * factor) for n in notes]
+
+
+def onset_scale_check(notes, y_mono, sr=SAMPLE_RATE, scales=None, hop=512):
+    """How well the transcribed onsets line up with the audio's onset strength when MIDI time is multiplied by each
+    scale (0.6..1.5). Score = mean onset strength at the predicted onsets (+-1 frame) over the clip's mean.
+    -> (best scale, its score, score at scale 1)."""
+    if scales is None:
+        scales = np.round(np.linspace(0.6, 1.5, 91), 3)
+    if len(notes) < 4:
+        return 1.0, float("nan"), float("nan")
+    env = librosa.onset.onset_strength(y=np.asarray(y_mono, np.float32), sr=sr, hop_length=hop)
+    env = np.maximum.reduce([env, np.roll(env, 1), np.roll(env, -1)])
+    mean = float(env.mean()) + 1e-9
+    starts = np.array([n["start"] for n in notes])
+
+    def score(sc):
+        fr = np.round(starts * sc * sr / hop).astype(int)
+        fr = fr[(fr >= 0) & (fr < len(env))]
+        return float(env[fr].mean() / mean) if len(fr) >= 4 else 0.0
+    res = [(score(sc), float(sc)) for sc in scales]
+    best = max(res)
+    return best[1], best[0], score(1.0)
 
 
 def load_clean_pedalboard_events(midi_path, max_dur=None):
@@ -203,7 +250,7 @@ def polish_vector(vec, spec, score_fn, centroid_fn, real_centroid, pitch_span, s
     def clip(name, x):
         lo, hi = bounds.get(name, (0.0, 1.0))
         return float(np.clip(x, lo, hi))
-    best_v, best_s, best_out, log = np.array(vec, np.float32, copy=True), float(start_score), start_out, []
+    best_v, best_s, best_out, log = np.array(vec, np.float32, copy=True), start_score, start_out, []
 
     def stage(name, cands):
         nonlocal best_v, best_s, best_out
@@ -429,7 +476,8 @@ def compute_stereo_metrics(y, is_channels_first=False):
 
 def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k_per_note=2, steps=25, seed=42,
                               second_note="auto", occam_tol=None, occam_abs=0.0, max_midi=None, drop_polyphony=False,
-                              polish=True, square_shape=0.5):
+                              polish=True, square_shape=None, max_eval_freq=None, cond_lowpass=None, select="mss",
+                              lexi_rel=0.05, lexi_abs=0.2, midi_scale=None, freq_decay=None, decay_knee=900.0):
     E = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval")
     audio_ref_dir = os.path.join(E, "audio")
     midi_muscriptor_dir = os.path.join(E, "midi_muscriptor")
@@ -455,7 +503,10 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
 
     print("Initializing Surge XT plugin...", flush=True)
     synth = spec_v4.init_synth(DEFAULT_PLUGIN_PATH)
-    loss_fn = MultiScaleSTFTLoss()
+    loss_fn = am6.DecayMultiScaleSTFTLoss(decay_knee, freq_decay) if freq_decay else MultiScaleSTFTLoss()
+    midi_scale = dict(midi_scale or {})
+    band = (lambda x: am6.lowpass(x, SAMPLE_RATE, max_eval_freq)) if max_eval_freq else (lambda x: x)
+    lexi_bands = tuple(b for b in am6.BANDS_HZ if b[1] < (max_eval_freq or 4000.0))
 
     results = []
 
@@ -485,6 +536,12 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             real_L, real_R = y_real, y_real
             y_real_mono = y_real
             y_real = np.stack([y_real, y_real], axis=-1)
+        y_real_full = y_real                                   # the saved reference stays full band
+        y_cond_mono = am6.lowpass(y_real_mono, sr, cond_lowpass) if cond_lowpass else y_real_mono
+        if max_eval_freq:                                      # everything scored below is band limited
+            real_L, real_R = band(real_L), band(real_R)
+            y_real = np.stack([real_L, real_R], axis=-1)
+            y_real_mono = y_real.mean(axis=1)
 
         real_width, real_corr = compute_stereo_metrics(y_real, is_channels_first=False)
         real_stereo_class = "Pure Mono" if real_width < 0.02 else ("Wide Stereo" if real_width > 0.3 else "Narrow Stereo")
@@ -500,6 +557,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
 
         phrase_dur = len(y_real_mono) / sr
         events = load_clean_pedalboard_events(midi_path, max_dur=phrase_dur)
+        scale = float(midi_scale.get(stem_id, 1.0))
         real_centroid = get_centroid(y_real_mono, sr)
 
         real_cent_L = get_centroid(real_L, sr)
@@ -508,6 +566,14 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
 
         # Extract notes and select clean representative subset
         all_notes = extract_notes_from_midi(midi_path, max_dur=phrase_dur)
+        if scale != 1.0:
+            all_notes = [n for n in scale_notes(extract_notes_from_midi(midi_path), scale) if n["start"] < phrase_dur]
+            events = events_from_notes(all_notes, phrase_dur)
+            print(f"  MIDI times x {scale:.4f} (--midi_scale)", flush=True)
+        best_sc, sc_best, sc_one = onset_scale_check(all_notes, y_real_mono, sr)
+        if np.isfinite(sc_best) and abs(best_sc - 1.0) > 0.03 and sc_best > 1.2 * sc_one:
+            print(f"  WARNING: MIDI onsets fit the audio better at time x {best_sc:.3f} (score {sc_best:.2f} vs "
+                  f"{sc_one:.2f}); wrong export tempo? --midi_scale {stem_id}={best_sc * scale:.4f}", flush=True)
         if max_midi is not None or drop_polyphony:
             n_before = len(all_notes)
             all_notes = filter_transcription(all_notes, max_midi, drop_polyphony)
@@ -519,7 +585,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
         print(f"\n[{idx+1:02d}/24] Inverting '{name}' ({style}, {bpm} BPM, {real_stereo_class} W={real_width:.2f}, {len(all_notes)} notes -> selected {len(selected_notes)} notes: {pitches})...", flush=True)
 
         ref_phrase_dest = os.path.join(listen_dir, f"{stem_id}__real_phrase.wav")
-        sf.write(ref_phrase_dest, y_real, sr, subtype="PCM_16")
+        sf.write(ref_phrase_dest, y_real_full, sr, subtype="PCM_16")
 
         # Nominal root, sub-octave threshold, and harmonic parity
         root_midi = max(set(pitches), key=pitches.count) if pitches else 36
@@ -529,6 +595,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
         freqs_real = np.fft.rfftfreq(len(y_real_mono), 1.0 / sr)
         t_sub = float(np.sum(fft_real[freqs_real < sub_thresh]**2) / (np.sum(fft_real**2) + 1e-9))
         real_parity = am6.parity_over_notes(y_real_mono, selected_notes, sr)    # each note at its own f0
+        real_res_db, real_res_hz = am6.resonance_over_notes(y_real_mono, selected_notes, sr)
 
         stem_res = {
             "stem_id": stem_id,
@@ -540,6 +607,15 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             "real_width": round(real_width, 3),
             "real_corr": round(real_corr, 3),
             "real_stereo_class": real_stereo_class,
+            "real_resonance_db": None if not np.isfinite(real_res_db) else round(float(real_res_db), 2),
+            "real_resonance_hz": None if not np.isfinite(real_res_hz) else round(float(real_res_hz), 1),
+            "midi_scale": scale,
+            "midi_scale_check": {"best": best_sc, "score_best": round(sc_best, 3) if np.isfinite(sc_best) else None,
+                                 "score_at_1": round(sc_one, 3) if np.isfinite(sc_one) else None},
+            "select": select,
+            "max_eval_freq": max_eval_freq,
+            "cond_lowpass": cond_lowpass,
+            "freq_decay": None if not freq_decay else {"gamma": freq_decay, "knee_hz": decay_knee},
             "models": {}
         }
 
@@ -552,10 +628,10 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             # Collect candidates across all selected notes
             cand_vecs, note_info = [], []
             for n_idx, n in enumerate(selected_notes):
-                chunk, chunk_dur = cut_note(y_real_mono, n, sr, next_start=next_onset(n, all_notes))
+                chunk, chunk_dur = cut_note(y_cond_mono, n, sr, next_start=next_onset(n, all_notes))
                 sixteenth_s = chunk_dur
                 partner = octave_partner(n, all_notes) if second_note == "auto" else None
-                chunk_oct = (cut_note(y_real_mono, partner, sr, next_start=next_onset(partner, all_notes))[0]
+                chunk_oct = (cut_note(y_cond_mono, partner, sr, next_start=next_onset(partner, all_notes))[0]
                              if partner is not None else None)
 
                 t_phrase, t_rolling = build_conditioning_targets(chunk, sixteenth_s, sr=sr, chunk_oct=chunk_oct)
@@ -598,10 +674,11 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                 synth.parameters["a_osc_3_retrigger"].raw_value = 1.0 if retrig else 0.0
 
                 pred_audio = synth.process(events, duration=phrase_dur, sample_rate=SAMPLE_RATE, num_channels=2)
-                pred_L, pred_R = pred_audio[0], pred_audio[1]
+                pred_L, pred_R = band(pred_audio[0]), band(pred_audio[1])
+                pred_scored = np.stack([pred_L, pred_R]) if max_eval_freq else pred_audio
                 pred_mid = (pred_L + pred_R) / np.sqrt(2.0)
                 pred_side = (pred_L - pred_R) / np.sqrt(2.0)
-                pred_width, pred_corr = compute_stereo_metrics(pred_audio, is_channels_first=True)
+                pred_width, pred_corr = compute_stereo_metrics(pred_scored, is_channels_first=True)
 
                 pred_mid_norm = pred_mid / (np.max(np.abs(pred_mid)) + 1e-7)
                 l = min(len(pred_mid_norm), len(real_mid_norm))
@@ -626,7 +703,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
 
                 # Harmonic parity penalty for square wave disambiguation
                 parity_pen = 0.0
-                if np.isfinite(real_parity) and real_parity < 0.12:
+                if square_shape is not None and np.isfinite(real_parity) and real_parity < 0.12:
                     cand_shape = float(p.get("shape", 0.0))
                     shape_pen = abs(cand_shape - square_shape) * 1.5
                     ring_pen = (float(p.get("ring_1x2_volume", 0.0)) + float(p.get("ring_2x3_volume", 0.0))) * 1.2
@@ -641,6 +718,9 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                     score = stft_mid + 0.4 * stft_side + 0.6 * width_err + sub_pen + bal_pen + cent_bal_pen + parity_pen
                 else:
                     score = stft_mid + 1.2 * pred_width + sub_pen + bal_pen + cent_bal_pen + parity_pen
+                if select == "lexi":
+                    bd = am6.band_dists(pred_mid_norm[:l], real_mid_norm[:l], sr, bands=lexi_bands)
+                    score = am6.LexiScore([bd[b[0]] for b in lexi_bands], score, rel=lexi_rel, abs_db=lexi_abs)
                 return score, pred_audio, pred_width, pred_corr
 
             # Re-rank candidates on full phrase in Surge XT (with stereo & retrigger search)
@@ -677,7 +757,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                     s_, a_, w_, c_ = phrase_score(capped_patch(v), best_retrig)
                     return s_, (a_, w_, c_)
                 win_vec, best_score, (best_audio, best_width, best_corr), polish_log = polish_vector(
-                    win_vec, lay.spec, score_vec, lambda out: get_centroid(out[0].mean(axis=0), sr), real_centroid,
+                    win_vec, lay.spec, score_vec, lambda out: get_centroid(band(out[0].mean(axis=0)), sr), real_centroid,
                     span, best_score, (best_audio, best_width, best_corr))
                 best_patch = capped_patch(win_vec)
             occam_log, score_before_occam = [], best_score
@@ -695,7 +775,9 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                     if not trials:
                         break
                     s2, a2, w2, c2, fname, v2, p2 = min(trials, key=lambda tr: tr[0])
-                    if s2 > best_score + max(occam_abs, occam_tol * best_score):
+                    if float(s2) > float(best_score) + max(occam_abs, occam_tol * float(best_score)):
+                        break
+                    if select == "lexi" and not am6.lexi_no_worse(s2, best_score, lexi_rel, lexi_abs):
                         break
                     occam_log.append({"removed": fname, "score": round(float(s2), 4)})
                     best_score, best_audio, best_width, best_corr, win_vec, best_patch = s2, a2, w2, c2, v2, p2
@@ -703,7 +785,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             el = time.time() - t0
 
             # Compute detailed audio metrics for winner
-            pred_winner_mono = best_audio.mean(axis=0)
+            pred_winner_mono = band(best_audio.mean(axis=0))
             pred_winner_norm = pred_winner_mono / (np.max(np.abs(pred_winner_mono)) + 1e-7)
             win_centroid = get_centroid(pred_winner_norm, sr)
             centroid_err = win_centroid - real_centroid
@@ -713,6 +795,10 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             # Both are stored now: mel_ssim = SSIM (higher = closer), mel_ssim_dist = 1 - SSIM.
             mel_ssim_dist = float(am.mel_ssim_dist(y_real_norm[:l_eval], pred_winner_norm[:l_eval]))
             mel_ssim = 1.0 - mel_ssim_dist
+            win_bands = am6.band_dists(pred_winner_norm[:l_eval], y_real_norm[:l_eval], sr, bands=lexi_bands)
+            win_emd = am6.spectral_emd_oct(pred_winner_norm[:l_eval], y_real_norm[:l_eval], sr,
+                                           fmax=min(4000.0, max_eval_freq or 4000.0))
+            win_res_db, win_res_hz = am6.resonance_over_notes(pred_winner_mono, selected_notes, sr)
 
             # Save winner audio
             cand_filename = f"{stem_id}__{m_name}.wav"
@@ -731,7 +817,11 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             patch_summary += f" | Retrig: {'On' if best_retrig else 'Off'}"
 
             stem_res["models"][m_name] = {
-                "phrase_mss": round(best_score, 3),
+                "phrase_mss": round(float(best_score), 3),
+                "band_dists": {k: round(v, 3) for k, v in win_bands.items()},
+                "spectral_emd_oct": round(win_emd, 4),
+                "resonance_db": None if not np.isfinite(win_res_db) else round(float(win_res_db), 2),
+                "resonance_hz": None if not np.isfinite(win_res_hz) else round(float(win_res_hz), 1),
                 "mel_ssim": round(mel_ssim, 4),
                 "mel_ssim_dist": round(mel_ssim_dist, 4),
                 "centroid_hz": round(win_centroid, 1),
@@ -973,9 +1063,22 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_polish", action="store_true", help="skip the V6.1 cutoff / FEG / keytrack polish")
-    parser.add_argument("--square_shape", type=float, default=0.5,
-                        help="osc shape value of a symmetric square in Surge (parity penalty); measure it with "
-                             "check_v6_spec.py --shape_scan before trusting 0.5")
+    parser.add_argument("--square_shape", type=float, default=None,
+                        help="osc shape value of a symmetric square in Surge (check_v6_spec.py --shape_scan); the "
+                             "parity penalty is off without it")
+    parser.add_argument("--max_eval_freq", type=float, default=None,
+                        help="score on audio lowpassed at this frequency (e.g. 4000); saved audio stays full band")
+    parser.add_argument("--cond_lowpass", type=float, default=None,
+                        help="also lowpass the conditioning audio (distribution shift: experiment)")
+    parser.add_argument("--select", choices=("mss", "lexi"), default="mss",
+                        help="lexi: band-hierarchical score (sub > body > air), see the module docstring")
+    parser.add_argument("--lexi_rel", type=float, default=0.05, help="relative band tolerance for --select lexi")
+    parser.add_argument("--lexi_abs", type=float, default=0.2, help="absolute band tolerance (dB) for --select lexi")
+    parser.add_argument("--freq_decay", type=float, default=None, metavar="GAMMA",
+                        help="weight the phrase STFT loss by (1 + f / knee)^-GAMMA (V6_1_PLAN.md 4.3: 1.0..1.5)")
+    parser.add_argument("--decay_knee", type=float, default=900.0, help="knee frequency for --freq_decay (Hz)")
+    parser.add_argument("--midi_scale", action="append", default=[], metavar="STEM_ID=FACTOR",
+                        help="multiply a stem's MIDI times (wrong export tempo); repeatable")
     parser.add_argument("--max_midi", type=int, default=None,
                         help="drop transcribed notes above this MIDI note (V6_SPECIFICATION.md 3.5: 60)")
     parser.add_argument("--drop_polyphony", action="store_true",
@@ -994,4 +1097,7 @@ if __name__ == "__main__":
                               k_per_note=args.k, steps=args.steps, seed=args.seed, second_note=args.second_note,
                               occam_tol=args.occam_tol, occam_abs=args.occam_abs, max_midi=args.max_midi,
                               drop_polyphony=args.drop_polyphony, polish=not args.no_polish,
-                              square_shape=args.square_shape)
+                              square_shape=args.square_shape, max_eval_freq=args.max_eval_freq,
+                              cond_lowpass=args.cond_lowpass, select=args.select, lexi_rel=args.lexi_rel,
+                              lexi_abs=args.lexi_abs, freq_decay=args.freq_decay, decay_knee=args.decay_knee,
+                              midi_scale={k: float(v) for k, v in (a.split("=", 1) for a in args.midi_scale)})
