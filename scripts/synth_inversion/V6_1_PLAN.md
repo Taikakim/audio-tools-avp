@@ -61,14 +61,52 @@ Prior to Occam pruning, the winning candidate undergoes 3-stage local polish on 
 
 ---
 
-## 3. Verification & Benchmark Plan
+## 4. Cumulative Spectral Prefix Prediction & Frequency-Decay Hierarchy
+
+Formulated during the Stem 24 audit (*Chakra & Edi Mis – The Final Mission*), this paradigm resolves the fundamental vulnerability of neural synth inversion to source-separation artifacts.
+
+### 4.1 The Core Problem: Linear FFT Dominance
+Standard STFT loss treats all frequency bins with equal weight. In a 2048-point STFT at 44.1 kHz (~21.5 Hz per bin):
+- **Sub-Bass (20–120 Hz)**: Only ~5 bins (0.5% of total).
+- **Body (120–2500 Hz)**: ~110 bins (10.7% of total).
+- **Air (> 2500 Hz)**: ~910 bins (88.8% of total).
+
+When a real stem is separated from a full mix via Demucs or BS-Roformer, the upper 90% of bins are contaminated with residual cymbals, hi-hat bleed, and phase-cancellation noise (-40 to -60 dB). Unweighted loss forces optimizers to open filters to 0.95 and add FM/unison to fit this high-frequency noise, sacrificing the fundamental and filter shoulder.
+
+### 4.2 Cumulative Spectral Energy Distribution (1D Wasserstein / EMD)
+Instead of pointwise bin error, evaluate the spectrum iteratively from bin 0 upwards via the **Cumulative Energy Distribution (CDF)**:
+
+$$\text{CDF}(f) = \frac{\sum_{j=0}^{k(f)} |X_j|^2}{\sum_{j=0}^{K} |X_j|^2}, \qquad \mathcal{L}_{\text{EMD}} = \int_0^{f_{\text{max}}} \left| \text{CDF}_{\text{pred}}(f) - \text{CDF}_{\text{real}}(f) \right| df$$
+
+- **Mathematical Invariant**: Bin 0 (Sub/Fundamental) is included in every prefix term from $1 \dots K$. Higher bins only influence the tail.
+- **Empirical Validation (Stem 24)**: Raw unweighted STFT favored `V6_A` (3.51) over `S5` (4.58) due to high-frequency noise matching Demucs hiss. Cumulative Spectral EMD penalized `V6_A` by **26×** (`0.2671` vs `0.0096` for S5), correctly matching human listening preference for the closed analog saw bass.
+
+### 4.3 $1/f^\gamma$ Frequency-Decay STFT Loss
+Scales the multi-scale spectral convergence and log-magnitude L1 by a frequency-decay envelope:
+
+$$w(f) = \frac{1}{\left(1 + \frac{f}{f_{\text{knee}}}\right)^\gamma}, \qquad f_{\text{knee}} \approx 800\text{–}1000\text{ Hz}, \quad \gamma \in [1.0, 1.5]$$
+
+- Fundamental ($50\text{ Hz}$): $w(f) \approx 1.00$
+- Filter Shoulder ($800\text{ Hz}$): $w(f) \approx 0.50$
+- Air / Separation Noise ($8000\text{ Hz}$): $w(f) \approx 0.03$ ($30\times$ down-weighted)
+
+### 4.4 Coarse-to-Fine Frequency Hierarchy in Neural Architecture (V6.2 Roadmap)
+Structured as a 3-stage frequency cascade:
+1. **Stage 1 (Sub Band: 20–150 Hz)**: Predicts strictly fundamental parameters (`root_midi`, `osc_1_octave`, `sub_mix`) from sub-bins only. Completely blind to high frequencies.
+2. **Stage 2 (Body Band: 150–2500 Hz)**: Conditioned on Stage 1, predicts `filter_idx`, `cutoff`, `resonance`, `shape` (saw vs. square), and `aeg_decay`.
+3. **Stage 3 (Air Band: > 2500 Hz)**: Conditioned on Stages 1 & 2, refines fine edge parameters (noise, chorus, transient click). Crucially, Stage 3 has no gradient path to Stage 1 or Stage 2 outputs—it is mathematically forbidden from altering cutoff or octave to fit air.
+
+---
+
+## 5. Verification & Benchmark Plan
 
 1. **Unit Verification:**
    - Run `audio_metrics_v6.py` unit tests for knee detection and parity computation.
    - Run `test_polish_keytrack_feg.py` to confirm bounds and parameter mapping.
 2. **Training & Real Stems Pipeline:**
-   - Launch `scratch/run_v6_dpo_pipeline.sh` when GPU 0 is free:
+   - Launch `scripts/synth_inversion/run_v6_1_pipeline.sh` when GPU 0 is free:
      * Render 8,192 guided preference pairs via 14 CPU workers.
      * Train Flow-DPO on `V6_C` ($\beta=100$ and $\beta=300$).
-     * Run 24 Real Stems Benchmark comparing `S5`, `DPO_b300`, `V6_C`, `V6_C_DPO_b100`, `V6_C_DPO_b300`.
+     * Run 24 Real Stems Benchmark with `--max_eval_freq 4000` and frequency-decay weighting.
      * Build interactive audition page at `/home/kim/sao_runs/stems_v6_c_dpo_occam/listen/index.html`.
+

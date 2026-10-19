@@ -28,19 +28,30 @@ This document compiles the complete, stem-by-stem human listening evaluation of 
    * **Solution**: Add `--max_eval_freq 4000` to lowpass conditioning targets and slice STFT evaluation frames to <= 4 kHz.
 
 2. **The 3-Band Hierarchical Lexicographical Loss (Sub-Bass > Body > Air)**:
-   * Formulated by the human evaluator during Stem 24 (Final Mission).
-   * Because linear FFT bins allocate ~90% of bins above 2 kHz, optimizers trade away the fundamental and filter shoulder to chase high-frequency noise.
+   * Formulated by the human evaluator during Stem 24 (*Chakra & Edi Mis – The Final Mission*).
+   * Because linear FFT bins allocate ~90% of bins above 2 kHz, optimizers trade away the fundamental and filter shoulder to chase high-frequency separation noise.
    * **Solution**: Optimization must strictly lock Sub-Bass (< 120 Hz) first, then Body (120–2500 Hz), and only allow Air (> 2500 Hz) to be refined if Body loss does not degrade.
 
-3. **Digital Waveshaper Loss Penalty**:
+3. **Cumulative Spectral Energy Distribution (1D Wasserstein / EMD) & 1/f Decay Loss**:
+   * **Iterative Prefix Formulation**: Evaluate the spectrum iteratively bin-by-bin from lowest to highest via cumulative energy distribution:
+     $$\text{CDF}(f) = \frac{\sum_{j=0}^{k(f)} |X_j|^2}{\sum_{j=0}^{K} |X_j|^2}, \qquad \mathcal{L}_{\text{EMD}} = \int_0^{f_{\text{max}}} \left| \text{CDF}_{\text{pred}}(f) - \text{CDF}_{\text{real}}(f) \right| df$$
+   * Because bin 0 (sub/fundamental) is present in every prefix slice, it receives maximum cumulative weight.
+   * **Stem 24 Empirical Test**: Raw unweighted STFT favored `V6_A` (3.51) over `S5` (4.58) due to high-frequency noise matching Demucs hiss. Cumulative Spectral EMD penalized `V6_A` by **26×** (`0.2671` vs `0.0096` for S5), correctly matching human listening preference for the closed analog saw bass.
+   * **$1/f^\gamma$ Decay Weighting**: MultiScaleSTFTLoss bins are scaled by $w(f) = \frac{1}{(1 + f/f_{\text{knee}})^\gamma}$ ($f_{\text{knee}} \approx 800\text{–}1000\text{ Hz}$), giving the sub-bass 30× more leverage than high-frequency hiss.
+   * **3-Stage Frequency Cascade Predictor (V6.2 Roadmap)**:
+     - Stage 1 (Sub 20–150 Hz): Predicts fundamental/octave/sub mix. Blind to high frequencies.
+     - Stage 2 (Body 150–2500 Hz): Predicts filter type, cutoff, resonance, waveform shape, decay.
+     - Stage 3 (Air > 2500 Hz): Refines noise, chorus, transient click. Mathematically forbidden from updating Stage 1 or 2 outputs.
+
+4. **Digital Waveshaper Loss Penalty**:
    * Empirical test on Stem 14 (TB-303 Acid) demonstrated that enabling ANY Surge waveshaper monotonically degrades MultiScaleSTFTLoss (+0.01 to +0.34) against analog-clipped targets.
    * Digital waveshapers produce wideband harmonic spray across hundreds of FFT bins. Bin-by-bin phase/magnitude mismatches accumulate penalties, causing Occam simplification to strip waveshapers.
 
-4. **Classic Oscillator Geometry in Surge XT**:
+5. **Classic Oscillator Geometry in Surge XT**:
    * Parameter scan proved that `shape = 0.000` is the true symmetric square wave (zero even harmonics, P_harm = 0.0000).
    * `shape = 0.500` is a saw/pulse hybrid with 28.9% even harmonic power.
 
-5. **DAW Export Tempo Drift in Stems 04 & 21**:
+6. **DAW Export Tempo Drift in Stems 04 & 21**:
    * User-fixed MIDIs (`muscriptor_FIX.mid`) had DAW project tempos set to 100 BPM (Stem 04) and 110 BPM (Stem 21) instead of song tempos (141 and 140 BPM).
    * This stretched note intervals by 1.41x and 1.27x, drifting notes out of phase with audio. Timestamps must be linearly rescaled.
 
