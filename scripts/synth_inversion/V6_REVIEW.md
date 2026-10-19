@@ -317,3 +317,56 @@ python train_realistic_bass_v6.py --bank ~/sao_runs/bank_v6 --bass_manifold $B -
 ```
 Then `audio_eval_v5.py` on the three (held-out synthetic, paired), the real-stem evaluation with
 `--max_midi 60 --drop_polyphony --occam_tol 0.02`, `stem_stats_v6.py`, and Kim's blind listening.
+
+---
+
+## 9. October 20, 2026: review of the V6.1 plan (`V6_1_PLAN.md`, commit `a29fefd`) and fixes
+
+V6.1 adds a local polish of the reranked winner (cutoff, filter envelope, keytrack), a harmonic-parity penalty,
+longer note crops ("gate normalization"), and guided Flow-DPO pairs (an extra, heuristically edited candidate per
+condition). The plan says the pipeline has not run yet. Code-read and CPU checks:
+
+**Bugs fixed** [V][T]
+1. **Keytrack polish crashed:** it read `notes`, undefined in that function, so every stem whose phrase spans 7 or
+   more semitones would have raised `NameError`. Now uses the stem's notes.
+2. **Occam threw the polish away:** the polish edited the patch dict, Occam restarted from the unpolished vector, so
+   any accepted removal discarded the polish. The polish now works on the stored vector (`polish_vector`), and Occam
+   continues from it. Keytrack -100 % (raw 0.25) is not representable in the vector space and is dropped;
+   values stay inside the spec's bounds.
+3. **Parity measured the wrong audio:** `rfft(y, n=8192)` kept only the first 186 ms, so on a real stem it
+   measured whatever came first (often silence or another note) at the root note's frequency. Over a whole phrase it
+   is wrong anyway: a note an octave up puts its odd harmonics on the root's even ones (a square phrase with its
+   octave note measures 137, the first note alone 0.006). Now: `parity_over_notes` (each transcribed note at its own
+   f0, median) for stems and `phrase_parity` (first note) for training-phrase renders.
+4. **"Gate normalization" read into the next note:** stretching every crop to 125 ms took the next note's onset into
+   the conditioning clip whenever a note is shorter (a 16th at 140 BPM is 107 ms). The crop now stops at the next
+   onset and the rest of the 125 ms is silence.
+5. **Guided DPO candidate ignored the candidate:** it compared the target's centroid with fixed cutoff thresholds;
+   the plan's rule is the centroid ERROR above 120 Hz. It now renders passive candidate 0 and uses its centroid
+   (`guide_candidate_vector`, in the stored v6 vector instead of a patch round trip). The manifest is written before
+   the first shard and reports headroom and how often the guided candidate wins (`guided_best_share`); each
+   condition stores which rules fired (`guided_rules`).
+
+**Assumptions now checked instead of assumed**
+- "shape = 0.50 is a symmetric square": `check_v6_spec.py --shape_scan` renders osc 1 at nine shape values and
+  reports parity; the pipeline passes the measured value as `--square_shape` to the pair generator and the evaluation.
+- `compute_spectral_shoulder` does not measure the filter [V]: on a 55 Hz saw through a 2-pole low-pass, cutoffs of
+  800 / 1 600 / 3 200 Hz give "shoulders" of 613 / 704 / 719 Hz. The -8 dB-below-passband rule mostly finds the saw's
+  own 1/k roll-off. It is unused by the V6.1 scripts (the polish uses the centroid); do not use it until it passes a
+  ladder check. It now averages the whole clip (Welch) instead of reading the first 93 ms.
+
+**Method notes**
+- The polish and Occam choose by the same phrase score that is reported, so the reported score of a polished system
+  is optimistic against an unpolished one. Compare systems inside one run, all polished (the pipeline does), with
+  `stem_stats_v6.py`, and let listening decide; `--no_polish` gives the unpolished reference.
+- Guided pairs are honest as long as the pair is chosen by the rendered score (it is): a wrong heuristic just loses.
+  If one rule wins most conditions, DPO learns that rule; `guided_rules` shows which.
+- The plan's base numbers ("V6_C held-out MSS 6.07 / SSIM 0.284") come without the V6_A / B / C comparison or a
+  reference; please add the `audio_eval_v5.py` report of A / B / C against S5 (and say whether 0.284 is SSIM or
+  1 - SSIM).
+- The `a_osc_N_mute = 0` lines added to `surge_spec_v5.apply_patch` are a sensible guard (an oscillator muted by an
+  earlier state would stay muted).
+
+**Run:** `run_v6_1_pipeline.sh` (replaces the unversioned `scratch/run_v6_dpo_pipeline.sh`): tests, Surge checks
+with the shape scan, guided pairs, DPO β 100 / 300, **the held-out synthetic gate** (`audio_eval_v5.py`; the S5 DPO
+skipped it), the real-stem evaluation of S5 / S5-DPO / V6_C / V6_C-DPO in one run, paired statistics, audition page.

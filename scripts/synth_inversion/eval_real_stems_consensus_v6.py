@@ -159,16 +159,95 @@ def select_representative_notes(notes, max_notes=6):
     return selected
 
 
-def cut_note(y_mono, n, sr=SAMPLE_RATE):
+def cut_note(y_mono, n, sr=SAMPLE_RATE, next_start=None):
     """One transcribed note -> peak-normalised chunk (125..240 ms, 5 ms fade out) and its length in seconds.
-    Ensures at least 125 ms is captured (matching the training Note 1 gate) so natural release tails are preserved."""
+    Ensures at least 125 ms (the training note-1 gate). KUANG 2026-10-19: audio is taken only up to the next
+    note's onset (next_start, seconds) and the rest of the 125 ms is silence. Reading past it put the start of the
+    next note into the conditioning clip whenever notes are shorter than 125 ms (a 16th at 140 BPM is 107 ms)."""
     s_idx = max(0, int(round(n["start"] * sr)))
     chunk_dur = min(0.240, max(0.125, n["dur"]))
-    chunk = y_mono[s_idx: s_idx + int(round(chunk_dur * sr))].copy()
+    n_len = int(round(chunk_dur * sr))
+    end = s_idx + n_len
+    if next_start is not None:
+        end = min(end, max(s_idx + 1, int(round(next_start * sr))))
+    audio = y_mono[s_idx:end].copy()
     fade_len = int(sr * 0.005)
-    if len(chunk) > fade_len:
-        chunk[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)
+    if len(audio) > fade_len:
+        audio[-fade_len:] *= np.linspace(1.0, 0.0, fade_len)
+    chunk = np.zeros(n_len, dtype=np.float32)
+    chunk[:len(audio)] = audio[:n_len]
     return chunk / (np.max(np.abs(chunk)) + 1e-7), chunk_dur
+
+
+def next_onset(n, notes):
+    """Start of the first transcribed note after n's start, or None."""
+    later = [m["start"] for m in notes if m["start"] > n["start"] + 1e-4]
+    return min(later) if later else None
+
+
+POLISH_KEYTRACK_RAW = (0.50, 0.625, 0.75, 0.875)   # 0 / 50 / 100 / 150 %; -100 % (0.25) is not in the vector space
+
+
+def polish_vector(vec, spec, score_fn, centroid_fn, real_centroid, pitch_span, start_score, start_out,
+                  keytrack_span=7, centroid_tol_hz=120.0):
+    """V6.1 local polish (V6_1_PLAN.md 2.4) in the stored-vector space, so Occam and the exported patch continue
+    from the polished vector. score_fn(vec) -> (score, out); centroid_fn(out) -> Hz. Each stage tries its
+    candidates from the stage's starting vector and keeps the best that lowers the score:
+      1. cutoff (filter 1 and 2 together) +- 0.5 / 1.0 x clip(centroid error / 2500, +-0.15), if |error| > 120 Hz;
+      2. filter envelope amount (both filters) +-0.08 / +-0.15;
+      3. keytrack 0 / 50 / 100 / 150 % (filter 2 to the same raw value), only if the phrase spans >= 7 semitones.
+    Values stay inside the spec's CONT_BOUNDS. -> (vec, score, out, log [(stage, value, score)])."""
+    I = spec.PARAM_INDEX
+    bounds = getattr(spec, "CONT_BOUNDS", {})
+
+    def clip(name, x):
+        lo, hi = bounds.get(name, (0.0, 1.0))
+        return float(np.clip(x, lo, hi))
+    best_v, best_s, best_out, log = np.array(vec, np.float32, copy=True), float(start_score), start_out, []
+
+    def stage(name, cands):
+        nonlocal best_v, best_s, best_out
+        base_s = best_s
+        found = None
+        for tag, v in cands:
+            s, out = score_fn(v)
+            if s < best_s:
+                best_v, best_s, best_out, found = v, s, out, (name, tag, round(float(s), 4))
+        if found is not None and best_s < base_s:
+            log.append(found)
+
+    err = real_centroid - centroid_fn(best_out)
+    if abs(err) > centroid_tol_hz:
+        shift = float(np.clip(err / 2500.0, -0.15, 0.15))
+        base = best_v.copy()
+        cands = []
+        for mult in (0.5, 1.0):
+            v = base.copy()
+            v[I["cutoff"]] = clip("cutoff", base[I["cutoff"]] + shift * mult)
+            v[I["filter_2_cutoff"]] = clip("filter_2_cutoff", base[I["filter_2_cutoff"]] + shift * mult)
+            cands.append((round(shift * mult, 4), v))
+        stage("cutoff", cands)
+    base = best_v.copy()
+    cands = []
+    for d in (-0.15, -0.08, 0.08, 0.15):
+        v = base.copy()
+        v[I["feg_amount"]] = clip("feg_amount", base[I["feg_amount"]] + d)
+        v[I["filter_2_feg_amount"]] = clip("filter_2_feg_amount", base[I["filter_2_feg_amount"]] + d)
+        cands.append((d, v))
+    stage("feg_amount", cands)
+    if pitch_span >= keytrack_span:
+        base = best_v.copy()
+        current_raw = 0.5 + 0.5 * float(base[I["keytrack"]])          # stored keytrack p -> raw 0.5 + 0.5 p
+        cands = []
+        for raw in POLISH_KEYTRACK_RAW:
+            if abs(raw - current_raw) < 0.05:
+                continue
+            v = base.copy()
+            v[I["keytrack"]] = clip("keytrack", (raw - 0.5) / 0.5)
+            v[I["filter_2_keytrack"]] = clip("filter_2_keytrack", raw)  # filter 2 keytrack is stored raw
+            cands.append((raw, v))
+        stage("keytrack_raw", cands)
+    return best_v, best_s, best_out, log
 
 
 def octave_partner(n, notes):
@@ -349,7 +428,8 @@ def compute_stereo_metrics(y, is_channels_first=False):
 
 
 def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k_per_note=2, steps=25, seed=42,
-                              second_note="auto", occam_tol=None, occam_abs=0.0, max_midi=None, drop_polyphony=False):
+                              second_note="auto", occam_tol=None, occam_abs=0.0, max_midi=None, drop_polyphony=False,
+                              polish=True, square_shape=0.5):
     E = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval")
     audio_ref_dir = os.path.join(E, "audio")
     midi_muscriptor_dir = os.path.join(E, "midi_muscriptor")
@@ -448,7 +528,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
         fft_real = np.abs(np.fft.rfft(y_real_mono))
         freqs_real = np.fft.rfftfreq(len(y_real_mono), 1.0 / sr)
         t_sub = float(np.sum(fft_real[freqs_real < sub_thresh]**2) / (np.sum(fft_real**2) + 1e-9))
-        real_parity = am6.compute_harmonic_parity(y_real_mono, nominal_f0, sr)
+        real_parity = am6.parity_over_notes(y_real_mono, selected_notes, sr)    # each note at its own f0
 
         stem_res = {
             "stem_id": stem_id,
@@ -472,10 +552,11 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             # Collect candidates across all selected notes
             cand_vecs, note_info = [], []
             for n_idx, n in enumerate(selected_notes):
-                chunk, chunk_dur = cut_note(y_real_mono, n, sr)
+                chunk, chunk_dur = cut_note(y_real_mono, n, sr, next_start=next_onset(n, all_notes))
                 sixteenth_s = chunk_dur
                 partner = octave_partner(n, all_notes) if second_note == "auto" else None
-                chunk_oct = cut_note(y_real_mono, partner, sr)[0] if partner is not None else None
+                chunk_oct = (cut_note(y_real_mono, partner, sr, next_start=next_onset(partner, all_notes))[0]
+                             if partner is not None else None)
 
                 t_phrase, t_rolling = build_conditioning_targets(chunk, sixteenth_s, sr=sr, chunk_oct=chunk_oct)
                 mel_p = torch.from_numpy(make_mel_spec(t_phrase)).unsqueeze(0).float()
@@ -545,9 +626,9 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
 
                 # Harmonic parity penalty for square wave disambiguation
                 parity_pen = 0.0
-                if real_parity < 0.12:
+                if np.isfinite(real_parity) and real_parity < 0.12:
                     cand_shape = float(p.get("shape", 0.0))
-                    shape_pen = abs(cand_shape - 0.50) * 1.5
+                    shape_pen = abs(cand_shape - square_shape) * 1.5
                     ring_pen = (float(p.get("ring_1x2_volume", 0.0)) + float(p.get("ring_2x3_volume", 0.0))) * 1.2
                     f2_res_pen = float(p.get("filter_2_resonance", 0.0)) * 0.8
                     parity_pen = shape_pen + ring_pen + f2_res_pen
@@ -585,63 +666,20 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                         best_width = pred_width
                         best_corr = pred_corr
 
-            # 3-point local cutoff polish on best_patch prior to Occam
-            pred_mono_probe = best_audio.mean(axis=0)
-            win_c_probe = get_centroid(pred_mono_probe, sr)
-            delta_cent = real_centroid - win_c_probe
-            if abs(delta_cent) > 120.0:
-                shift = float(np.clip(delta_cent / 2500.0, -0.15, 0.15))
-                for mult in [0.5, 1.0]:
-                    cand_p = best_patch.copy()
-                    cand_p["cutoff"] = float(np.clip(best_patch["cutoff"] + shift * mult, 0.0, 1.0))
-                    if "filter_2_cutoff" in cand_p:
-                        cand_p["filter_2_cutoff"] = float(np.clip(best_patch.get("filter_2_cutoff", 0.5) + shift * mult, 0.0, 1.0))
-                    sc_pol, a_pol, w_pol, c_pol = phrase_score(cand_p, best_retrig)
-                    if sc_pol < best_score:
-                        best_score = sc_pol
-                        best_patch = cand_p
-                        best_audio = a_pol
-                        best_width = w_pol
-                        best_corr = c_pol
-
-            # FEG mod amount polish (filter envelope sweep depth)
-            current_feg = float(best_patch.get("feg_amount", 0.5))
-            for delta_feg in [-0.15, -0.08, 0.08, 0.15]:
-                new_feg = float(np.clip(current_feg + delta_feg, 0.0, 1.0))
-                cand_p = best_patch.copy()
-                cand_p["feg_amount"] = new_feg
-                if "filter_2_feg_amount" in cand_p:
-                    cand_p["filter_2_feg_amount"] = float(np.clip(best_patch.get("filter_2_feg_amount", 0.5) + delta_feg, 0.0, 1.0))
-                sc_pol, a_pol, w_pol, c_pol = phrase_score(cand_p, best_retrig)
-                if sc_pol < best_score:
-                    best_score = sc_pol
-                    best_patch = cand_p
-                    best_audio = a_pol
-                    best_width = w_pol
-                    best_corr = c_pol
-
-            # Multi-octave filter keytrack polish (verifies high vs low note tonal balance)
-            pitches = [n["note"] for n in notes]
-            span = (max(pitches) - min(pitches)) if len(pitches) > 1 else 0
-            if span >= 7:  # Wide register span in phrase (fifths or octaves)
-                current_kt = float(best_patch.get("keytrack_raw", 0.5))
-                for kt_cand in [0.50, 0.75, 0.625, 0.25, 0.875]:
-                    if abs(kt_cand - current_kt) < 0.05:
-                        continue
-                    cand_p = best_patch.copy()
-                    cand_p["keytrack_raw"] = float(kt_cand)
-                    if "filter_2_keytrack" in cand_p:
-                        cand_p["filter_2_keytrack"] = float(kt_cand)
-                    sc_pol, a_pol, w_pol, c_pol = phrase_score(cand_p, best_retrig)
-                    if sc_pol < best_score:
-                        best_score = sc_pol
-                        best_patch = cand_p
-                        best_audio = a_pol
-                        best_width = w_pol
-                        best_corr = c_pol
-
             lay = layout_for_dim(param_dim)
             win_vec = np.array(pool_vecs[best_idx], np.float32)
+            polish_log, score_before_polish = [], best_score
+            if polish:
+                phrase_pitches = [n["note"] for n in all_notes]
+                span = (max(phrase_pitches) - min(phrase_pitches)) if len(phrase_pitches) > 1 else 0
+
+                def score_vec(v):
+                    s_, a_, w_, c_ = phrase_score(capped_patch(v), best_retrig)
+                    return s_, (a_, w_, c_)
+                win_vec, best_score, (best_audio, best_width, best_corr), polish_log = polish_vector(
+                    win_vec, lay.spec, score_vec, lambda out: get_centroid(out[0].mean(axis=0), sr), real_centroid,
+                    span, best_score, (best_audio, best_width, best_corr))
+                best_patch = capped_patch(win_vec)
             occam_log, score_before_occam = [], best_score
             if occam_tol is not None:
                 # Occam (ablation_v6): switch off features whose removal does not make the phrase score worse by
@@ -706,6 +744,9 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                 "osc1_octave_candidates": cand_oct,
                 "osc1_octave_winner": win_oct,
                 "occam": occam_log,
+                "polish": polish_log,
+                "phrase_score_before_polish": round(float(score_before_polish), 3),
+                "real_parity": None if not np.isfinite(real_parity) else round(float(real_parity), 4),
                 "phrase_score_before_occam": round(float(score_before_occam), 3),
                 "notes": note_info,
                 "elapsed_s": round(el, 2),
@@ -931,6 +972,10 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no_polish", action="store_true", help="skip the V6.1 cutoff / FEG / keytrack polish")
+    parser.add_argument("--square_shape", type=float, default=0.5,
+                        help="osc shape value of a symmetric square in Surge (parity penalty); measure it with "
+                             "check_v6_spec.py --shape_scan before trusting 0.5")
     parser.add_argument("--max_midi", type=int, default=None,
                         help="drop transcribed notes above this MIDI note (V6_SPECIFICATION.md 3.5: 60)")
     parser.add_argument("--drop_polyphony", action="store_true",
@@ -948,4 +993,5 @@ if __name__ == "__main__":
     evaluate_models_consensus(models, args.out_dir, device=args.device, max_notes=args.max_notes,
                               k_per_note=args.k, steps=args.steps, seed=args.seed, second_note=args.second_note,
                               occam_tol=args.occam_tol, occam_abs=args.occam_abs, max_midi=args.max_midi,
-                              drop_polyphony=args.drop_polyphony)
+                              drop_polyphony=args.drop_polyphony, polish=not args.no_polish,
+                              square_shape=args.square_shape)

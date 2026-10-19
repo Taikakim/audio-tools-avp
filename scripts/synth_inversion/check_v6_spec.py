@@ -8,6 +8,10 @@ measures the frequency of a harmonic peak with parabolic interpolation.
 
   python check_v6_spec.py --plugin "~/.vst3/Surge XT.vst3" --note 45
 Prints measured vs expected and exits 1 if any check is off by more than --tol_cents (default 3 cents).
+
+--shape_scan (V6.1): renders osc 1 alone at shape 0, 0.125, ..., 1 (width 0.5) and prints the harmonic parity
+(even / odd harmonic power; ~0 = odd harmonics only, a symmetric square). The shape with the lowest parity is the
+value for --square_shape in render_pairs_dpo_v6.py and eval_real_stems_consensus_v6.py (they assume 0.5).
 """
 import argparse
 import sys
@@ -89,15 +93,37 @@ def run(render, note, harmonic=8, tol=3.0, log=print):
     return out
 
 
+def shape_scan(render, note, shapes=tuple(np.linspace(0.0, 1.0, 9)), log=print):
+    """-> [(shape, parity)] for osc 1 alone, width 0.5; the lowest parity marks the symmetric square."""
+    import audio_metrics_v6 as am6
+    I = S.PARAM_INDEX
+    f0 = 440.0 * 2 ** ((note - 69) / 12)
+    out = []
+    for sh in shapes:
+        v = base_vector(note)
+        v[I["osc_1_volume"]], v[I["osc_2_volume"]] = 1.0, 0.0
+        v[I["shape"]], v[I["width"]] = float(sh), 0.5
+        par = am6.compute_harmonic_parity(render(v), f0, SR)
+        out.append((float(sh), float(par)))
+        log(f"shape {sh:5.3f}: parity {par:.4f}")
+    best = min(out, key=lambda r: r[1])
+    log(f"lowest parity at shape {best[0]:.3f} -> use --square_shape {best[0]:.3f}"
+        + ("" if best[1] < 0.12 else " (but no shape reaches < 0.12: no odd-only waveform at width 0.5)"))
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--plugin", default=S.DEFAULT_PLUGIN_PATH)
     ap.add_argument("--note", type=int, default=45)
     ap.add_argument("--harmonic", type=int, default=8, help="measure this harmonic (finer cents resolution)")
     ap.add_argument("--tol_cents", type=float, default=3.0)
+    ap.add_argument("--shape_scan", action="store_true", help="also report parity against osc shape (V6.1)")
     a = ap.parse_args(argv)
     plugin = S.init_synth(a.plugin)
     res = run(lambda v: render_sustained(plugin, v, a.note), a.note, a.harmonic, a.tol_cents)
+    if a.shape_scan:
+        shape_scan(lambda v: render_sustained(plugin, v, a.note), a.note)
     return 0 if all(r[3] for r in res) else 1
 
 
