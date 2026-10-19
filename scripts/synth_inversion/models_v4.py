@@ -273,6 +273,9 @@ def load_inverter_v4(ckpt_path, device="cpu", v4_config=None):
     cross-attention heads cannot be inferred and defaults to 4)."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state = ckpt["model_state"]
+    if "note_freqs" in state:                       # note-conditioned v6 flow (models_v6)
+        from models_v6 import load_inverter_v6
+        return load_inverter_v6(ckpt_path, device=device, v4_config=v4_config)
     if "encoder.tok_proj.weight" not in state:
         from models_v3 import load_inverter
         return load_inverter(ckpt_path, device=device)

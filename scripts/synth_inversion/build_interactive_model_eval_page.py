@@ -21,7 +21,10 @@ models = list(results[0]["models"].keys())
 stats = {}
 for m in models:
     mss_list = [r["models"][m]["phrase_mss"] for r in results if m in r["models"]]
-    ssim_list = [r["models"][m]["mel_ssim"] for r in results if m in r["models"]]
+    # eval summaries written before 2026-10-19 stored 1 - SSIM under "mel_ssim"; newer ones carry mel_ssim_dist
+    # next to it and mel_ssim is the similarity. Convert old files so the column always reads "higher = closer".
+    ssim_list = [r["models"][m]["mel_ssim"] if "mel_ssim_dist" in r["models"][m] else 1.0 - r["models"][m]["mel_ssim"]
+                 for r in results if m in r["models"]]
     cent_deltas = [abs(r["models"][m]["centroid_delta_hz"]) for r in results if m in r["models"]]
     width_deltas = [abs(r["models"][m].get("width_delta", 0.0)) for r in results if m in r["models"]]
     stats[m] = {
@@ -64,7 +67,7 @@ for idx, r in enumerate(results):
     for m in models:
         d = r["models"][m]
         mss = d["phrase_mss"]
-        ssim = d["mel_ssim"]
+        ssim = d["mel_ssim"] if "mel_ssim_dist" in d else 1.0 - d["mel_ssim"]   # old files: 1 - SSIM
         cent = d["centroid_hz"]
         d_cent = d["centroid_delta_hz"]
         w_val = d.get("stereo_width", 0.0)
@@ -650,7 +653,7 @@ html_content = f"""<!DOCTYPE html>
                         <th>Wins</th>
                         <th>Mean MSS</th>
                         <th>Median MSS</th>
-                        <th>Mel SSIM</th>
+                        <th>Mel SSIM (higher = closer)</th>
                         <th>Centroid Err</th>
                         <th>Width Err</th>
                     </tr>

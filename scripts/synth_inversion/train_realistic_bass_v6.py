@@ -1,0 +1,1073 @@
+import json
+from inharmonicity_target import InharmonicityConfig, InharmonicityExtractor
+from inharmonicity_aux_head import InharmonicityHead, masked_inharmonicity_loss
+"""Joint online training of Synth-JEPA and the flow-matching inverter on the real-preset bass prior.
+
+Audio is rendered by real Surge XT in DataLoader workers (one persistent plugin per worker) from
+realistic_bass_prior_v3.py (training split of the presets); log-mel is computed on the GPU with
+ExactGpuMel (matches audio_utils.make_mel_spec). Both models see the same batch each step.
+
+v2 (2026-10-02 review). What changed and why:
+  * Validation exists. Two FIXED sets are rendered once at startup: notes from HELD-OUT presets
+    (the prior's 'val' split) and notes from training presets. Every --val_interval_steps both are
+    scored: JEPA losses (fixed SIGReg slices), flow loss (fixed noise/t), and retrieval over the
+    WHOLE set (chance 1/val_size, not 1/batch). The train-preset vs held-out-preset gap is the
+    number that says whether the model generalises beyond the ~400 archetypes or memorises them.
+    v1 logged only training loss and in-batch retrieval (chance 1/32).
+  * A fresh start works (v1 referenced `normalizer` before creating it: NameError).
+  * Resume is exact: both optimisers, the normaliser, step, elapsed time and the best score are in
+    checkpoint_latest.pt; files are written to a temp name and renamed, so a crash mid-save cannot
+    corrupt the file the next start resumes from. A checkpoint from another prior (manifold md5) or
+    from the v1 script is refused instead of silently mixing distributions.
+  * LR schedule: linear warmup (--warmup_steps), constant, linear decay to 0 over the last
+    --decay_frac of the time budget (WSD; the run is time-budgeted, so the schedule is too).
+    v1 ran constant LR, and its watchdog halved it at random moments.
+  * The flow model is trained on the UN-normalised mel, like every other flow model here, and is
+    exported as flow_latest.pt / flow_best.pt in the format models.load_inverter() reads, so
+    evaluate_holdout_audio.py --ckpt works on it. The JEPA is exported as jepa_latest.pt /
+    jepa_best.pt in the format synth_jepa_search.load_synth_jepa() reads, carrying the prior's
+    support box ('prior_bounds') for the search.
+  * Non-finite loss or gradient: the step is skipped (weights never see a NaN); after
+    --max_bad_steps consecutive skips the process exits with code 3 so the watchdog restarts it
+    from the last good checkpoint.
+  * Rolling step checkpoints are pruned to the last --keep_last.
+  * run_meta.json is written at a fresh launch (purpose, prior, args).
+
+v6 (2026-10-19, KUANG; V6_SPECIFICATION.md section 3, V6_REVIEW.md section 5). Derived from train_realistic_bass_v5.py:
+  * Layout surge_spec_v6 / param_codec_v6: the MIDI note (storage index 0) is the flow's INPUT (models_v6
+    NoteConditionedFlow), not a predicted parameter; osc 1 is fixed at octave 0; osc 2 / 3 octaves are relative
+    (-2..+2); osc 2 / 3 fine pitch spans +-0.2 semitones. Flow output 114-d. The JEPA's parameter side still sees the
+    note (44 continuous inputs).
+  * Prior soundset_prior_v6.SoundsetPriorV6 (simplicity prior: 70 % sparse, 20 % presets, 10 % random) for live
+    rendering and validation; banks from render_bank_v6.py (format 6). --random_patch_frac is gone (the prior has its
+    own random share) and ladders are refused (no v6 ladder sets yet).
+  * --flow_encoder defaults to temporal_asp (the A-series encoder); --inharm_weight needs a labelled bank in bank mode.
+  * The acoustic loss rebuilds the JEPA input with the conditioning note (param_codec_v6.jepa_cont).
+
+v5 additions (2026-10-13, KUANG; all off by default, so existing launch commands train the same model):
+  * --bank DIR reads pre-rendered clips (render_bank_v5.py) in an order fixed by --bank_seed, identical for every arm;
+    --val_cache DIR reuses the startup validation renders.
+  * --flow_xattn adds per-block cross-attention to the flow (models_v4); --jepa_layers, --predictor_hidden,
+    --flow_layers, --flow_enc_dim set the model size (defaults = the sizes used so far).
+  * The periodic log line reports samples/s and the share of wall time spent waiting for data.
+  * Flow exports carry args['v4_config'], so load_inverter_v4 rebuilds every v4 option (cross-attention heads too).
+"""
+import argparse
+import glob
+import json
+import os
+import signal
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, SCRIPT_DIR)
+
+import param_codec_v6 as codec  # noqa: E402
+from audio_utils import ExactGpuMel  # noqa: E402
+from models_v6 import build_model_v6  # noqa: E402
+from realistic_prior_v4 import ALL_MANIFOLD_PATH, BASS_MANIFOLD_PATH, manifold_md5  # noqa: E402,F401
+from soundset_prior_v6 import SoundsetPriorV6  # noqa: E402
+from surge_spec_v6 import (  # noqa: E402
+    CAT_INDICES, CONT_INDICES, DEFAULT_PLUGIN_PATH, LP_FILTERS, NOTE_DUR_RANGE,
+    NUM_PARAMS, PARAM_INDEX, WAVESHAPER_TYPES, canonicalize_vector, domain_weights,
+    init_synth, render_patch, vector_to_patch,
+)
+from synth_jepa_model import SynthJEPA  # noqa: E402
+from synth_jepa_search_v3 import WelfordNormalizer  # noqa: E402
+from training_controls_v3 import (EMA, LadderDataset, ladder_validation, ordinal_loss, ot_couple,  # noqa: E402
+                               render_ladder_set)
+
+FORMAT_VERSION = 6
+JEPA_KWARGS = dict(embed_dim=512, predictor_hidden=1024, num_audio_layers=8, num_param_layers=8,
+                   num_slices_sigreg=64, ff_dim=1024, in_frames=81,
+                   num_continuous=len(CONT_INDICES), cat_sizes=[k for _, k in CAT_INDICES])
+FLOW_KWARGS = dict(model_type="flow", hidden_dim=512, num_layers=8, encoding=codec.ENCODING_V2, time_scale=1000.0,
+                   param_dim=codec.ENCODED_DIM)
+
+_STOP_REQUESTED = False
+
+
+def _sig_handler(sig, frame):
+    global _STOP_REQUESTED
+    print(f"\n[!] Signal {sig} received. Saving checkpoint and stopping...", flush=True)
+    _STOP_REQUESTED = True
+
+
+# --- Hand-tuned FEG calibration (user-measured, 2026-10-14) -------------------------------------
+# Minimum FEG modulation (semitones) for a sensible amount of sound at cutoff 0 / resonance 0,
+# at filter decays of 0.15 s (0.20 s for OB-Xd), 0.5 s and 2 s, analog envelopes, waveshaper off.
+_FEG_MIN_T = np.log2(np.array([0.15, 0.5, 2.0]))
+_FEG_MIN_ST = {
+    0: (32, 24, 16),   # LP 12 dB
+    1: (42, 34, 30),   # LP 24 dB
+    2: (42, 34, 30),   # Legacy ladder (as LP 24)
+    3: (42, 34, 30),   # Vintage ladder (as LP 24)
+    4: (36, 28, 24),   # OB-Xd 12 dB (0.2 s point)
+    5: (41, 32, 26),   # OB-Xd 24 dB (0.2 s point)
+    6: (32, 24, 20),   # K35
+    7: (58, 48, 42),   # Diode ladder
+    8: (32, 26, 18),   # Cutoff warp
+    9: (48, 40, 32),   # Res warp
+}
+# Reduction at waveshaper +24 dB, per decay point (LP 12: roughly halved; ladders: -14/-16/-18;
+# diode: -10 flat; the rest assume -8 flat).
+_FEG_DRIVE_REDUCTION = {0: None, 1: (14, 16, 18), 2: (14, 16, 18), 3: (14, 16, 18), 7: (10, 10, 10)}
+_DRIVE_DB_MAX = 0.32 * 48.0  # vector drive 1.0 -> raw 0.82 -> +15.4 dB
+_SURGE_ENV_MIN_LOG2, _SURGE_ENV_SPAN = -8.0, 13.0
+
+
+class RealisticOnlineDataset(Dataset):
+    """Renders prior draws online; one persistent Surge instance per worker (persistent_workers)."""
+
+    def __init__(self, manifold_path, plugin_path=DEFAULT_PLUGIN_PATH, length=10_000_000, inharm_cfg=None,
+                 all_manifold_path=ALL_MANIFOLD_PATH):
+        # manifold_path is the BASS manifold of the v6 simplicity prior
+        self.manifold_path = manifold_path
+        self.all_manifold_path = all_manifold_path
+        self.plugin_path = plugin_path
+        self.length = length
+        self.inharm_cfg = inharm_cfg
+        self._synth = None
+        self._prior = None
+        self._extractor = None
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        if self._synth is None:
+            self._synth = init_synth(self.plugin_path, verify=False)  # enums verified once in the main process
+            self._prior = SoundsetPriorV6(self.manifold_path, self.all_manifold_path, split="train")
+            if self.inharm_cfg is not None:
+                self._extractor = InharmonicityExtractor(self.inharm_cfg)
+        patch, vec, midi_note, note_dur = self._prior.sample_patch_and_midi()
+        audio = render_patch(self._synth, patch, midi_note, note_dur)
+        if self._extractor is not None:
+            inharm_res = self._extractor.process_phrase(audio, midi_note)
+            from inharmonicity_target import to_training_pair
+            res_val, res_valid = to_training_pair(inharm_res)
+        else:
+            res_val, res_valid = 0.0, 0.0
+        return torch.from_numpy(audio), torch.from_numpy(vec), res_val, res_valid
+
+
+def _worker_init(_worker_id):
+    signal.signal(signal.SIGINT, signal.SIG_IGN)  # the main process handles Ctrl-C / SIGTERM
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is not None:
+        import numpy as np
+        import random
+        seed = worker_info.seed % (2**32 - 1)
+        np.random.seed(seed)
+        random.seed(seed)
+
+
+def validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device):
+    import json
+    import numpy as np
+    from sklearn.metrics import r2_score
+    from inharmonicity_aux_head import masked_inharmonicity_loss
+    stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_stats.json")
+    with open(stats_path, "r") as f:
+        stats = json.load(f)
+        
+    jepa.eval()
+    out = {}
+    with torch.no_grad():
+        for split_name, (audio, vecs, target, valid) in val_sets.items():
+            if target is None: continue
+            a = audio.to(device)
+            mel = mel_fn(a)
+            za = jepa.encode_audio(normalizer.normalize(mel))
+            pred = jepa.inharmonicity_head(za).squeeze(-1)
+            
+            target = target.to(device)
+            valid_mask = valid.to(device)
+            
+            mse, n = masked_inharmonicity_loss(pred, target, valid_mask)
+            
+            v = valid_mask != 0
+            p_val = pred[v].cpu().numpy()
+            t_val = target[v].cpu().numpy()
+            r2 = r2_score(t_val, p_val) if len(t_val) > 1 else float("nan")
+            
+            mean_key = "train" if "train" in split_name else "val"
+            baseline_mean = stats[mean_key]["pooled_mean"]
+            baseline_mse = float(np.mean((t_val - baseline_mean)**2)) if len(t_val) > 0 else 0.0
+            
+            out[split_name] = {"mse": float(mse.detach()), "r2": float(r2), "baseline_mse": baseline_mse}
+            
+    jepa.train()
+    return out
+
+def render_fixed_set(synth, prior, n, seed, extractor=None):
+    rng = np.random.RandomState(seed)
+    audio, vecs, inharm, valid = [], [], [], []
+    for _ in range(n):
+        patch, vec, midi_note, note_dur = prior.sample_patch_and_midi(rng)
+        a = render_patch(synth, patch, midi_note, note_dur)
+        audio.append(a)
+        vecs.append(vec)
+        if extractor is not None:
+            res = extractor.process_phrase(a, midi_note)
+            if res["valid"]:
+                inharm.append(res["value"])
+                valid.append(1.0)
+            else:
+                inharm.append(0.0)
+                valid.append(0.0)
+    
+    if extractor is not None:
+        return torch.from_numpy(np.stack(audio)), torch.from_numpy(np.stack(vecs)), torch.tensor(inharm, dtype=torch.float32), torch.tensor(valid, dtype=torch.float32)
+    return torch.from_numpy(np.stack(audio)), torch.from_numpy(np.stack(vecs))
+
+
+def prepare_jepa_inputs(params: torch.Tensor):
+    """[B, 59] stored params -> (continuous in [-1, 1] [B, 44], note included; list of one-hot [B, k])."""
+    cont = params[:, CONT_INDICES] * 2.0 - 1.0
+    cat_classes = codec.target_classes(params)
+    cat_onehots = [F.one_hot(cls, k).float() for cls, (_, k) in zip(cat_classes, CAT_INDICES)]
+    return cont, cat_onehots
+
+
+def flow_loss(model, mel, params, w_enc, generator=None, ot=False, cond_noise=False, clean_frac=0.3, loss_type="mse", return_pred=False,
+              return_t=False):
+    """Conditional flow-matching loss (OT path), domain-weighted, on the encoded layout.
+    ot=True pairs noise and targets by minibatch optimal transport (training_controls_v3.ot_couple).
+    cond_noise=True (H6): each sample's audio condition is noised to level tau (1 = clean, share clean_frac;
+    otherwise tau ~ logit-normal(0, 1), Synth-JDF's time distribution) and tau is passed to the model."""
+    x1 = codec.encode(params)
+    note = codec.note_of(params)                         # the condition, not a target
+    x0 = torch.randn(x1.shape, device=x1.device, dtype=x1.dtype, generator=generator)
+    if ot:
+        x0 = ot_couple(x0, x1)
+    t = torch.rand(x1.shape[0], device=x1.device, generator=generator)
+    xt, target = model.path(x0, x1, t)
+    if cond_noise:
+        B = x1.shape[0]
+        clean = torch.rand(B, device=x1.device, generator=generator) < clean_frac
+        tau = torch.where(clean, torch.ones(B, device=x1.device),
+                          torch.sigmoid(torch.randn(B, device=x1.device, generator=generator)))
+        pred = model(xt, t, model.noisy(mel, tau, generator=generator), tau=tau, note=note)
+    else:
+        pred = model(xt, t, mel, note=note)
+    err = (pred - target).abs() if loss_type == "mae" else (pred - target) ** 2   # MAE: Synth-JDF supp. 4
+    f_loss = ((w_enc * err).sum(dim=1) / w_enc.sum()).mean()
+    if return_pred:
+        x_hat_1 = xt + (1.0 - t.unsqueeze(1)) * pred
+        return (f_loss, x_hat_1, t) if return_t else (f_loss, x_hat_1)
+    return f_loss
+
+
+def acoustic_consistency(jepa, x_hat_1, za, t, note, temp=0.5, cat_mode="soft", t_min=0.0, t_weight="none"):
+    """1 - cos(JEPA predictor(params(x_hat_1)), za), the Stage 5 loss, with two opt-in corrections (KUANG 2026-10-19):
+    t_min / t_weight: x_hat_1 at small t is a blurred posterior mean, not a patch; scoring it pulls the velocity field
+      toward acoustically 'safe' averages. t_min drops items with t < t_min; t_weight="t" weights by t.
+    cat_mode="st": straight-through categoricals (hard one-hot forward, softmax gradient backward), so the JEPA sees
+      the one-hot inputs it was trained on; "soft" (Stage 5) feeds softmax(x / temp), never a one-hot.
+    The JEPA's weights are frozen for this term (gradients reach x_hat_1 only). -> (loss, share of items used)."""
+    cont_hat, cat_blocks = codec.split_encoded(x_hat_1)
+    cont_input = codec.jepa_cont(cont_hat.clamp(0.0, 1.0), note) * 2.0 - 1.0     # v6: the note goes back in
+    cats = []
+    for b in cat_blocks:
+        soft = F.softmax(b / temp, dim=-1)
+        if cat_mode == "st":
+            hard = F.one_hot(soft.argmax(dim=-1), soft.shape[-1]).to(soft.dtype)
+            soft = hard + soft - soft.detach()
+        cats.append(soft)
+    req = [p.requires_grad for p in jepa.parameters()]
+    for p in jepa.parameters():
+        p.requires_grad_(False)
+    try:
+        za_hat = jepa.predict_audio_latent(jepa.encode_params(cont_input, cats))
+    finally:
+        for p, r in zip(jepa.parameters(), req):
+            p.requires_grad_(r)
+    per = 1.0 - F.cosine_similarity(za_hat, za.detach(), dim=-1)
+    w = (t >= t_min).to(per.dtype)
+    if t_weight == "t":
+        w = w * t
+    used = float((w > 0).float().mean())
+    return (w * per).sum() / w.sum().clamp_min(1e-8), used
+
+
+def lr_factor(step, frac, warmup_steps, decay_frac):
+    warm = 1.0 if warmup_steps <= 0 else min(1.0, (step + 1) / max(1, warmup_steps))
+    decay = 1.0 if decay_frac <= 0.0 or frac < 1.0 - decay_frac else max(0.0, (1.0 - frac) / max(decay_frac, 1e-9))
+    return warm * decay
+
+
+@torch.no_grad()
+def validate(jepa, flow, normalizer, mel_fn, audio, params, w_enc, lambda_sig, device, chunk=128):
+    """Fixed-set scores. Retrieval is over the whole set (chance = 1/len)."""
+    jepa.eval()
+    flow.eval()
+    gen = torch.Generator(device=device).manual_seed(1234)
+    sums, n, za_all, zp_all = {}, 0, [], []
+    for s in range(0, len(audio), chunk):
+        a = audio[s:s + chunk].to(device)
+        p = params[s:s + chunk].to(device)
+        mel = mel_fn(a)
+        cont, cats = prepare_jepa_inputs(p)
+        lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats, sigreg_generator=gen)
+        i_loss = torch.zeros((), device=device)
+        fl = flow_loss(flow, mel, p, w_enc, generator=gen)
+        b = a.shape[0]
+        for k, v in dict(jepa=lp + la + lambda_sig * (sa + sp), lp=lp, la=la, sig_a=sa, sig_p=sp, flow=fl).items():
+            sums[k] = sums.get(k, 0.0) + float(v) * b
+        n += b
+        za_all.append(za)
+        zp_all.append(zp)
+    za, zp = torch.cat(za_all), torch.cat(zp_all)
+    tgt = torch.arange(len(za), device=device)
+    out = {k: v / n for k, v in sums.items()}
+    out["r_a2p"] = float((torch.cdist(jepa.f_a2p(za), zp).argmin(dim=1) == tgt).float().mean())
+    out["r_p2a"] = float((torch.cdist(jepa.f_p2a(zp), za).argmin(dim=1) == tgt).float().mean())
+    out["chance"] = 1.0 / len(za)
+    jepa.train()
+    flow.train()
+    return out
+
+
+def atomic_save(obj, path):
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out_dir", default="/run/media/kim/Mantu/surge_200k_models/overnight_realistic_bass_v3")
+    ap.add_argument("--manifold", default="/home/kim/sao_runs/real_manifold_v4_bass.npz")
+    ap.add_argument("--bass_manifold", default="/home/kim/sao_runs/real_manifold_v4_bass.npz")
+    ap.add_argument("--all_manifold", default="/home/kim/sao_runs/real_manifold_v4_all.npz")
+    ap.add_argument("--plugin", default=DEFAULT_PLUGIN_PATH)
+    ap.add_argument("--hours", type=float, default=8.0, help="total time budget, including resumed time")
+    ap.add_argument("--seed", type=int, default=None, help="seed for torch, numpy, random, and dataloader workers")
+    ap.add_argument("--max_steps", type=int, default=0, help=">0 stops after this many steps (smoke tests)")
+    ap.add_argument("--batch_size", type=int, default=32)
+    ap.add_argument("--min_batch_size", type=int, default=2, help="minimum batch size when decaying batch size")
+    ap.add_argument("--batch_schedule", choices=["constant", "linear_decay", "power2_decay"], default="constant",
+                    help="batch size schedule over the time budget: constant, linear_decay, or power2_decay")
+    ap.add_argument("--resume_from", default="", help="explicit checkpoint path to resume from (overrides latest)")
+    ap.add_argument("--optimizer", choices=["modular", "adamw", "fusion"], default="modular",
+                    help="optimizer choice: modular (ModularOptimizer with SCION LMOs), adamw, or fusion")
+    ap.add_argument("--whitening", choices=["shampoo", "soap", "none"], default="none",
+                    help="whitening preconditioner for ModularOptimizer (default: none; shampoo requires large B>=128)")
+    ap.add_argument("--scalar_opt", choices=["sign", "adam"], default="adam",
+                    help="optimizer for 1D parameters/biases: adam (SF-AdamW matched RMS) or sign (default: adam)")
+    ap.add_argument("--scalar_sf_beta", type=float, default=0.95,
+                    help="Schedule-Free beta for 1D adam parameters (default: 0.95)")
+    ap.add_argument("--grad_clip", type=float, default=1.2,
+                    help="gradient clipping max norm (default: 1.2; 0 to disable)")
+    ap.add_argument("--snr_gate", action="store_true", default=False,
+                    help="enable SNR gating (default: False, disabled)")
+    ap.add_argument("--inharm_weight", type=float, default=0.0)
+    ap.add_argument("--inharm_config", type=str)
+    ap.add_argument("--ns_poly", default="cubic5", choices=["quintic", "cubic5", "cubic"],
+                    help="Newton-Schulz polynomial for SpectralLMO (default: cubic5)")
+    ap.add_argument("--radial_brake", type=float, default=0.8,
+                    help="soft limiting on parameter norm growth (default: 0.8)")
+    ap.add_argument("--var_dampening", type=float, default=1.15,
+                    help="Variance-Aware Dynamic Dampening threshold (default: 1.15)")
+    ap.add_argument("--sf_c_warmup", type=int, default=1000,
+                    help="steps before Schedule-Free Polyak averaging engages (default: 1000)")
+    ap.add_argument("--sf_r", type=float, default=1.0,
+                    help="Schedule-Free learning rate weighting (default: 1.0)")
+    ap.add_argument("--wd_jepa", type=float, default=0.02,
+                    help="weight decay on JEPA spectral weights (default: 0.02)")
+    ap.add_argument("--wd_flow", type=float, default=1e-4,
+                    help="weight decay on Flow spectral weights (default: 1e-4)")
+    ap.add_argument("--wd_overtraining", action="store_true", default=True,
+                    help="enable overtraining-aware weight decay scaling (default: True)")
+    ap.add_argument("--fusion_components", default="sf,normuon,ns5",
+                    help="comma-separated list of FusionOpt components to enable (default: sf,normuon,ns5; mona/shampoo omitted for B=32)")
+    ap.add_argument("--flow_dim", type=int, default=512, help="Flow hidden dim")
+    ap.add_argument("--note_features", type=int, default=8,
+                    help="sin / cos frequencies of the note input (models_v6)")
+    ap.add_argument("--flow_encoder", default="temporal_asp", choices=("conv", "temporal_asp", "temporal_segments", "temporal_queries"),
+                    help="flow audio encoder: conv = the v3 pooled encoder (default, unchanged); temporal_* = models_v4 (keeps the time axis)")
+    ap.add_argument("--flow_film", action="store_true", help="per-block FiLM from the audio embedding (models_v4)")
+    # --- v5 (2026-10-13): cross-attention flow, model size, render bank, cached validation sets ---
+    ap.add_argument("--flow_xattn", action="store_true",
+                    help="per-block cross-attention from the flow state to the encoder's time tokens (models_v4; "
+                         "needs a temporal_* --flow_encoder; zero-initialised, so it starts as the plain flow)")
+    ap.add_argument("--flow_xattn_heads", type=int, default=4)
+    ap.add_argument("--flow_xattn_dim", type=int, default=0, help="cross-attention width; 0 = the encoder's d_model")
+    ap.add_argument("--flow_layers", type=int, default=8, help="flow ResBlocks (default 8, as before)")
+    ap.add_argument("--flow_enc_dim", type=int, default=256, help="temporal_* encoder token width (d_model)")
+    ap.add_argument("--jepa_layers", type=int, default=8, help="JEPA audio and parameter encoder depth (default 8)")
+    ap.add_argument("--predictor_hidden", type=int, default=1024, help="JEPA cross-domain predictor width")
+    ap.add_argument("--bank", default="", help="read training clips from a render_bank_v5.py bank instead of live Surge")
+    ap.add_argument("--bank_seed", type=int, default=0, help="order of the bank (identical for every arm with this seed)")
+    ap.add_argument("--val_cache", default="", help="directory for cached validation and ladder-validation renders")
+    ap.add_argument("--embed_dim", type=int, default=512, help="JEPA embedding dimension (default: 512)")
+    ap.add_argument("--ff_dim", type=int, default=1152,
+                    help="feedforward dimension for JEPA (1152 matches ~53M paper size, 1024 is default ~50M)")
+    ap.add_argument("--total_steps", type=int, default=0,
+                    help="total steps for WSD decay schedule (0 calculates from hours and batch size)")
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--prefetch_factor", type=int, default=4,
+                    help="batches loaded in advance by each worker (default: 4)")
+    ap.add_argument("--lr_jepa", type=float, default=9e-5)
+    ap.add_argument("--lr_flow", type=float, default=6e-5)
+    ap.add_argument("--lambda_sig", type=float, default=1.0)
+    ap.add_argument("--warmup_steps", type=int, default=1000)
+    ap.add_argument("--decay_frac", type=float, default=0.2, help="final fraction of the time budget with LR decay")
+    ap.add_argument("--norm_batches", type=int, default=250, help="batches for the mel normaliser (paper: first 8k)")
+    ap.add_argument("--val_size", type=int, default=512, help="notes per fixed validation set")
+    ap.add_argument("--val_interval_steps", type=int, default=1000)
+    ap.add_argument("--checkpoint_interval_steps", type=int, default=1000)
+    ap.add_argument("--keep_last", type=int, default=3, help="rolling checkpoint_step_*.pt files kept")
+    ap.add_argument("--log_interval_steps", type=int, default=50)
+    ap.add_argument("--max_bad_steps", type=int, default=20)
+    ap.add_argument("--allow_prior_change", action="store_true", help="resume although the manifold changed")
+    ap.add_argument("--purpose", default="", help="one line for run_meta.json: what question this run answers")
+    ap.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    # --- accuracy controls during training (training_controls_v3.py); all off by default ---
+    ap.add_argument("--ladder_every", type=int, default=0,
+                    help="every N-th step is a ladder batch (bracketed minimal pairs); 0 = off")
+    ap.add_argument("--ladder_anchors", type=int, default=4, help="anchors per ladder batch")
+    ap.add_argument("--ladder_steps", type=int, default=16, help="steps per ladder")
+    ap.add_argument("--ladder_workers", type=int, default=2)
+    ap.add_argument("--lambda_ord", type=float, default=0.5, help="weight of the JEPA ordinal loss on ladders")
+    ap.add_argument("--ladder_val_anchors", type=int, default=0,
+                    help="held-out ladders per axis for ladder validation; 0 = off")
+    ap.add_argument("--ot_coupling", action="store_true", help="minibatch OT noise/target pairing for the flow")
+    ap.add_argument("--cond_noise", action="store_true",
+                    help="EXPERIMENTS H6: train the flow on partly noised audio conditions (tau is a model input)")
+    ap.add_argument("--flow_loss", choices=("mse", "mae"), default="mse",
+                    help="velocity-matching error; Synth-JDF (supp. sec. 4) found MAE slightly better")
+    ap.add_argument("--cond_noise_clean_frac", type=float, default=0.3,
+                    help="share of flow samples with a clean condition (tau=1); the rest tau ~ logit-normal(0, 1)")
+    ap.add_argument("--ema_halflife_steps", type=float, default=0.0,
+                    help="EMA of the online weights with this half-life (steps); 0 = off")
+    ap.add_argument("--lr_floor", type=float, default=1.0,
+                    help="modular/fusion: LR multiplier reached at the end of a linear decay over the last "
+                         "--decay_frac of the run (step-based when --max_steps > 0); 1.0 = constant LR")
+    ap.add_argument("--lambda_acoustic", type=float, default=0.0,
+                    help="weight of differentiable Synth-JEPA acoustic consistency loss in flow training (default: 0.0)")
+    ap.add_argument("--acoustic_temp", type=float, default=0.5,
+                    help="softmax temperature for soft categorical probabilities in acoustic loss (default: 0.5)")
+    ap.add_argument("--acoustic_cat", choices=("soft", "st"), default="soft",
+                    help="acoustic loss categoricals: soft = softmax(x/temp) (Stage 5); st = straight-through one-hot")
+    ap.add_argument("--acoustic_t_min", type=float, default=0.0,
+                    help="acoustic loss only on items with flow time t >= this (0 = all, Stage 5); 0.5 suggested")
+    ap.add_argument("--acoustic_t_weight", choices=("none", "t"), default="none",
+                    help="weight the acoustic loss per item by t (x_hat_1 is a cleaner patch estimate near t = 1)")
+    return ap
+
+
+def train(args):
+    if args.seed is not None:
+        import numpy as np
+        import random
+        torch.manual_seed(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        
+    inharm_cfg = None
+    if args.inharm_weight > 0:
+        if not args.inharm_config:
+            print("error: --inharm_weight > 0 requires --inharm_config")
+            sys.exit(2)
+        from inharmonicity_target import InharmonicityConfig, InharmonicityExtractor
+        inharm_cfg = InharmonicityConfig.from_json(args.inharm_config)
+
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = False
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    log_file = open(os.path.join(args.out_dir, "training.log"), "a", buffering=1)
+
+    def log(msg):
+        line = f"{time.strftime('[%Y-%m-%d %H:%M:%S]')} {msg}"
+        print(line, flush=True)
+        log_file.write(line + "\n")
+
+    device = torch.device(args.device)
+    if args.manifold and args.manifold != "/home/kim/sao_runs/real_manifold_v4_bass.npz":
+        args.bass_manifold = args.manifold
+    prior_md5 = manifold_md5(args.bass_manifold)
+    if args.ladder_every > 0:
+        raise SystemExit("v6 has no ladder sets yet: use --ladder_every 0")
+    train_prior = SoundsetPriorV6(args.bass_manifold, args.all_manifold, split="train")
+    val_prior = SoundsetPriorV6(args.bass_manifold, args.all_manifold, split="val")
+    prior_bounds = train_prior.support_bounds()
+    log("=" * 70)
+    log(f"V6 joint training (note-conditioned flow, simplicity prior) on {device} | bass {args.bass_manifold} (md5 {prior_md5[:10]}), "
+        f"{train_prior.N} total presets, calibrated={train_prior.calibrated})")
+
+    mel_fn = ExactGpuMel(device=device)
+    if args.embed_dim % 8:
+        raise SystemExit(f"--embed_dim {args.embed_dim} must be divisible by the JEPA's 8 attention heads")
+    if args.flow_xattn and not args.flow_encoder.startswith("temporal_"):
+        raise SystemExit("--flow_xattn needs a temporal_* --flow_encoder (the conv encoder has no time tokens)")
+    jepa_kwargs = dict(embed_dim=args.embed_dim, predictor_hidden=args.predictor_hidden, num_audio_layers=args.jepa_layers,
+                       num_param_layers=args.jepa_layers, num_slices_sigreg=64, ff_dim=args.ff_dim, in_frames=81,
+                       num_continuous=len(CONT_INDICES), cat_sizes=[k for _, k in CAT_INDICES])
+    if args.inharm_weight > 0:
+        jepa_kwargs["inharmonicity_head"] = True
+    jepa = SynthJEPA(**jepa_kwargs).to(device)
+    
+    if args.inharm_weight > 0:
+        import math
+        stats_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_stats.json")
+        with open(stats_path, "r") as f:
+            stats = json.load(f)
+        train_mean = stats["train"]["pooled_mean"]
+        # Softplus(bias) = train_mean => exp(bias) = exp(train_mean) - 1
+        bias_val = math.log(math.exp(train_mean) - 1.0)
+        with torch.no_grad():
+            jepa.inharmonicity_head.net[-2].bias.fill_(bias_val)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+    FLOW_KWARGS["hidden_dim"] = args.flow_dim
+    FLOW_KWARGS["num_layers"] = args.flow_layers
+    enc_kwargs = {"d_model": args.flow_enc_dim} if args.flow_encoder.startswith("temporal_") else None
+    flow = build_model_v6(**FLOW_KWARGS, cond_noise=args.cond_noise, encoder=args.flow_encoder, film=args.flow_film,
+                          enc_kwargs=enc_kwargs, xattn=args.flow_xattn, xattn_dim=args.flow_xattn_dim or None,
+                          xattn_heads=args.flow_xattn_heads, note_features=args.note_features).to(device)
+
+    if args.optimizer == "modular":
+        from stable_audio_tools.training.modular_opt import (
+            ModularOptimizer,
+            build_modular_param_groups,
+            summarise_modular_groups,
+        )
+
+        jepa_groups = build_modular_param_groups(
+            jepa,
+            default_whitening=args.whitening,
+            spectral_lr=args.lr_jepa,
+            sign_lr=args.lr_jepa,
+            colnorm_lr=args.lr_jepa,
+            spectral_wd=args.wd_jepa,
+            sign_wd=0.0,
+            colnorm_wd=0.0,
+            scalar_opt=args.scalar_opt,
+            scalar_sf_beta=args.scalar_sf_beta,
+        )
+        flow_groups = build_modular_param_groups(
+            flow,
+            default_whitening=args.whitening,
+            spectral_lr=args.lr_flow,
+            sign_lr=args.lr_flow,
+            colnorm_lr=args.lr_flow,
+            spectral_wd=args.wd_flow,
+            sign_wd=0.0,
+            colnorm_wd=0.0,
+            scalar_opt=args.scalar_opt,
+            scalar_sf_beta=args.scalar_sf_beta,
+        )
+        opt_jepa = ModularOptimizer(
+            jepa_groups,
+            lr=args.lr_jepa,
+            schedule_free=True,
+            sf_c_warmup=args.sf_c_warmup,
+            sf_r=args.sf_r,
+            normuon=True,
+            snr_gate=args.snr_gate,
+            ns_poly=args.ns_poly,
+            radial_brake=args.radial_brake,
+            var_dampening_threshold=args.var_dampening,
+            wd_overtraining=args.wd_overtraining,
+            warmup_steps=args.warmup_steps,
+        )
+        opt_flow = ModularOptimizer(
+            flow_groups,
+            lr=args.lr_flow,
+            schedule_free=True,
+            sf_c_warmup=args.sf_c_warmup,
+            sf_r=args.sf_r,
+            normuon=True,
+            snr_gate=args.snr_gate,
+            ns_poly=args.ns_poly,
+            radial_brake=args.radial_brake,
+            var_dampening_threshold=args.var_dampening,
+            wd_overtraining=args.wd_overtraining,
+            warmup_steps=args.warmup_steps,
+        )
+        log(f"Optimizer: ModularOptimizer (ns_poly={args.ns_poly}, whitening={args.whitening}, "
+            f"scalar_opt={args.scalar_opt}, grad_clip={args.grad_clip}, "
+            f"radial_brake={args.radial_brake}, var_damp={args.var_dampening}, sf_c_warmup={args.sf_c_warmup}, "
+            f"wd_ot={args.wd_overtraining}, snr_gate={args.snr_gate})")
+    elif args.optimizer == "fusion":
+        from stable_audio_tools.training.fusion_groups import build_fusion_param_groups
+        from stable_audio_tools.training.fusion_opt import FusionOpt
+
+        jepa_groups = build_fusion_param_groups(jepa, spectral_lr=args.lr_jepa, scalar_lr=args.lr_jepa,
+                                                spectral_wd=0.01, scalar_wd=0.0)
+        flow_groups = build_fusion_param_groups(flow, spectral_lr=args.lr_flow, scalar_lr=args.lr_flow,
+                                                spectral_wd=1e-4, scalar_wd=0.0)
+        components = set(c.strip() for c in args.fusion_components.split(",") if c.strip())
+        tot_steps = args.total_steps if args.total_steps > 0 else max(1000, int(args.hours * 3600 * 1.5))
+        opt_jepa = FusionOpt(jepa_groups, lr=args.lr_jepa, components=components,
+                             decay_schedule="wsd", total_steps=tot_steps, decay_start_frac=0.8)
+        opt_flow = FusionOpt(flow_groups, lr=args.lr_flow, components=components,
+                             decay_schedule="wsd", total_steps=tot_steps, decay_start_frac=0.8)
+        log(f"Optimizer: FusionOpt with components {sorted(components)} (decay_schedule=wsd, total_steps={tot_steps})")
+    else:
+        opt_jepa = torch.optim.AdamW(jepa.parameters(), lr=args.lr_jepa, weight_decay=0.05)
+        opt_flow = torch.optim.AdamW(flow.parameters(), lr=args.lr_flow, weight_decay=1e-4)
+        log("Optimizer: AdamW")
+
+    w_enc = codec.encoded_weights(torch.from_numpy(domain_weights()).to(device))
+    log(f"JEPA {sum(p.numel() for p in jepa.parameters()) / 1e6:.2f}M params (ff_dim={args.ff_dim}), "
+        f"flow {sum(p.numel() for p in flow.parameters()) / 1e6:.2f}M params")
+
+    # Fixed validation sets (main-process synth; verifies the enum mapping once). With --val_cache the renders are
+    # stored under a key of everything that determines them and reused by every later run with the same key.
+    synth = init_synth(args.plugin, verify=True)
+    extractor = InharmonicityExtractor(inharm_cfg) if args.inharm_weight > 0 else None
+    cache_path = None
+    if args.val_cache:
+        import hashlib
+        from render_bank_v4 import file_md5
+        key = json.dumps({"v": 1, "prior": prior_md5, "val_size": args.val_size, "seeds": [1, 2, 3],
+                          "ladder_val_anchors": args.ladder_val_anchors, "ladder_steps": args.ladder_steps,
+                          "inharm": file_md5(args.inharm_config) if args.inharm_weight > 0 else None,
+                          "plugin": os.path.basename(os.path.normpath(args.plugin))}, sort_keys=True)
+        os.makedirs(args.val_cache, exist_ok=True)
+        cache_path = os.path.join(args.val_cache, f"valsets_{hashlib.sha1(key.encode()).hexdigest()[:16]}.pt")
+    if cache_path and os.path.exists(cache_path):
+        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+        val_sets, ladder_val_set = cached["val_sets"], cached["ladder_val_set"]
+        log(f"Loaded cached validation sets from {cache_path}")
+    else:
+        t0 = time.time()
+        val_sets = {"heldout": render_fixed_set(synth, val_prior, args.val_size, seed=1, extractor=extractor if args.inharm_weight > 0 else None),
+                    "trainpresets": render_fixed_set(synth, train_prior, args.val_size, seed=2, extractor=extractor if args.inharm_weight > 0 else None)}
+        log(f"Rendered fixed validation sets ({args.val_size} notes each) in {time.time() - t0:.1f}s")
+        ladder_val_set = None
+        if args.ladder_val_anchors > 0:
+            t0 = time.time()
+            ladder_val_set = render_ladder_set(synth, val_prior, args.ladder_val_anchors, args.ladder_steps, seed=3)
+            log(f"Rendered held-out ladder set ({len(ladder_val_set[0])} notes) in {time.time() - t0:.1f}s")
+        if cache_path:
+            atomic_save({"val_sets": val_sets, "ladder_val_set": ladder_val_set}, cache_path)
+            log(f"Cached validation sets in {cache_path}")
+    del synth
+    import gc
+    gc.collect()
+
+    if args.bank:
+        # Pre-rendered clips (render_bank_v6.py): the same items in the same order for every arm with this bank_seed.
+        from torch.utils.data import RandomSampler
+        from render_bank_v6 import BankMainDataset, check_compatible, cycle, read_manifest
+        manifest = read_manifest(args.bank)
+        # KUANG 2026-10-19: the format-only check let a bank built for another prior, or without inharmonicity labels,
+        # train silently. render_bank_v4 banks use the same 60-d storage as v5 (octaves digitised identically).
+        hard, soft = check_compatible(manifest, args.bass_manifold, args.all_manifold, args.inharm_weight,
+                                      args.inharm_config, args.ladder_every)
+        if hard:
+            raise SystemExit("--bank cannot serve this run:\n  " + "\n  ".join(hard))
+        if soft and not args.allow_prior_change:
+            raise SystemExit("--bank does not fit this run (--allow_prior_change to accept):\n  " + "\n  ".join(soft))
+        main_ds = BankMainDataset(args.bank)
+        need = (args.max_steps or 0) * args.batch_size * (1.0 - (1.0 / args.ladder_every if args.ladder_every else 0.0))
+        log(f"Training clips from bank {args.bank} ({len(main_ds)} items, seed {args.bank_seed}); this run needs "
+            f"~{need + args.norm_batches * args.batch_size:.0f} = {(need + args.norm_batches * args.batch_size) / len(main_ds):.2f} passes")
+        loader = DataLoader(main_ds, batch_size=args.batch_size,
+                            sampler=RandomSampler(main_ds, generator=torch.Generator().manual_seed(args.bank_seed)),
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
+                            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+                            persistent_workers=args.num_workers > 0)
+        batches = cycle(loader)
+    else:
+        loader = DataLoader(RealisticOnlineDataset(args.bass_manifold, args.plugin, inharm_cfg=inharm_cfg,
+                                                   all_manifold_path=args.all_manifold),
+                            batch_size=args.batch_size,
+                            num_workers=args.num_workers, pin_memory=device.type == "cuda", drop_last=True,
+                            prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+                            persistent_workers=args.num_workers > 0, worker_init_fn=_worker_init,
+                            # spawn, not fork: the main process has loaded Surge (validation renders),
+                            # and a forked copy of the plugin/audio state can deadlock
+                            multiprocessing_context="spawn" if args.num_workers > 0 else None)
+        batches = iter(loader)
+    ladder_batches = None
+    if args.ladder_every > 0:
+        if args.bank:
+            lad_ds = BankLadderDataset(args.bank, args.ladder_anchors)
+            ladder_loader = DataLoader(lad_ds, batch_size=None, num_workers=args.ladder_workers,
+                                       sampler=RandomSampler(lad_ds, generator=torch.Generator().manual_seed(args.bank_seed + 1)),
+                                       pin_memory=device.type == "cuda",
+                                       prefetch_factor=2 if args.ladder_workers > 0 else None,
+                                       persistent_workers=args.ladder_workers > 0)
+            ladder_batches = cycle(ladder_loader)
+        else:
+            ladder_loader = DataLoader(LadderDataset(args.manifold, args.plugin, args.ladder_anchors, args.ladder_steps),
+                                       batch_size=None, num_workers=args.ladder_workers, pin_memory=device.type == "cuda",
+                                       prefetch_factor=2, persistent_workers=True, worker_init_fn=_worker_init,
+                                       multiprocessing_context="spawn")
+            ladder_batches = iter(ladder_loader)
+
+    ema_jepa = EMA(jepa, args.ema_halflife_steps) if args.ema_halflife_steps > 0 else None
+    ema_flow = EMA(flow, args.ema_halflife_steps) if args.ema_halflife_steps > 0 else None
+    for g in list(getattr(opt_jepa, "param_groups", [])) + list(getattr(opt_flow, "param_groups", [])):
+        g.setdefault("base_lr", g["lr"])
+    best_kind = {"online": float("inf"), "ema": float("inf")}
+
+    latest = os.path.join(args.out_dir, "checkpoint_latest.pt")
+    ckpt_target = args.resume_from if args.resume_from else latest
+    step, elapsed_prev, best = 0, 0.0, float("inf")
+    if os.path.exists(ckpt_target):
+        ckpt = torch.load(ckpt_target, map_location=device, weights_only=False)
+        if ckpt.get("format_version", 1) < FORMAT_VERSION:
+            raise SystemExit(f"{ckpt_target} was written by the v1 trainer (no optimiser state, buggy prior); "
+                             "start a new run in a new --out_dir.")
+        if ckpt["prior_md5"] != prior_md5 and not args.allow_prior_change:
+            raise SystemExit(f"{ckpt_target} was trained on a different manifold (md5 {ckpt['prior_md5'][:10]}); "
+                             "use a new --out_dir, or --allow_prior_change to continue anyway.")
+        ckpt_head_state = any(k.startswith("inharmonicity_head") for k in ckpt["jepa_state_dict"].keys())
+        run_head_state = args.inharm_weight > 0
+        if ckpt_head_state != run_head_state:
+            print("Cannot resume across a head on/off change (D8).")
+            sys.exit(2)
+        jepa.load_state_dict(ckpt["jepa_state_dict"])
+        flow.load_state_dict(ckpt["flow_state_dict"])
+        opt_jepa.load_state_dict(ckpt["opt_jepa"])
+        opt_flow.load_state_dict(ckpt["opt_flow"])
+        normalizer = WelfordNormalizer.from_state_dict(ckpt["normalizer"])
+        step = ckpt["step"]
+        elapsed_prev = 0.0 if args.resume_from else ckpt["elapsed_s"]
+        best = ckpt.get("best_val", float("inf"))
+        best_kind = ckpt.get("best_kind", best_kind)
+        if ema_jepa is not None and "ema_jepa" in ckpt:
+            ema_jepa.load_state_dict(ckpt["ema_jepa"])
+            ema_flow.load_state_dict(ckpt["ema_flow"])
+        log(f"Resumed at step {step} from {os.path.basename(ckpt_target)} "
+            f"({ckpt['elapsed_s'] / 3600:.2f} h previously logged, best held-out JEPA loss {best:.4f})")
+    else:
+        log(f"Estimating mel normaliser over {args.norm_batches} batches...")
+        normalizer = WelfordNormalizer()
+        for _ in range(args.norm_batches):
+            aud, _, _, _ = next(batches)
+            normalizer.update(mel_fn(aud.to(device)).cpu().numpy())
+        normalizer.freeze()
+        with open(os.path.join(args.out_dir, "run_meta.json"), "w") as f:
+            json.dump({"run": os.path.basename(os.path.normpath(args.out_dir)),
+                       "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                       "purpose": args.purpose or None, "status": "running",
+                       "script": os.path.abspath(__file__), "args": vars(args),
+                       "prior": {"manifold": args.manifold, "md5": prior_md5, "train_presets": train_prior.N,
+                                 "heldout_presets": val_prior.N, "calibrated": train_prior.calibrated},
+                       "result": None, "kim_feedback": None}, f, indent=2)
+
+    if args.cond_noise:
+        # The flow noises its own condition in standardised space, so it carries the frozen mel stats. Write
+        # them into the EMA shadow too: the EMA averages float buffers, and its copy was taken before the stats
+        # existed (it would otherwise drift slowly from the placeholder zeros/ones).
+        with torch.no_grad():
+            flow.mel_mean.copy_(normalizer.frozen_mean.to(device))
+            flow.mel_std.copy_(normalizer.frozen_std.to(device))
+        if ema_flow is not None:
+            ema_flow.shadow["mel_mean"] = flow.mel_mean.detach().clone().float()
+            ema_flow.shadow["mel_std"] = flow.mel_std.detach().clone().float()
+
+    def resume_state(val_best):
+        return {"format_version": FORMAT_VERSION, "step": step, "elapsed_s": elapsed_prev + time.time() - start,
+                "jepa_state_dict": jepa.state_dict(), "flow_state_dict": flow.state_dict(),
+                "opt_jepa": opt_jepa.state_dict(), "opt_flow": opt_flow.state_dict(),
+                "normalizer": normalizer.state_dict(), "prior_md5": prior_md5, "prior_bounds": prior_bounds,
+                "best_val": val_best, "args": vars(args), "jepa_kwargs": jepa_kwargs,
+                "best_kind": best_kind,
+                **({"ema_jepa": ema_jepa.state_dict(), "ema_flow": ema_flow.state_dict()} if ema_jepa else {})}
+
+    def export(tag):
+        meta = {"step": step, "prior": args.manifold, "prior_md5": prior_md5}
+        atomic_save({"model_state_dict": jepa.state_dict(), "model_kwargs": jepa_kwargs,
+                     "normalizer": normalizer.state_dict(), "prior_bounds": prior_bounds, **meta},
+                    os.path.join(args.out_dir, f"jepa_{tag}.pt"))
+        atomic_save({"model_state": flow.state_dict(), "prior_bounds": prior_bounds,
+                     "args": {"model_type": "flow", "param_encoding": codec.ENCODING_V2, "time_scale": 1000.0,
+                              "v4_config": getattr(flow, "v4_config", None)}, **meta},
+                    os.path.join(args.out_dir, f"flow_{tag}.pt"))
+
+    def save_checkpoint():
+        if hasattr(opt_jepa, "eval"):
+            opt_jepa.eval()
+        if hasattr(opt_flow, "eval"):
+            opt_flow.eval()
+        state = resume_state(best)
+        atomic_save(state, os.path.join(args.out_dir, f"checkpoint_step_{step:07d}.pt"))
+        atomic_save(state, latest)
+        export("latest")
+        for old in sorted(glob.glob(os.path.join(args.out_dir, "checkpoint_step_*.pt")))[:-args.keep_last]:
+            os.remove(old)
+        if hasattr(opt_jepa, "train"):
+            opt_jepa.train()
+        if hasattr(opt_flow, "train"):
+            opt_flow.train()
+        export_kinds("latest")
+
+    def export_kinds(tag):
+        """online = the weights being trained (SF y); ema = EMA of online. ("latest"/"best" stay the SF x.)"""
+        export(f"online_{tag}")
+        if ema_jepa is not None:
+            with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
+                export(f"ema_{tag}")
+
+    def validate_kinds(res_sf):
+        """Online (SF y) and EMA weights on the same fixed sets, plus held-out ladders for all kinds."""
+        kinds = {"sf": None, "online": None}
+        if ema_jepa is not None:
+            kinds["ema"] = None
+        rec = {"step": step, "time": time.time()}
+        for kind in kinds:
+            if kind == "sf":
+                res = res_sf
+            else:
+                def run_val():
+                    r = {name: validate(jepa, flow, normalizer, mel_fn, a, p, w_enc, args.lambda_sig, device)
+                            for name, (a, p, *_) in val_sets.items()}
+                    if args.inharm_weight > 0:
+                        aux = validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device)
+                        for name in r:
+                            r[name]["aux_mse"] = aux[name]["mse"]
+                            r[name]["aux_r2"] = aux[name]["r2"]
+                            r[name]["aux_baseline_mse"] = aux[name]["baseline_mse"]
+                    return r
+                if kind == "ema":
+                    with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
+                        res = run_val()
+                        lad = ladder_validation(jepa, flow, normalizer, mel_fn, ladder_val_set, args.ladder_steps,
+                                                device, codec) if ladder_val_set is not None else {}
+                else:
+                    res = run_val()
+                    lad = ladder_validation(jepa, flow, normalizer, mel_fn, ladder_val_set, args.ladder_steps,
+                                            device, codec) if ladder_val_set is not None else {}
+                res["heldout"].update(lad)
+                h = res["heldout"]
+                log(f"VAL[{kind}] step {step} | held-out JEPA {h['jepa']:.4f} flow {h['flow']:.4f} "
+                    f"R a2p {100 * h['r_a2p']:.1f}% p2a {100 * h['r_p2a']:.1f}% | train-presets JEPA "
+                    f"{res['trainpresets']['jepa']:.4f}"
+                    + (f" | ladder rho flow {lad['ladder_flow_rho_mean']:.3f} jepa {lad['ladder_jepa_rho_mean']:.3f}"
+                       if lad else ""))
+                if h["jepa"] < best_kind[kind]:
+                    best_kind[kind] = h["jepa"]
+                    if kind == "ema":
+                        with ema_jepa.swapped(jepa), ema_flow.swapped(flow):
+                            export("ema_best")
+                    else:
+                        export("online_best")
+            for name, r in res.items():
+                for k, v in r.items():
+                    rec[f"{kind}/{name}/{k}"] = v
+        with open(os.path.join(args.out_dir, "val_kinds.jsonl"), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    total_s = args.hours * 3600.0
+    start = time.time()
+    t_window = start                                     # throughput window for the periodic log line
+    run = {k: 0.0 for k in ("jepa", "flow", "r_a2p", "r_p2a", "wait_s", "samples")}
+    bad = {"jepa": 0, "flow": 0}
+    log("Entering main training loop...")
+    if hasattr(opt_jepa, "train"):
+        opt_jepa.train()
+    if hasattr(opt_flow, "train"):
+        opt_flow.train()
+
+    while not _STOP_REQUESTED:
+        elapsed = elapsed_prev + time.time() - start
+        if (args.max_steps and step >= args.max_steps) or (not args.max_steps and elapsed >= total_s):
+            break
+        if args.optimizer == "adamw":
+            f = lr_factor(step, elapsed / total_s, args.warmup_steps, args.decay_frac)
+            for g in opt_jepa.param_groups:
+                g["lr"] = args.lr_jepa * f
+            for g in opt_flow.param_groups:
+                g["lr"] = args.lr_flow * f
+        else:
+            f = 1.0
+            if args.lr_floor < 1.0:
+                frac = step / args.max_steps if args.max_steps else elapsed / total_s
+                start_decay = 1.0 - args.decay_frac
+                if frac > start_decay:
+                    f = 1.0 - (1.0 - args.lr_floor) * min(1.0, (frac - start_decay) / max(args.decay_frac, 1e-9))
+                for g in list(opt_jepa.param_groups) + list(opt_flow.param_groups):
+                    g["lr"] = g["base_lr"] * f
+
+        # Dynamic batch schedule
+        time_frac = min(1.0, max(0.0, elapsed / max(1e-6, total_s)))
+        if args.batch_schedule == "linear_decay":
+            curr_b = int(round(args.batch_size - time_frac * (args.batch_size - args.min_batch_size)))
+        elif args.batch_schedule == "power2_decay":
+            # 32 -> 16 -> 8 -> 4 -> 2 across geometric time intervals
+            stages = [32, 16, 8, 4, 2]
+            stage_idx = min(len(stages) - 1, int(time_frac * len(stages)))
+            curr_b = max(args.min_batch_size, stages[stage_idx])
+        else:
+            curr_b = args.batch_size
+        curr_b = max(args.min_batch_size, min(args.batch_size, curr_b))
+
+        is_ladder = ladder_batches is not None and step % args.ladder_every == args.ladder_every - 1
+        t_wait = time.time()
+        if is_ladder:
+            # No inharmonicity targets for ladder batches yet
+            audio, params, _axis = next(ladder_batches)
+            inharm_val = torch.zeros(audio.shape[0])
+            inharm_valid = torch.zeros(audio.shape[0])
+        else:
+            audio, params, inharm_val, inharm_valid = next(batches)
+        run["wait_s"] = run.get("wait_s", 0.0) + time.time() - t_wait   # time blocked on the data loader
+        run["samples"] = run.get("samples", 0.0) + audio.shape[0]
+        if curr_b < audio.shape[0]:
+            audio = audio[:curr_b]
+            params = params[:curr_b]
+            inharm_val = inharm_val[:curr_b]
+            inharm_valid = inharm_valid[:curr_b]
+        audio = audio.to(device, non_blocking=True)
+        params = params.to(device, non_blocking=True)
+        inharm_val = inharm_val.to(device, non_blocking=True).float()
+        inharm_valid = inharm_valid.to(device, non_blocking=True).float()
+        mel = mel_fn(audio)
+
+        opt_jepa.zero_grad(set_to_none=True)
+        cont, cats = prepare_jepa_inputs(params)
+        lp, la, sa, sp, za, zp = jepa(normalizer.normalize(mel), cont, cats)
+        
+        if args.inharm_weight > 0.0:
+            inharm_pred = jepa.inharmonicity_head(za)
+            i_loss, i_count = masked_inharmonicity_loss(inharm_pred, inharm_val, inharm_valid)
+            i_loss = args.inharm_weight * i_loss
+        else:
+            i_loss = torch.zeros((), device=device)
+
+        if is_ladder:
+            # no SIGReg on a ladder (not i.i.d.); ordinal loss on the audio embedding instead
+            o_loss = ordinal_loss(za, args.ladder_steps)
+            j_loss = lp + la + args.lambda_ord * o_loss + i_loss
+            run["ord"] = run.get("ord", 0.0) + float(o_loss.detach())
+            run["n_ladder"] = run.get("n_ladder", 0) + 1
+        else:
+            j_loss = lp + la + args.lambda_sig * (sa + sp) + i_loss
+        j_loss.backward()
+        gn = nn.utils.clip_grad_norm_(jepa.parameters(), args.grad_clip) if args.grad_clip > 0 else torch.tensor(0.0)
+        if torch.isfinite(j_loss) and torch.isfinite(gn):
+            opt_jepa.step()
+            bad["jepa"] = 0
+        else:
+            bad["jepa"] += 1
+            log(f"Step {step}: non-finite JEPA loss/grad ({float(j_loss):.4g}/{float(gn):.4g}); step skipped")
+
+        opt_flow.zero_grad(set_to_none=True)
+        if args.lambda_acoustic > 0.0:
+            f_loss, x_hat_1, t_fl = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
+                                              clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss,
+                                              return_pred=True, return_t=True)
+            ac_loss, _ac_used = acoustic_consistency(jepa, x_hat_1, za, t_fl, codec.note_of(params), temp=args.acoustic_temp,
+                                                     cat_mode=args.acoustic_cat, t_min=args.acoustic_t_min,
+                                                     t_weight=args.acoustic_t_weight)
+            total_flow_loss = f_loss + args.lambda_acoustic * ac_loss
+        else:
+            f_loss = flow_loss(flow, mel, params, w_enc, ot=args.ot_coupling, cond_noise=args.cond_noise,
+                               clean_frac=args.cond_noise_clean_frac, loss_type=args.flow_loss, return_pred=False)
+            ac_loss = torch.zeros((), device=device)
+            total_flow_loss = f_loss
+        total_flow_loss.backward()
+        gn = nn.utils.clip_grad_norm_(flow.parameters(), args.grad_clip) if args.grad_clip > 0 else torch.tensor(0.0)
+        if torch.isfinite(total_flow_loss) and torch.isfinite(gn):
+            opt_flow.step()
+            bad["flow"] = 0
+        else:
+            bad["flow"] += 1
+            log(f"Step {step}: non-finite flow loss/grad ({float(total_flow_loss):.4g}/{float(gn):.4g}); step skipped")
+        if max(bad.values()) >= args.max_bad_steps:
+            log(f"{args.max_bad_steps} consecutive non-finite steps; exiting (code 3) without saving")
+            log_file.close()
+            sys.exit(3)
+
+        if ema_jepa is not None:
+            ema_jepa.update(jepa)
+            ema_flow.update(flow)
+
+        with torch.no_grad():
+            tgt = torch.arange(za.shape[0], device=device)
+            run["r_a2p"] += float((torch.cdist(jepa.f_a2p(za), zp).argmin(dim=1) == tgt).float().mean())
+            run["r_p2a"] += float((torch.cdist(jepa.f_p2a(zp), za).argmin(dim=1) == tgt).float().mean())
+        run["jepa"] += float(j_loss.detach())
+        run["inharm"] = run.get("inharm", 0.0) + float(i_loss.detach())
+        run["inharm_valid"] = run.get("inharm_valid", 0.0) + float(inharm_valid.mean())
+        run["flow"] += float(f_loss.detach())
+        run["acoustic"] = run.get("acoustic", 0.0) + float(ac_loss.detach())
+        step += 1
+
+        if step % args.log_interval_steps == 0:
+            k = args.log_interval_steps
+            el = elapsed_prev + time.time() - start
+            wall = max(time.time() - t_window, 1e-9)
+            ac_str = f" (Ac {run['acoustic'] / k:.4f})" if args.lambda_acoustic > 0.0 else ""
+            log(f"Step {step:7d} | {el / 3600:5.2f}h / {args.hours:.2f}h | lr x{f:.3f} | batch {curr_b:2d} | "
+                f"JEPA {run['jepa'] / k:.4f} | Flow {run['flow'] / k:.4f}{ac_str} | Aux {run['inharm'] / k:.4f} (v={run['inharm_valid'] / k:.2f}) | "
+                f"in-batch R a2p {100 * run['r_a2p'] / k:5.1f}% p2a {100 * run['r_p2a'] / k:5.1f}% "
+                f"(chance {100 / curr_b:.1f}%)"
+                + (f" | ladders {run['n_ladder']:.0f} ord {run['ord'] / max(1, run['n_ladder']):.4f}"
+                   if run.get("n_ladder") else "")
+                + f" | {run['samples'] / wall:.0f} samples/s, data wait {100 * run['wait_s'] / wall:.0f}%")
+            run = {key: 0.0 for key in run}
+            t_window = time.time()
+
+        if step % args.val_interval_steps == 0:
+            if hasattr(opt_jepa, "eval"):
+                opt_jepa.eval()
+            if hasattr(opt_flow, "eval"):
+                opt_flow.eval()
+            res = {name: validate(jepa, flow, normalizer, mel_fn, a, p, w_enc, args.lambda_sig, device)
+                   for name, (a, p, *_) in val_sets.items()}
+            if args.inharm_weight > 0:
+                aux = validate_inharmonicity(val_sets, jepa, normalizer, mel_fn, device)
+                for name in res:
+                    res[name]["aux_mse"] = aux[name]["mse"]
+                    res[name]["aux_r2"] = aux[name]["r2"]
+                    res[name]["aux_baseline_mse"] = aux[name]["baseline_mse"]
+            h, tr = res["heldout"], res["trainpresets"]
+            aux_str = f" | AUX held-out MSE {h['aux_mse']:.5f} (baseline {h['aux_baseline_mse']:.5f}) R^2 {h['aux_r2']:.4f}" if "aux_mse" in h else ""
+            log(f"VAL step {step} | held-out presets: JEPA {h['jepa']:.4f} flow {h['flow']:.4f} "
+                f"R a2p {100 * h['r_a2p']:.1f}% p2a {100 * h['r_p2a']:.1f}% (chance {100 * h['chance']:.2f}%) | "
+                f"train presets: JEPA {tr['jepa']:.4f} flow {tr['flow']:.4f} | gap {h['jepa'] - tr['jepa']:+.4f}{aux_str}")
+            with open(os.path.join(args.out_dir, "val.jsonl"), "a") as fh:
+                fh.write(json.dumps({"step": step, "time": time.time(), **{f"{n}/{k}": v for n, r in res.items()
+                                                                           for k, v in r.items()}}) + "\n")
+            if h["jepa"] < best:
+                best = h["jepa"]
+                atomic_save(resume_state(best), os.path.join(args.out_dir, "checkpoint_best.pt"))
+                export("best")
+                log(f"--> new best held-out JEPA loss {best:.4f}: checkpoint_best.pt, jepa_best.pt, flow_best.pt")
+            if hasattr(opt_jepa, "train"):
+                opt_jepa.train()
+            if hasattr(opt_flow, "train"):
+                opt_flow.train()
+            validate_kinds(res)
+
+        if step % args.checkpoint_interval_steps == 0:
+            save_checkpoint()
+            log(f"--> checkpoint at step {step}")
+
+    if hasattr(opt_jepa, "eval"):
+        opt_jepa.eval()
+    if hasattr(opt_flow, "eval"):
+        opt_flow.eval()
+    save_checkpoint()
+    if hasattr(opt_jepa, "eval"):
+        opt_jepa.eval()
+    if hasattr(opt_flow, "eval"):
+        opt_flow.eval()
+    atomic_save(resume_state(best), os.path.join(args.out_dir, "checkpoint_final.pt"))
+    log(f"Stopped at step {step} ({(elapsed_prev + time.time() - start) / 3600:.2f} h); "
+        f"best held-out JEPA loss {best:.4f}")
+    log_file.close()
+
+
+if __name__ == "__main__":
+    train(build_parser().parse_args())

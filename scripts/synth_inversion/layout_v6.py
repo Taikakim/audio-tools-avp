@@ -5,7 +5,7 @@ Before this, flow_sampling_v5, render_pool_v5, dpo_pairs_v5, train_flow_dpo_v5 a
 spec and codec directly, so they could not be used on v4 (108-d) or v5 (126-d) flows; the real-stem eval guessed the
 note range. Every layout so far uses NOTE_LOW..NOTE_HIGH = 28..50; take it from here, never hard-code it.
 
-  L = layout_for_dim(flow.param_dim)        # 92 -> v3, 108 -> v4, 126 -> v5 (from the codecs)
+  L = layout_for_dim(flow.param_dim)        # 92 -> v3, 108 -> v4, 126 -> v5, 114 -> v6 (from the codecs)
   L = layout_named("v5")
   L.spec, L.codec, L.name, L.encoded_dim, L.num_params
   L.note_unit(midi)                          # MIDI note -> the [0, 1] value of parameter 0
@@ -19,7 +19,8 @@ import numpy as np
 
 _BY_NAME = {"v3": ("surge_spec_v3", "param_codec_v3"),
             "v4": ("surge_spec_v4", "param_codec_v4"),
-            "v5": ("surge_spec_v5", "param_codec_v5")}
+            "v5": ("surge_spec_v5", "param_codec_v5"),
+            "v6": ("surge_spec_v6", "param_codec_v6")}
 OCTAVE_PARAMS = ("osc_1_octave", "osc_2_octave", "osc_3_octave")
 
 
@@ -40,6 +41,19 @@ class Layout:
     @property
     def note_range(self):
         return int(self.spec.NOTE_LOW), int(self.spec.NOTE_HIGH)
+
+    @property
+    def note_conditioned(self):
+        """v6: the note is the flow's input (models_v6), osc 1 is fixed at octave 0; not a predicted parameter."""
+        return hasattr(self.spec, "CONDITION_PARAMS")
+
+    def decode(self, x, note_unit=None):
+        """Flow output [B, D] -> storage vectors. note_unit [B]: required (and used) for note-conditioned layouts."""
+        if self.note_conditioned:
+            if note_unit is None:
+                raise ValueError(f"layout {self.name} needs the note to decode")
+            return self.codec.decode(x, note_unit)
+        return self.codec.decode(x)
 
     def note_unit(self, midi):
         lo, hi = self.note_range
@@ -87,10 +101,12 @@ def fold_note(midi, layout):
 
 
 def shift_octaves(vec, k, layout):
-    """Shift all three oscillators by k octaves in the ordinal storage layout (v4 / v5: 7 octave positions,
-    stored as class / 6). Clamped at -3 / +3; returns (new vector, number of oscillators that hit the clamp)."""
+    """Shift all three oscillators by k octaves in the ordinal storage layout (v3 / v4 / v5: 7 octave positions,
+    stored as class / 6). Clamped at -3 / +3; returns (new vector, number of oscillators that hit the clamp).
+    v6: a no-op. Osc 1 is fixed at octave 0 and osc 2 / 3 are relative, so a patch played at the real note
+    already sounds at the right pitch."""
     out = np.array(vec, dtype=np.float32, copy=True)
-    if k == 0:
+    if k == 0 or layout.note_conditioned:
         return out, 0
     if not all(n in layout.spec.PARAM_INDEX for n in OCTAVE_PARAMS):
         raise ValueError(f"layout {layout.name} has no per-oscillator octave parameters")

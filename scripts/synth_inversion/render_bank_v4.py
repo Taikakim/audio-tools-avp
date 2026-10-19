@@ -196,21 +196,22 @@ def cycle(loader):
 
 
 def check_compatible(manifest, bass_manifold=None, all_manifold=None, inharm_weight=0.0, inharm_config=None,
-                     ladder_every=0):
+                     ladder_every=0, fmt=FORMAT, num_params=NUM_PARAMS):
     """-> (hard, soft) problem lists. hard: the bank cannot serve the run (wrong format or layout, aux labels or
-    ladders it does not have). soft: it was built from other manifolds (overridable with --allow_prior_change)."""
+    ladders it does not have). soft: it was built from other manifolds (overridable with --allow_prior_change).
+    fmt / num_params: the bank format and storage size the run expects (render_bank_v6 passes 6 / 59)."""
     hard, soft = [], []
-    if manifest.get("format") != FORMAT:
-        hard.append(f"bank format {manifest.get('format')} != {FORMAT}")
-    if int(manifest.get("num_params", NUM_PARAMS)) != NUM_PARAMS:
-        hard.append(f"bank has {manifest.get('num_params')} params, this layout {NUM_PARAMS}")
+    if manifest.get("format") != fmt:
+        hard.append(f"bank format {manifest.get('format')} != {fmt}")
+    if int(manifest.get("num_params", num_params)) != num_params:
+        hard.append(f"bank has {manifest.get('num_params')} params, this layout {num_params}")
     if inharm_weight > 0:
         if not manifest.get("inharm_labels"):
             hard.append("--inharm_weight > 0 but the bank has no inharmonicity labels (rebuild with --inharm_config)")
         elif inharm_config and manifest.get("inharm_config_md5") != file_md5(inharm_config):
             hard.append("the bank's inharmonicity labels were made with another --inharm_config")
     if ladder_every and ladder_every > 0:
-        hard.append("--ladder_every > 0 but render_bank_v4 banks hold no ladders (use --ladder_every 0 or live mode)")
+        hard.append("--ladder_every > 0 but banks hold no ladders (use --ladder_every 0 or live mode)")
     for key, path in (("bass_manifold", bass_manifold), ("all_manifold", all_manifold)):
         if path is None:
             continue

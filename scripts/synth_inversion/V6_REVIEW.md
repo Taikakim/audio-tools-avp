@@ -231,4 +231,89 @@ the real-stem pack, then a blind listening test (`listening_test_v5.py`).
 | `test_eval_v4.py` | its tiny JEPA now uses the V3 sizes | |
 
 Not done here: the v6 layout (note as input, osc 1 fixed), the simplicity prior, a ladder bank for V4 / V5. They change
-the training data and need Kim's go after steps 0 to 3.
+the training data and need Kim's go after steps 0 to 3. (Done in section 8, after Kim's go.)
+
+---
+
+## 8. October 19, 2026, afternoon: the Steps 0 to 4 results, and V6 phase 1 code
+
+Antigravity's `V6_SPECIFICATION.md` (commit `6cc2d74`) reports Steps 1 to 4 and specifies V6. Kim asked for the code
+the specification needs. Reading of the results first, then the code.
+
+### 8.1 What the results show, and what they do not
+
+- **Step 0 is not reported.** Whether Stage 4 / 5 trained with the temporal encoder, the inharmonicity head
+  (`v=` in the log) or ladders is still unknown. It is a five-minute check of `run_meta.json`; needed before saying
+  what V5 "is".
+- **Note-range fix (Step 1/2):** S5 real-stem wins rose from 3 to 11 of 24, which fits the diagnosis in section 1.
+- **"Mel SSIM" in the results is a distance, so its direction is inverted** [V]. The evaluation stored
+  `am.mel_ssim_dist` (= 1 - SSIM, lower is closer) as `mel_ssim`; the specification reads it as "higher is better".
+  So in the DPO table β = 30 (0.719) has the *worst* structural match and S1 (0.649) the best; S5 0.682 -> β 100 0.669
+  is a small improvement, β 300 (0.695) and β 30 (0.719) are worse. The landmark values (0.834, 0.867, 0.922) are
+  distances too. Fixed: new summaries store `mel_ssim` = SSIM and `mel_ssim_dist`; the audition page converts old files.
+  Pages built from old summaries show distances.
+- **Occam (Step 2):** mean phrase score of S5 5.458 -> 5.394 with 128 features removed, but S5's wins fell from 11 to
+  7. No interval is given; with 24 stems a 0.06 change can be one stem. `stem_stats_v6.py` gives the paired answer.
+- **Ablation (Step 3)** agrees with section 4: the waveshaper is audible in 60 % of the draws where it is on and
+  detectable from z_a (AUROC 0.84 to 0.86); a second oscillator is audible in only 20 % of the draws where it is on.
+  The 0.587 is the AUROC for *audible* osc 2, so it says audible second oscillators are hard to detect from z_a; it is
+  not itself a measurement of parameter-label training. Both points support Occam over learned gates.
+- **Flow-DPO (Step 4):** the synthetic headroom is large (best of 8: MSS 3.43 vs 5.75 for the first draw; spread above
+  render noise in 96 % of conditions), so the preference data carries signal. **On the real stems DPO is not shown to
+  help:** all three arms have a higher mean phrase score than the base (5.545 / 5.705 / 5.748 vs 5.536) and fewer wins
+  (3 / 2 / 1 vs 7). The per-stem gains (#04, #12, #14) are each picked from the best of three β values, so they are a
+  selection, not an effect. The two numbers that decide it are missing: the held-out synthetic evaluation of the DPO
+  checkpoints (`audio_eval_v5.py`, the step 4 gate) and the DPO validation pair accuracy (88.3 % is training).
+- **`bass_energy_dist`** matches the low-band level (|log RMS below 600 Hz|); it does not reward "more body". It has
+  not been through the ladder gate; run `ladder_metric_check_v5.py` with it before giving it weight.
+- **Specification 3.4's training objective is not implementable as written:** MSS, D_bass and D_modspec need rendered
+  audio, and Surge is not differentiable, so they cannot be training losses (as `V4_COMPONENTS.md` found for the V4
+  brief). Only the JEPA term trains the flow; the audio metrics belong in DPO ranking and evaluation. The 0.2 weight on
+  the inharmonicity loss also disagrees with section 3.3's `--inharm_weight 100` (the A-series value); use 100 unless
+  an ablation says otherwise.
+- **Smaller corrections:** the V6 width is 114, not 110 (126 - 1 - 7 - 4); "waveshapers 87 %" is the trainer's live
+  random sampler, the bank prior used 10 % (Step 0 tells which a run saw).
+
+### 8.2 Phase 1 code (this commit)
+
+| File | What | Test |
+|---|---|---|
+| `surge_spec_v6.py` | 59 stored values: note at index 0 as the condition, osc 1 fixed at octave 0, osc 2 / 3 relative octaves (-2..+2), ±0.2 st fine pitch; `to_v5` / `from_v5`; renders through surge_spec_v5 | [T] |
+| `param_codec_v6.py` | 114-d encoding without the note; `decode(x, note)`, `jepa_cont` (note back into the JEPA input) | [T] |
+| `soundset_prior_v6.py` | simplicity prior: 70 % sparse (spec table), 20 % presets, 10 % random | [T] shares |
+| `models_v6.py` | `NoteConditionedFlow` (note as sin / cos features into the parameter projection), `build_model_v6`, loader; `load_inverter_v4` hands v6 checkpoints over | [T] |
+| `train_realistic_bass_v6.py` | v5 trainer on the v6 layout, prior, bank and note-conditioned flow; ladders refused; `--flow_encoder temporal_asp` default | [T] end to end on a fake bank |
+| `render_bank_v6.py` | format-6 bank from the simplicity prior, inharmonicity labels, glitch redraws, `verify` | [T] |
+| `check_v6_spec.py` | desktop check of the ±0.2 st fine pitch and the relative octaves on Surge | [T] measurement on synthetic tones |
+| `stem_stats_v6.py` | paired real-stem statistics (bootstrap CI over stems, sign test) | [T] |
+| `layout_v6.py`, `flow_sampling_v5.py`, `train_flow_dpo_v5.py`, `dpo_pairs_v5.py`, `audio_eval_v5.py`, `ablation_v6.py` | v6 support (note passed to the flow, v6 prior) | [T] |
+| `eval_real_stems_consensus_v5.py` | v6 support; `--max_midi 60 --drop_polyphony` (specification 3.5 transcription filter, the reranked phrase too); SSIM fix | [T] |
+| `build_interactive_model_eval_page.py` | SSIM column reads "higher = closer" for old and new files | |
+
+### 8.3 Desktop order (each a gate for the next)
+
+```
+cd $S
+python -m pytest test_v6.py test_v6_foundation.py test_v5.py test_eval_v4.py test_v4_components.py -q
+python check_v6_spec.py --plugin "~/.vst3/Surge XT.vst3"                     # exit 0, or fix V5_PITCH_ST in surge_spec_v6
+python stem_stats_v6.py ~/sao_runs/stems_v6_dpo_occam/consensus_eval_summary.json --ref S5_16.5h
+python stem_stats_v6.py ~/sao_runs/stems_v6_dpo_occam/consensus_eval_summary.json --ref S5_16.5h --metric mel_ssim_dist
+python audio_eval_v5.py --bass_manifold $B --all_manifold $A --n 256 --k 8 --workers 14 --device cuda:0 \
+    --flow S5=<S5 flow_ema> --flow B100=~/sao_runs/dpo_s5_b100/flow_dpo_latest.pt --flow B300=~/sao_runs/dpo_s5_b300/flow_dpo_latest.pt \
+    --metrics logmel_l1 mss modspec_dist bass_energy_dist --out ~/sao_runs/audio_eval_dpo     # the step 4 gate
+python render_bank_v6.py build --out ~/sao_runs/bank_v6 --bass_manifold $B --all_manifold $A --n_items 100000 \
+    --workers 14 --inharm_config inharm_config.json && python render_bank_v6.py verify --bank ~/sao_runs/bank_v6
+python ablation_v6.py labels --layout v6 --bass_manifold $B --all_manifold $A --n 4096 --workers 14 --out ~/sao_runs/abl_v6
+```
+Gate for training: in `abl_v6/summary.json`, on_share x (1 - audible_share_of_on) per feature (on but inaudible) well
+below the v5 values (osc 2: 0.75 x 0.80 = 0.60).
+
+Arms (same bank, seed and step budget; add the S5 launch's model-size and `--cond_noise` flags):
+```
+python train_realistic_bass_v6.py --bank ~/sao_runs/bank_v6 --bass_manifold $B --all_manifold $A \
+    --flow_encoder temporal_asp --ladder_every 0 --max_steps 12000 --batch_size 64 --seed 0 --device cuda:0 --out_dir ~/sao_runs/v6_A
+  ... --inharm_weight 100 --inharm_config inharm_config.json --out_dir ~/sao_runs/v6_B
+  ... (B) --lambda_acoustic <S5 value> --acoustic_cat st --acoustic_t_min 0.5 --out_dir ~/sao_runs/v6_C
+```
+Then `audio_eval_v5.py` on the three (held-out synthetic, paired), the real-stem evaluation with
+`--max_midi 60 --drop_polyphony --occam_tol 0.02`, `stem_stats_v6.py`, and Kim's blind listening.

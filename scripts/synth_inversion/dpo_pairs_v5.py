@@ -90,7 +90,12 @@ def make_prior(layout_name, a):
     from realistic_prior_v4 import UnifiedSoundsetPrior, manifold_md5
     if not (a.bass_manifold and a.all_manifold):
         raise SystemExit(f"--source synth with a {layout_name} flow needs --bass_manifold and --all_manifold")
-    return (UnifiedSoundsetPrior(a.bass_manifold, a.all_manifold, split="train"),
+    if layout_name == "v6":
+        from soundset_prior_v6 import SoundsetPriorV6
+        cls = SoundsetPriorV6
+    else:
+        cls = UnifiedSoundsetPrior
+    return (cls(a.bass_manifold, a.all_manifold, split="train"),
             manifold_md5(a.bass_manifold) + "+" + manifold_md5(a.all_manifold))
 
 

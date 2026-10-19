@@ -229,9 +229,11 @@ def main(argv=None, pool=None, prior=None):
             prior = RealisticBassPrior(a.manifold, split="val")
         else:
             from realistic_prior_v4 import UnifiedSoundsetPrior
+            from soundset_prior_v6 import SoundsetPriorV6
             if not (a.bass_manifold and a.all_manifold):
                 raise SystemExit(f"{lname} flows need --bass_manifold and --all_manifold")
-            prior = UnifiedSoundsetPrior(a.bass_manifold, a.all_manifold, split="val")
+            prior = (SoundsetPriorV6 if lname == "v6" else UnifiedSoundsetPrior)(a.bass_manifold, a.all_manifold,
+                                                                                  split="val")
     items = draw_items(prior, a.n, a.seed) if lname == "v3" else draw_items_soundset(prior, a.n, a.seed)
     midi, clusters = items["midi"], items["preset"]
     t0 = time.time()

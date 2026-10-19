@@ -11,7 +11,8 @@ Candidate j of target b uses the generator stream of one seeded torch.Generator,
 reproducible on one device.
 
 The codec and note range come from the flow's own layout (layout_v6.layout_for_flow: 92 -> v3, 108 -> v4,
-126 -> v5); the returned vectors are in that layout's ordinal storage, to be rendered with the same spec.
+126 -> v5, 114 -> v6); the returned vectors are in that layout's ordinal storage, to be rendered with the same spec.
+v6 flows take the note as an input (models_v6) instead of having it pinned along the path.
 """
 import numpy as np
 import torch
@@ -49,14 +50,19 @@ def sample_candidates(flow, mel, midi, k=8, steps=25, seed=0, tau=1.0, chunk=512
             raise ValueError("tau < 1 needs a model trained with cond_noise")
         emb = flow.encoder(m)
         x = torch.randn(R, flow.param_dim, device=device, generator=gen)
+        conditioned = lay is not None and lay.note_conditioned
         for i in range(steps):
             tv = i / steps
             t = torch.full((R,), tv, device=device)
-            x[:, 0] = (1.0 - tv) * x[:, 0] + tv * n
-            x = x + flow(x, t, audio_emb=emb, tau=tau_t) * (1.0 / steps)
-        x[:, 0] = n
+            if conditioned:                                      # v6: the note is an input, nothing to pin
+                x = x + flow(x, t, audio_emb=emb, tau=tau_t, note=n) * (1.0 / steps)
+            else:
+                x[:, 0] = (1.0 - tv) * x[:, 0] + tv * n
+                x = x + flow(x, t, audio_emb=emb, tau=tau_t) * (1.0 / steps)
+        if not conditioned:
+            x[:, 0] = n
         x = torch.clamp(x, 0.0, 1.0)
-        out.append(x if ordinal else lay.codec.decode(x))
+        out.append(x if ordinal else lay.decode(x, n))
     flow.train(was)
     return torch.cat(out).cpu().numpy().reshape(B, k, -1).astype(np.float32)
 

@@ -112,6 +112,29 @@ def extract_notes_from_midi(midi_path, max_dur=None):
     return notes
 
 
+def filter_transcription(notes, max_midi=None, drop_polyphony=False):
+    """V6_SPECIFICATION.md 3.5 transcription clean-up: drop notes above max_midi, and with drop_polyphony every note
+    that overlaps another in time (a cluster is a transcription error on a monophonic bass)."""
+    keep = [n for n in notes if max_midi is None or n["note"] <= max_midi]
+    if drop_polyphony:
+        def overlaps(a, b):
+            return a is not b and a["start"] < b["start"] + b["dur"] and b["start"] < a["start"] + a["dur"]
+        keep = [n for n in keep if not any(overlaps(n, m) for m in keep)]
+    return keep
+
+
+def events_from_notes(notes, max_dur):
+    """Note list -> pedalboard MIDI events (the phrase the reranker renders), cut at max_dur."""
+    ev = []
+    for n in notes:
+        if n["start"] >= max_dur:
+            continue
+        ev.append(mido.Message("note_on", note=n["note"], velocity=n.get("vel", 100), time=n["start"]))
+        ev.append(mido.Message("note_off", note=n["note"], velocity=0, time=min(n["start"] + n["dur"], max_dur - 0.005)))
+    ev.sort(key=lambda m: (m.time, m.type == "note_on"))
+    return ev
+
+
 def select_representative_notes(notes, max_notes=6):
     """Select diverse, clean notes covering unique pitches and solid durations."""
     if not notes:
@@ -189,9 +212,10 @@ def get_centroid(y, sr=SAMPLE_RATE):
 
 @torch.no_grad()
 def sample_candidates_adaptive(model, mel, midi_note, k=4, steps=25, seed=42):
-    """Adaptive candidate sampler for 92-d (v3), 108-d (v4) and 126-d (v5) flow models. The note is folded into
-    the layout's trained range by whole octaves and the oscillators are shifted back afterwards, so the returned
-    vectors play right at midi_note. -> (vectors [k, P], octaves folded)."""
+    """Adaptive candidate sampler for 92-d (v3), 108-d (v4), 126-d (v5) and 114-d (v6) flow models. The note is
+    folded into the layout's trained range by whole octaves and the oscillators are shifted back afterwards, so the
+    returned vectors play right at midi_note (v6: the note is the model's input and osc 1 is fixed at octave 0, so
+    nothing needs shifting). -> (vectors [k, P], octaves folded)."""
     device = next(model.parameters()).device
     model.eval()
     mel = mel.to(device)
@@ -208,33 +232,26 @@ def sample_candidates_adaptive(model, mel, midi_note, k=4, steps=25, seed=42):
     for i in range(steps):
         tv = i / steps
         t = torch.full((k,), tv, device=device)
-        x[:, 0] = (1.0 - tv) * x[:, 0] + tv * note_t
-        x = x + model(x, t, audio_emb=emb) * (1.0 / steps)
-    
-    x[:, 0] = note_t
-    
-    p_ord = layout.codec.decode(x).cpu().numpy()
+        if layout.note_conditioned:
+            x = x + model(x, t, audio_emb=emb, note=note_t) * (1.0 / steps)
+        else:
+            x[:, 0] = (1.0 - tv) * x[:, 0] + tv * note_t
+            x = x + model(x, t, audio_emb=emb) * (1.0 / steps)
+
+    if not layout.note_conditioned:
+        x[:, 0] = note_t
+    p_ord = layout.decode(torch.clamp(x, 0.0, 1.0) if layout.note_conditioned else x, note_t).cpu().numpy()
     if folded:
         p_ord, _ = shift_octaves(p_ord, -folded, layout)
     return p_ord, folded
 
 
-def build_consensus_vector(param_vectors, param_dim=99):
+def build_consensus_vector(param_vectors, param_dim=92):
     """Build consensus vector from a pool of parameter vectors.
     Uses median for continuous parameters and mode (majority vote) for categorical parameters.
     """
-    if param_dim == 126:
-        cat_indices = spec_v5.CAT_INDICES
-        cont_indices = spec_v5.CONT_INDICES
-        num_params = spec_v5.NUM_PARAMS
-    elif param_dim == 108:
-        cat_indices = spec_v4.CAT_INDICES
-        cont_indices = spec_v4.CONT_INDICES
-        num_params = spec_v4.NUM_PARAMS
-    else:
-        cat_indices = spec_v3.CAT_INDICES
-        cont_indices = spec_v3.CONT_INDICES
-        num_params = spec_v3.NUM_PARAMS
+    spec = layout_for_dim(param_dim).spec
+    cat_indices, cont_indices, num_params = spec.CAT_INDICES, spec.CONT_INDICES, spec.NUM_PARAMS
     
     consensus = np.zeros(num_params, dtype=np.float32)
     
@@ -251,17 +268,12 @@ def build_consensus_vector(param_vectors, param_dim=99):
     return consensus
 
 
-def vector_to_patch_adaptive(vec, param_dim=99):
-    if param_dim == 126:
-        return spec_v5.vector_to_patch(vec)
-    elif param_dim == 108:
-        return spec_v4.vector_to_patch(vec)
-    else:
-        return spec_v3.vector_to_patch(vec)
+def vector_to_patch_adaptive(vec, param_dim=92):
+    return layout_for_dim(param_dim).spec.vector_to_patch(vec)
 
 
-def apply_patch_adaptive(plugin, patch, param_dim=99):
-    if param_dim == 126:
+def apply_patch_adaptive(plugin, patch, param_dim=92):
+    if layout_for_dim(param_dim).name in ("v5", "v6"):           # v6 patches are surge_spec_v5 patch dicts
         spec_v5.apply_patch(plugin, patch)
     else:
         spec_v4.apply_patch(plugin, patch)
@@ -280,10 +292,10 @@ def bpm_to_max_release_raw(bpm: float) -> float:
     return float(np.clip(raw, 0.08, 0.35))
 
 
-def format_patch_details(patch, param_dim=99):
+def format_patch_details(patch, param_dim=92):
     """Format key synth parameters into human-readable summary string."""
-    if param_dim in (126, 108):
-        spec = spec_v5 if param_dim == 126 else spec_v4
+    if param_dim in (126, 114, 108):
+        spec = spec_v4 if param_dim == 108 else spec_v5
         f1_type = spec.LP_FILTERS[patch["filter_idx"]][0]
         f2_type = spec.LP_FILTERS[patch.get("filter_2_type", 0)][0]
         ws_type = spec.WAVESHAPER_TYPES[patch["ws_idx"]][0]
@@ -335,7 +347,7 @@ def compute_stereo_metrics(y, is_channels_first=False):
 
 
 def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k_per_note=2, steps=25, seed=42,
-                              second_note="auto", occam_tol=None, occam_abs=0.0):
+                              second_note="auto", occam_tol=None, occam_abs=0.0, max_midi=None, drop_polyphony=False):
     E = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval")
     audio_ref_dir = os.path.join(E, "audio")
     midi_muscriptor_dir = os.path.join(E, "midi_muscriptor")
@@ -414,6 +426,11 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
 
         # Extract notes and select clean representative subset
         all_notes = extract_notes_from_midi(midi_path, max_dur=phrase_dur)
+        if max_midi is not None or drop_polyphony:
+            n_before = len(all_notes)
+            all_notes = filter_transcription(all_notes, max_midi, drop_polyphony)
+            events = events_from_notes(all_notes, phrase_dur)      # rerank the cleaned phrase, not the raw one
+            print(f"  transcription filter: {n_before} -> {len(all_notes)} notes", flush=True)
         selected_notes = select_representative_notes(all_notes, max_notes=max_notes)
 
         pitches = [n["note"] for n in selected_notes]
@@ -586,7 +603,11 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             win_centroid = get_centroid(pred_winner_norm, sr)
             centroid_err = win_centroid - real_centroid
             l_eval = min(len(pred_winner_norm), len(y_real_norm))
-            mel_ssim = float(am.mel_ssim_dist(y_real_norm[:l_eval], pred_winner_norm[:l_eval]))
+            # KUANG 2026-10-19: am.mel_ssim_dist is 1 - SSIM (lower = closer). Until now it was stored as "mel_ssim"
+            # and read as a similarity (V6_SPECIFICATION.md 2.4 "Mel SSIM up"), which inverts the comparison.
+            # Both are stored now: mel_ssim = SSIM (higher = closer), mel_ssim_dist = 1 - SSIM.
+            mel_ssim_dist = float(am.mel_ssim_dist(y_real_norm[:l_eval], pred_winner_norm[:l_eval]))
+            mel_ssim = 1.0 - mel_ssim_dist
 
             # Save winner audio
             cand_filename = f"{stem_id}__{m_name}.wav"
@@ -594,9 +615,12 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             pred_stereo_norm = (best_audio / (np.max(np.abs(best_audio)) + 1e-7)).astype(np.float32)
             sf.write(cand_dest, pred_stereo_norm.T, sr, subtype="PCM_16")
 
-            oct_i = lay.spec.PARAM_INDEX["osc_1_octave"]
-            cand_oct = [int(c) - 3 for c in octave_class(cand_vecs[:, oct_i], lay)]
-            win_oct = int(octave_class(win_vec[oct_i], lay)) - 3
+            if lay.note_conditioned:                                 # v6: osc 1 is always at octave 0
+                cand_oct, win_oct = [0] * len(cand_vecs), 0
+            else:
+                oct_i = lay.spec.PARAM_INDEX["osc_1_octave"]
+                cand_oct = [int(c) - 3 for c in octave_class(cand_vecs[:, oct_i], lay)]
+                win_oct = int(octave_class(win_vec[oct_i], lay)) - 3
 
             patch_summary = format_patch_details(best_patch, param_dim=param_dim)
             patch_summary += f" | Retrig: {'On' if best_retrig else 'Off'}"
@@ -604,6 +628,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
             stem_res["models"][m_name] = {
                 "phrase_mss": round(best_score, 3),
                 "mel_ssim": round(mel_ssim, 4),
+                "mel_ssim_dist": round(mel_ssim_dist, 4),
                 "centroid_hz": round(win_centroid, 1),
                 "centroid_delta_hz": round(centroid_err, 1),
                 "stereo_width": round(best_width, 3),
@@ -622,7 +647,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                 "best_patch": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in best_patch.items()}
             }
 
-            print(f"  [{m_name}] MSS: {best_score:.3f} | SSIM: {mel_ssim:.4f} | Cent: {win_centroid:.0f}Hz ({centroid_err:+.0f}Hz) | W: {best_width:.2f} (dW: {best_width - real_width:+.2f}) | Retrig: {'On' if best_retrig else 'Off'} | {best_type} in {el:.1f}s", flush=True)
+            print(f"  [{m_name}] MSS: {best_score:.3f} | SSIM (higher = closer): {mel_ssim:.4f} | Cent: {win_centroid:.0f}Hz ({centroid_err:+.0f}Hz) | W: {best_width:.2f} (dW: {best_width - real_width:+.2f}) | Retrig: {'On' if best_retrig else 'Off'} | {best_type} in {el:.1f}s", flush=True)
 
         results.append(stem_res)
 
@@ -665,7 +690,7 @@ def generate_listening_pack_html(results, listen_dir, model_names):
                 <audio controls src="{d['audio_file']}"></audio>
                 <div class="metrics">
                     <span class="{badge_class}">MSS: {mss:.3f}</span>
-                    <span class="badge">SSIM: {ssim:.3f}</span>
+                    <span class="badge">SSIM (1 = same): {ssim:.3f}</span>
                     <span class="badge">W: {d.get('stereo_width', 0.0):.2f} (dW: {d.get('width_delta', 0.0):+.2f})</span>
                 </div>
                 <div class="centroid-info">Centroid: {cent:.0f} Hz ({d_cent:+.0f} Hz) | Retrig: {d.get('retrigger', 'On')} | {d['winner_type']}</div>
@@ -839,6 +864,10 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_midi", type=int, default=None,
+                        help="drop transcribed notes above this MIDI note (V6_SPECIFICATION.md 3.5: 60)")
+    parser.add_argument("--drop_polyphony", action="store_true",
+                        help="drop transcribed notes that overlap another note (clusters); the reranked phrase too")
     parser.add_argument("--second_note", choices=("auto", "pitch_shift"), default="auto",
                         help="auto: the stem's own note an octave up when transcribed, else pitch shift; "
                              "pitch_shift: always (the pre-2026-10-19 behaviour)")
@@ -851,4 +880,5 @@ if __name__ == "__main__":
     models = {name: path for name, path in args.model}
     evaluate_models_consensus(models, args.out_dir, device=args.device, max_notes=args.max_notes,
                               k_per_note=args.k, steps=args.steps, seed=args.seed, second_note=args.second_note,
-                              occam_tol=args.occam_tol, occam_abs=args.occam_abs)
+                              occam_tol=args.occam_tol, occam_abs=args.occam_abs, max_midi=args.max_midi,
+                              drop_polyphony=args.drop_polyphony)

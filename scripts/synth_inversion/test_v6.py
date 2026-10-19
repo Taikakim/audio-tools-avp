@@ -154,7 +154,7 @@ def _base_vec(seed=0):
 
 # ------------------------------------------------------------------------------------------------ layout
 def test_layout_widths_come_from_the_codecs():
-    assert L.dims() == {92: "v3", 108: "v4", 126: "v5"}
+    assert L.dims() == {92: "v3", 108: "v4", 126: "v5", 114: "v6"}
     assert L.layout_for_dim(126).name == "v5" and L.layout_named("v4").num_params == 60
     with pytest.raises(ValueError):
         L.layout_for_dim(99)

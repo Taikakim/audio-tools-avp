@@ -60,6 +60,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 from layout_v6 import layout_for_flow  # noqa: E402
+from models_v6 import flow_call  # noqa: E402
 
 
 # ------------------------------------------------------------------------------------------------------ data
@@ -157,9 +158,10 @@ def dpo_terms(policy, ref, mel, vec_w, vec_l, w_enc, beta, gen, tau=1.0, codec=N
         if float(tau) < 1.0:
             m = policy.noisy(mel, tau_t[:B], generator=gen)      # one noise draw, shared by winner, loser, policy, ref
     xt, u, tt, mm = torch.cat([xtw, xtl]), torch.cat([uw, ul]), torch.cat([t, t]), torch.cat([m, m])
-    ep = _err(policy(xt, tt, mm, tau=tau_t), u, w_enc)
+    note = torch.cat([vec_w[:, 0], vec_l[:, 0]])          # storage index 0; used by note-conditioned (v6) flows only
+    ep = _err(flow_call(policy, xt, tt, mel=mm, tau=tau_t, note=note), u, w_enc)
     with torch.no_grad():
-        er = _err(ref(xt, tt, mm, tau=tau_t), u, w_enc)
+        er = _err(flow_call(ref, xt, tt, mel=mm, tau=tau_t, note=note), u, w_enc)
     dw, dl = ep[:B] - er[:B], ep[B:] - er[B:]
     delta = dw - dl
     loss = -F.logsigmoid(-beta * delta).mean()
@@ -175,7 +177,7 @@ def sft_term(policy, mel, vec, w_enc, gen, loss_type="mae", codec=None):
     t = torch.rand(x1.shape[0], device=x1.device, generator=gen)
     xt, u = policy.path(x0, x1, t)
     tau_t = torch.ones(x1.shape[0], device=x1.device) if getattr(policy, "cond_noise", False) else None
-    v = policy(xt, t, mel, tau=tau_t)
+    v = flow_call(policy, xt, t, mel=mel, tau=tau_t, note=vec[:, 0])
     err = (v - u).abs() if loss_type == "mae" else (v - u) ** 2
     return ((w_enc * err).sum(dim=1) / w_enc.sum()).mean()
 

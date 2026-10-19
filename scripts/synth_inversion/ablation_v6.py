@@ -295,7 +295,9 @@ def cmd_labels(a, pool=None, prior=None):
     lay = layout_named(a.layout)
     if prior is None:
         from realistic_prior_v4 import UnifiedSoundsetPrior
-        prior = UnifiedSoundsetPrior(a.bass_manifold, a.all_manifold, split=a.split)
+        from soundset_prior_v6 import SoundsetPriorV6
+        prior = (SoundsetPriorV6 if lay.name == "v6" else UnifiedSoundsetPrior)(a.bass_manifold, a.all_manifold,
+                                                                                 split=a.split)
     enrich = dict((kv.split("=")[0], float(kv.split("=")[1])) for kv in a.enrich)
     names = a.features or list(SIMPLIFICATIONS)
     vecs, midi = _draw(prior, a.n, a.seed, lay.spec, enrich)
@@ -403,7 +405,8 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     lb = sub.add_parser("labels")
-    lb.add_argument("--layout", default="v5", choices=("v4", "v5"), help="the soundset prior (v4 / v5 trainers)")
+    lb.add_argument("--layout", default="v5", choices=("v4", "v5", "v6"),
+                    help="the soundset prior: v4 / v5 = realistic_prior_v4, v6 = soundset_prior_v6 (simplicity prior)")
     lb.add_argument("--bass_manifold")
     lb.add_argument("--all_manifold")
     lb.add_argument("--split", default="train")
@@ -428,7 +431,7 @@ def build_parser():
     oc = sub.add_parser("occam")
     oc.add_argument("--items", required=True, help="audio_eval_v5 items.npz")
     oc.add_argument("--system", required=True)
-    oc.add_argument("--layout", default="v5", choices=("v3", "v4", "v5"))
+    oc.add_argument("--layout", default="v5", choices=("v3", "v4", "v5", "v6"))
     oc.add_argument("--select", default="logmel_l1")
     oc.add_argument("--metrics", nargs="+", default=["logmel_l1", "mss", "modspec_dist"])
     oc.add_argument("--features", nargs="*", default=None)
