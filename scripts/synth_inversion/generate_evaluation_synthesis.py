@@ -35,10 +35,10 @@ user_reviews = {
 }
 
 tech_commentary = {
-    'stem_01_astral_prot_saw': "V6_C wins decisively by picking LP 12 dB with cutoff 0.44 and tight FEG decay (0.28). S5 and DPO both suffered from sub-octave hallucinations and slow envelope attacks. V6_B had excessive sub_mix (0.42), which bloated the fundamental.",
+    'stem_01_astral_prot_saw': "V6_C wins decisively by picking LP Diode Ladder with cutoff 0.45, resonance 0.59 and secondary LP 12 dB (cutoff 0.60, res 0.30) in serial. S5 and DPO both suffered from sub-octave hallucinations and slow envelope attacks. V6_B had excessive sub_mix (0.42), which bloated the fundamental.",
     'stem_02_acid_alien_ebm': "S5 won rank 1 because it captured the resonant, aggressive harmonic bite. V6_A/B detuned their unison voices too far (unison_detune 0.08), making the phrase sound slightly sour/out-of-tune, and had aeg_release choked to 20ms.",
     'stem_03_acid_alien_stab': "V6_C found the squelchy, nasal bandpass-like character using K35 filter (cutoff 0.58, res 0.42). S5 and DPO both failed by adding heavy sub-oscillators to what should have been a punchy, mid-rangey acid stab.",
-    'stem_04_goddess_square': "DPO captured the true square wave character (shape 0.00) and dry punch. S5 was second. Note: user MIDI edit exported at 100 BPM instead of 141 BPM, stretching note onsets by 1.41x and breaking phrase alignment.",
+    'stem_04_goddess_square': "DPO captured the dry punch (shape 0.00 triangle/pulse blend) and ranked first; S5 was second. Note: user MIDI edit exported at 100 BPM instead of 141 BPM, stretching note onsets by 1.41x and breaking phrase alignment.",
     'stem_05_goddess_unison': "V6_B won by leveraging Surge's unison engine (4 voices, detune 0.04) and serial dual filters (LP 24 dB + LP 12 dB). S5 produced an odd resonant bleep because it lacked multi-voice unison routing.",
     'stem_06_increase_dose_disco': "V6_B and V6_A produced clean, rounded single-osc saw basses. DPO suffered from transient attack clicks. V6_C was penalised for adding a harsh sub-oscillator that overpowered the mix.",
     'stem_07_increase_dose_sub': "V6_B won with serial filtering and moderate saturation. DPO produced an intriguing 'hoover-like' pitch beating that mimicked the analog phaser's movement. S5 relied on an unconvincing sub-oscillator crutch.",

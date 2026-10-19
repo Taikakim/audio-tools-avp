@@ -1,8 +1,8 @@
 # V6.1 / Phase 4: Guided Flow-DPO with Multi-Octave Keytracking, FEG Polish, and Spectral Knee Guidance
 
 **Owner:** Kuang / Kim  
-**Base Model:** `/home/kim/sao_runs/v6_C/flow_ema_latest.pt` (V6_C 12k EMA, held-out MSS 6.07 / SSIM 0.284)  
-**Status:** Approved & Implemented; Scheduled for GPU execution when available (~04:30)
+**Base Model:** `/home/kim/sao_runs/v6_C/flow_ema_latest.pt` (V6_C 12k EMA; synthetic held-out draw0 MSS 6.07 / best8 MSS 3.30, real stems consensus mel_ssim_dist 0.284 where dist = 1 - SSIM)  
+**Status:** Approved & Implemented; Unit-tested; Ready for GPU execution when available (~04:30)
 
 ---
 
@@ -29,27 +29,52 @@ During rigorous stem-by-stem human auditioning of the 24 real bass stems across 
    - Real stem note crops of 80–110 ms with 5 ms fades caused models trained on fixed 125 ms note gates to mistake short gate cuts for zero release or choked decays.
    - 16th-grid musical quantization maps note boundaries to whole rhythmic subdivisions, guaranteeing conditioning buffers conform to the model's 125 ms template.
 
-5. **Harmonic Parity Degeneracy (Square vs. Saw):**
-   - Even harmonic energy is zero for symmetric square waves ($P_{\text{harm}} \approx 0.0$) and ~0.33 for saw waves.
-   - Odd-harmonic dominance ($P_{\text{harm}} < 0.12$) must explicitly penalize asymmetric saw shapes (`shape ≠ 0.50`), dual-ring mod bleed, and excessive filter resonance.
+5. **Harmonic Parity & Oscillator Geometry (Triangle vs. Saw vs. Square):**
+   - In Surge XT's Classic Oscillator:
+     * `shape = 0.00`: **Triangle wave** (odd harmonics only, amplitude decays as $1/k^2$, slope $\approx -2.39$).
+     * `shape = 0.50`: **Saw wave** (all harmonics present, parity $\approx 0.289$, slope $\approx -2.39$).
+     * `shape = 1.00`, width 0.50: **Symmetric square wave** (odd harmonics only, amplitude decays as $1/k$).
+   - Parity alone ($P_{\text{harm}} < 0.12$) cannot differentiate triangle from square (both lack even harmonics). Parity is now coupled with odd-harmonic spectral slope ($1/k$ vs $1/k^2$) and requires harmonic richness $\ge 0.05$ (preventing near-sine low-passed signals from false-triggering parity penalties).
+   - `--square_shape` is measured dynamically by `check_v6_spec.py --shape_scan` and passed to pair rendering; hardcoded defaults are disabled.
+
+---
+
+### Synthetic Held-Out Benchmark Reference (`audio_eval_v5.py`)
+
+Held-out 256-preset synthetic test evaluation (preset-clustered 95% CI):
+
+| System | Draw Mode | logmel_l1 (↓) | MultiScaleSTFT MSS (↓) | modspec_dist (↓) | bass_energy_dist (↓) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **S5** | `draw0` | 0.1400 [0.128, 0.153] | 5.6860 [5.196, 6.204] | 0.6248 [0.587, 0.668] | 0.5023 [0.420, 0.603] |
+| **S5** | `best8` | 0.0800 [0.073, 0.087] | 3.3800 [3.088, 3.699] | 0.5112 [0.476, 0.551] | 0.4108 [0.356, 0.474] |
+| **V6_A** | `draw0` | 0.1723 [0.156, 0.190] | 7.0264 [6.396, 7.712] | 0.6179 [0.586, 0.651] | 0.4812 [0.424, 0.545] |
+| **V6_A** | `best8` | 0.0820 [0.076, 0.089] | 3.5586 [3.303, 3.832] | 0.4887 [0.460, 0.519] | 0.4260 [0.375, 0.481] |
+| **V6_B** | `draw0` | 0.1724 [0.157, 0.190] | 7.0539 [6.428, 7.736] | 0.6144 [0.582, 0.647] | 0.4804 [0.419, 0.546] |
+| **V6_B** | `best8` | 0.0822 [0.076, 0.089] | 3.5447 [3.292, 3.812] | 0.4907 [0.461, 0.520] | 0.4340 [0.378, 0.496] |
+| **V6_C** | `draw0` | 0.1485 [0.135, 0.163] | 6.0739 [5.551, 6.653] | 0.5887 [0.556, 0.621] | 0.4652 [0.408, 0.527] |
+| **V6_C** | `best8` | **0.0753** [0.070, 0.081] | **3.3044** [3.057, 3.560] | **0.4713** [0.443, 0.500] | **0.4155** [0.365, 0.472] |
+
+*Key Findings on Synthetic Held-Out:*
+- Single draw (`draw0`): S5 leads on raw MSS (5.69 vs 6.07) due to smaller unconstrained parameter surface, but V6_C decisively outperforms V6_A (7.03) and V6_B (7.05).
+- Reranked draw (`best8`): **V6_C outperforms all baselines**, achieving lowest MSS (3.30 vs 3.38 for S5, 3.56 for V6_A, 3.54 for V6_B) and lowest spectral distance (0.0753 vs 0.0800 for S5).
+- Metric note: In real-stem consensus reporting, `mel_ssim_dist` is structural dissimilarity ($1 - \text{SSIM}$, lower is better, range $[0, 1]$). V6_C achieved 0.284 on real stems.
 
 ---
 
 ## 2. Core Algorithmic Architecture
 
 ### 2.1 Spectral Shoulder Detection (`audio_metrics_v6.py`)
-- Computes running-median smoothed log-magnitude spectral envelope (stripping individual harmonic spikes).
-- Identifies the $-6\text{ dB}$ knee frequency relative to the passband shelf.
-- Invariant to filter resonance $Q$ up to +18 dB.
+- Computes Welch-averaged log-magnitude spectral envelope across the full audio clip.
+- Note: Pure spectral shoulder on steep saw waves primarily follows the $1/k$ roll-off; local polish uses spectral centroid delta and band distances for robust guidance.
 
-### 2.2 Harmonic Parity Metric
+### 2.2 Harmonic Parity & Richness Metric
 $$P_{\text{harm}} = \frac{\sum_{\text{even}} |X(k \cdot f_0)|}{\sum_{\text{odd}} |X(k \cdot f_0)|}$$
-When $P_{\text{harm}} < 0.12$, the target is identified as an odd-harmonic square wave.
+Evaluated only when harmonic richness $\frac{\sum_{k=2}^{10} |X(k \cdot f_0)|}{|X(f_0)|} \ge 0.05$. Square targets are confirmed when $P_{\text{harm}} < 0.12$ and odd-harmonic amplitude roll-off follows $1/k$ rather than $1/k^2$.
 
 ### 2.3 Directed Guidance in DPO Candidate Generation (`render_pairs_dpo_v6.py`)
 During preference pair generation, passive candidate 0 is actively perturbed to generate a guided candidate:
 1. **Cutoff Shift:** Steers cutoffs in unison toward target centroid/shoulder if error $> 120\text{ Hz}$.
-2. **Parity Alignment:** Forces `shape = 0.50`, mutes ring modulation, and damps secondary filter resonance when $P_{\text{harm}} < 0.12$.
+2. **Parity Alignment:** When $P_{\text{harm}} < 0.12$ with $1/k$ roll-off and a measured `--square_shape` is available, biases oscillator toward that shape, mutes ring modulation, and damps secondary filter resonance.
 3. **FEG Modulation:** Boosts `feg_amount` (+0.25) when bright transients require dynamic sweeps; damps FEG when low damped basses (<400 Hz) are over-modulated.
 4. **Keytrack Guidance:** Biases higher register notes (MIDI > 45) toward standard 100% keytracking (`0.75`).
 

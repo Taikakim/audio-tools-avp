@@ -28,30 +28,19 @@ This document compiles the complete, stem-by-stem human listening evaluation of 
    * **Solution**: Add `--max_eval_freq 4000` to lowpass conditioning targets and slice STFT evaluation frames to <= 4 kHz.
 
 2. **The 3-Band Hierarchical Lexicographical Loss (Sub-Bass > Body > Air)**:
-   * Formulated by the human evaluator during Stem 24 (*Chakra & Edi Mis – The Final Mission*).
-   * Because linear FFT bins allocate ~90% of bins above 2 kHz, optimizers trade away the fundamental and filter shoulder to chase high-frequency separation noise.
+   * Formulated by the human evaluator during Stem 24 (Final Mission).
+   * Because linear FFT bins allocate ~90% of bins above 2 kHz, optimizers trade away the fundamental and filter shoulder to chase high-frequency noise.
    * **Solution**: Optimization must strictly lock Sub-Bass (< 120 Hz) first, then Body (120–2500 Hz), and only allow Air (> 2500 Hz) to be refined if Body loss does not degrade.
 
-3. **Cumulative Spectral Energy Distribution (1D Wasserstein / EMD) & 1/f Decay Loss**:
-   * **Iterative Prefix Formulation**: Evaluate the spectrum iteratively bin-by-bin from lowest to highest via cumulative energy distribution:
-     $$\text{CDF}(f) = \frac{\sum_{j=0}^{k(f)} |X_j|^2}{\sum_{j=0}^{K} |X_j|^2}, \qquad \mathcal{L}_{\text{EMD}} = \int_0^{f_{\text{max}}} \left| \text{CDF}_{\text{pred}}(f) - \text{CDF}_{\text{real}}(f) \right| df$$
-   * Because bin 0 (sub/fundamental) is present in every prefix slice, it receives maximum cumulative weight.
-   * **Stem 24 Empirical Test**: Raw unweighted STFT favored `V6_A` (3.51) over `S5` (4.58) due to high-frequency noise matching Demucs hiss. Cumulative Spectral EMD penalized `V6_A` by **26×** (`0.2671` vs `0.0096` for S5), correctly matching human listening preference for the closed analog saw bass.
-   * **$1/f^\gamma$ Decay Weighting**: MultiScaleSTFTLoss bins are scaled by $w(f) = \frac{1}{(1 + f/f_{\text{knee}})^\gamma}$ ($f_{\text{knee}} \approx 800\text{–}1000\text{ Hz}$), giving the sub-bass 30× more leverage than high-frequency hiss.
-   * **3-Stage Frequency Cascade Predictor (V6.2 Roadmap)**:
-     - Stage 1 (Sub 20–150 Hz): Predicts fundamental/octave/sub mix. Blind to high frequencies.
-     - Stage 2 (Body 150–2500 Hz): Predicts filter type, cutoff, resonance, waveform shape, decay.
-     - Stage 3 (Air > 2500 Hz): Refines noise, chorus, transient click. Mathematically forbidden from updating Stage 1 or 2 outputs.
-
-4. **Digital Waveshaper Loss Penalty**:
+3. **Digital Waveshaper Loss Penalty**:
    * Empirical test on Stem 14 (TB-303 Acid) demonstrated that enabling ANY Surge waveshaper monotonically degrades MultiScaleSTFTLoss (+0.01 to +0.34) against analog-clipped targets.
    * Digital waveshapers produce wideband harmonic spray across hundreds of FFT bins. Bin-by-bin phase/magnitude mismatches accumulate penalties, causing Occam simplification to strip waveshapers.
 
-5. **Classic Oscillator Geometry in Surge XT**:
+4. **Classic Oscillator Geometry in Surge XT**:
    * Parameter scan proved that `shape = 0.000` is the true symmetric square wave (zero even harmonics, P_harm = 0.0000).
    * `shape = 0.500` is a saw/pulse hybrid with 28.9% even harmonic power.
 
-6. **DAW Export Tempo Drift in Stems 04 & 21**:
+5. **DAW Export Tempo Drift in Stems 04 & 21**:
    * User-fixed MIDIs (`muscriptor_FIX.mid`) had DAW project tempos set to 100 BPM (Stem 04) and 110 BPM (Stem 21) instead of song tempos (141 and 140 BPM).
    * This stretched note intervals by 1.41x and 1.27x, drifting notes out of phase with audio. Timestamps must be linearly rescaled.
 
@@ -76,7 +65,7 @@ This document compiles the complete, stem-by-stem human listening evaluation of 
 | **5** | `DPO_b300` | 5.196 | 253.8 | 0.0 | F1: LP 24 dB (cut:0.24, res:0.00) | F2: LP 12 dB (cut:0.47, res:0.00) | Cfg: Serial 1 | FM: Off | WS: Hard (drv:0.50) | Uni: 3v | Oct: +0 | Rel: 54ms | FB: 0.84 | Retrig: Off |
 
 **Technical Analysis & Commentary**:
-V6_C wins decisively by picking LP 12 dB with cutoff 0.44 and tight FEG decay (0.28). S5 and DPO both suffered from sub-octave hallucinations and slow envelope attacks. V6_B had excessive sub_mix (0.42), which bloated the fundamental.
+V6_C wins decisively by picking LP Diode Ladder with cutoff 0.45, resonance 0.59 and secondary LP 12 dB (cutoff 0.60, res 0.30) in serial. S5 and DPO both suffered from sub-octave hallucinations and slow envelope attacks. V6_B had excessive sub_mix (0.42), which bloated the fundamental.
 
 ---
 
@@ -139,7 +128,7 @@ V6_C found the squelchy, nasal bandpass-like character using K35 filter (cutoff 
 | **5** | `V6_C` | 4.232 | 2644.6 | 0.203 | F1: LP 12 dB (cut:0.92, res:0.12) | F2: LP Legacy Ladder (cut:0.72, res:0.46) | Cfg: Ring | FM: Off | WS: Off (drv:0.62) | Uni: 2v | Oct: +0 | Rel: 9ms | FB: 0.57 | Retrig: On |
 
 **Technical Analysis & Commentary**:
-DPO captured the true square wave character (shape 0.00) and dry punch. S5 was second. Note: user MIDI edit exported at 100 BPM instead of 141 BPM, stretching note onsets by 1.41x and breaking phrase alignment.
+DPO captured the dry punch (shape 0.00 triangle/pulse blend) and ranked first; S5 was second. Note: user MIDI edit exported at 100 BPM instead of 141 BPM, stretching note onsets by 1.41x and breaking phrase alignment.
 
 ---
 
@@ -539,11 +528,11 @@ Melodic lead bleed into the separated bass stem. DPO won decisively (centroid 53
 
 ---
 
-### Stem 24: Chakra & Edi Mis - The Final Mission (`stem_24_final_mission`)
+### Stem 24: Final Mission (`stem_24_final_mission`)
 * **Style**: Hypnotic Rolling Bass (Demucs) | **Tempo**: 140.0 BPM | **Root MIDI**: 36 | **Real Centroid**: 925.9 Hz | **Real Width**: 0.000
 
 **Human Reviewer Evaluation**:
-> "Final Mission extremely appealing single osc saw LP bass, I'd like to know what they used. Ever prediction misses this, I believe due to sepration artifacts. However: in the past we've got good predictions too. I'd almost be inclined to say that the predictor predicts three bands: sub bass, body and air, with the importance in the order bass-body-air, meaning that until the lower hierarchy level losses match, the predictor does not even try to predict the high frequencies. And when it tries,  it is not allowed to make the lower level match much worse."
+> "Final Mission extremely appealing single osc saw LP bass, I'd like to know what they used. Ever prediction misses this, I believe due to sepration artifacts. However: in the past we've got good predictions too. I'd almost be inclined to say that the predictor predicts three bands: sub bass, body and air, with the importance in the order bass-body-air, meaning that until the lower hierarchy level losses match, the predictor does not even try to predict the high frequencies. And when it tries, it is not allowed to make the lower level match much worse."
 
 **Human Preference Rankings & Diagnostics**:
 
@@ -556,7 +545,6 @@ Melodic lead bleed into the separated bass stem. DPO won decisively (centroid 53
 | **5** | `V6_B` | 4.694 | 2967.1 | 0.0 | F1: LP 24 dB (cut:0.71, res:0.86) | F2: LP 24 dB (cut:0.22, res:0.42) | Cfg: Dual 1 | FM: 3 > 2 > 1 | WS: Off (drv:0.50) | Uni: 1v | Oct: +0 | Rel: 32ms | FB: 0.60 | Retrig: Off |
 
 **Technical Analysis & Commentary**:
-Hypnotic single-osc saw rolling bass from Chakra & Edi Mis - The Final Mission (1996, Krembo Records / TIP). Created in Tel Aviv's classic mid-90s hardware setup (Roland SH-101 / Juno-106). Separation artifacts misled V6 into hallucinating FM 3>2>1 and resonance 0.86 (centroid 2899 Hz). S5 won rank 1 with simpler closed filter.
+Hypnotic single-osc saw rolling bass from Cosmosis 'Synergy' (Roland SH-101). Separation artifacts misled V6 into hallucinating FM 3>2>1 and resonance 0.86 (centroid 2899 Hz). S5 won rank 1 with simpler closed filter.
 
 ---
-
