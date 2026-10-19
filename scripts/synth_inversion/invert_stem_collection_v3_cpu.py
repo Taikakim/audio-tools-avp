@@ -210,7 +210,7 @@ STEM_CATALOG = [
     },
     {
         "id": "stem_24_final_mission",
-        "name": "Final Mission",
+        "name": "Chakra & Edi Mis - The Final Mission",
         "path": "/run/media/kim/Mantu/surge_200k_models/stem_inversion_results/final_mission_test/real_stem_phrase.wav",
         "bpm": 140.0,
         "style": "Hypnotic Rolling Bass (Demucs)"
