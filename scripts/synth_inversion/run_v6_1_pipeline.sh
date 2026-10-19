@@ -5,13 +5,13 @@
 # Every step skips work that is already on disk (resumable), except the checks.
 set -euo pipefail
 
-PY=${PY:-python}
+PY=${PY:-/home/kim/Projects/SAO/.venv/bin/python}
 B=${B:-/home/kim/sao_runs/real_manifold_v4_bass.npz}
 A=${A:-/home/kim/sao_runs/real_manifold_v4_all.npz}
 PLUGIN=${PLUGIN:-"$HOME/.vst3/Surge XT.vst3"}
 RUNS=${RUNS:-/home/kim/sao_runs}
 BASE=${BASE:-$RUNS/v6_C/flow_ema_latest.pt}                 # the flow DPO starts from (V6_C 12k EMA)
-S5=${S5:?set S5 to the Stage 5 flow checkpoint}
+S5=${S5:-$RUNS/v5_stage5_acoustic_flow_16h/flow_ema_latest.pt}
 DPO5=${DPO5:-$RUNS/dpo_s5_b300/flow_dpo_latest.pt}
 PAIRS=$RUNS/dpo_pairs_v6c_guided
 # Stems 04 / 21: user-fixed MIDIs exported at 100 / 110 BPM (songs 141 / 140). Leave empty if the files on disk were
