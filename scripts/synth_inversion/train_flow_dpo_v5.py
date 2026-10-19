@@ -163,8 +163,8 @@ def dpo_terms(policy, ref, mel, vec_w, vec_l, w_enc, beta, gen, tau=1.0, codec=N
     dw, dl = ep[:B] - er[:B], ep[B:] - er[B:]
     delta = dw - dl
     loss = -F.logsigmoid(-beta * delta).mean()
-    stats = {"loss": float(loss.detach()), "acc": float((delta < 0).float().mean()), "delta": float(delta.mean()),
-             "dw": float(dw.mean()), "dl": float(dl.mean())}
+    stats = {"loss": float(loss.detach()), "acc": float((delta < 0).float().mean().detach()),
+             "delta": float(delta.detach().mean()), "dw": float(dw.detach().mean()), "dl": float(dl.detach().mean())}
     return loss, stats
 
 
@@ -198,8 +198,12 @@ def link_run(out, run, kind, tag, policy, src_ckpt, dpo_meta):
     jstep = torch.load(jp, map_location="cpu", weights_only=False).get("step")
     shutil.copyfile(jp, os.path.join(out, "jepa_online_latest.pt"))
     export(policy, src_ckpt, os.path.join(out, "flow_online_latest.pt"), dpo_meta, step=jstep)
-    with open(os.path.join(run, "run_meta.json")) as f:
-        meta = json.load(f)
+    meta_path = os.path.join(run, "run_meta.json")
+    if os.path.exists(meta_path):
+        with open(meta_path) as f:
+            meta = json.load(f)
+    else:
+        meta = {"source_run": run}
     meta["purpose"] = f"Flow-DPO of {os.path.basename(os.path.normpath(run))} {kind}/{tag}: {dpo_meta}"
     meta["run"] = os.path.basename(os.path.normpath(out))
     with open(os.path.join(out, "run_meta.json"), "w") as f:

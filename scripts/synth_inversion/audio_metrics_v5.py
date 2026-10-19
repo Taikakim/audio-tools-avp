@@ -267,9 +267,22 @@ def sm_modspec_dist(target, pred, sr=SR):
     return float(np.linalg.norm(a[:, :n] - b[:, :n]))
 
 
+def bass_energy_dist(target, pred, sr=SR, cutoff_hz=600.0):
+    """Log-energy difference below cutoff_hz (default 600 Hz). Penalizes thin/gutless renders."""
+    import scipy.signal
+    t, p = _pair(target, pred)
+    b, a = scipy.signal.butter(4, min(cutoff_hz / (sr / 2.0), 0.99), btype="low")
+    t_low = scipy.signal.lfilter(b, a, t)
+    p_low = scipy.signal.lfilter(b, a, p)
+    rms_t = float(np.sqrt(np.mean(t_low ** 2)) + 1e-7)
+    rms_p = float(np.sqrt(np.mean(p_low ** 2)) + 1e-7)
+    return float(abs(np.log(rms_t) - np.log(rms_p)))
+
+
 # ------------------------------------------------------------------------------------------------------ registry
 METRICS = {
     # name: (function, family, what it is for)
+    "bass_energy_dist": (bass_energy_dist, "ours", "diagnostic; low-end body match (<600Hz)"),
     "logmel_l1": (logmel_l1, "ours", "primary; best-of-k selector"),
     "mss": (mss, "paper", "primary; paper metric"),
     "wmfcc": (wmfcc, "paper", "secondary; DTW-tolerant timbre"),

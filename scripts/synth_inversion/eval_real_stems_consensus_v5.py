@@ -372,7 +372,12 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
         style = item["style"]
 
         real_wav_path = os.path.join(audio_ref_dir, f"{stem_id}_real.wav")
-        midi_path = os.path.join(midi_muscriptor_dir, f"{stem_id}_muscriptor.mid")
+        midi_fix_path = os.path.join(midi_muscriptor_dir, f"{stem_id}_muscriptor_FIX.mid")
+        if os.path.exists(midi_fix_path):
+            midi_path = midi_fix_path
+            print(f"[{idx+1:02d}/24] Using user-fixed MIDI: {os.path.basename(midi_fix_path)}", flush=True)
+        else:
+            midi_path = os.path.join(midi_muscriptor_dir, f"{stem_id}_muscriptor.mid")
 
         if not os.path.exists(real_wav_path) or not os.path.exists(midi_path):
             print(f"[{idx+1:02d}/24] SKIPPING {name}: Missing files", flush=True)
