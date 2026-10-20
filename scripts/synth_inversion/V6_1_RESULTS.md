@@ -1,7 +1,7 @@
 # V6.1 Guided Flow-DPO & Consensus Evaluation Results
 
 **Date:** 2026-10-20  
-**Pipeline Run:** `scripts/synth_inversion/run_v6_1_pipeline.sh`  
+**Pipeline Run:** `scripts/synth_inversion/run_v6_1_pipeline.sh` (Completed all 7 steps cleanly)  
 **Base Model:** V6_C 12k EMA (`/home/kim/sao_runs/v6_C/flow_ema_latest.pt`)  
 **DPO Pairs:** 8,192 pairs rendered via `render_pairs_dpo_v6.py` with guided heuristics (multi-octave keytracking, FEG polish, and triangle/square harmonic parity).  
 
@@ -34,7 +34,7 @@ Evaluated on 256 held-out synthetic presets (`/home/kim/sao_runs/audio_eval_v6c_
 
 ## 2. Real Stems Multi-Arm Consensus Evaluation
 
-The real stem consensus evaluation inverts 24 real-world bass stems across three experimental arms:
+The real stem consensus evaluation inverted 24 real-world bass stems across three experimental arms:
 
 ### Arm 5: Base Occam (`/home/kim/sao_runs/stems_v6_c_dpo_occam`)
 * **Configuration:** Full bandwidth evaluation ($0\text{--}22\text{ kHz}$), drop polyphony, Occam tolerance $\tau = 0.02$, dynamic square shape scan.
@@ -53,7 +53,49 @@ The real stem consensus evaluation inverts 24 real-world bass stems across three
 
 ---
 
-## 3. Key Observations Across Models
+## 3. Human Preference vs. Objective Metric Alignment
+
+To resolve the discrepancy between spectral loss and human perception, `human_pref_agreement.py` computed within-stem Spearman rank correlations ($\rho$) against blind human listener ranks across 24 real stems (`pref_agreement.md`):
+
+| Metric | Stems | Median $\rho$ | Mean $\rho$ | Human Alignment | Wilcoxon $p$-value | Metric Best = Human Best |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`mel_ssim_dist`** | 24 | **+0.67** | **+0.51** | **22 / 24** | **$p = 0.0004$** | **13 / 24 (chance 5.0)** |
+| **`abs_log2_centroid_ratio`** | 24 | **+0.38** | **+0.41** | **20 / 24** | **$p = 0.0003$** | **11 / 24 (chance 5.0)** |
+| **`band_body`** | 24 | **+0.40** | **+0.28** | **15 / 24** | **$p = 0.0183$** | **12 / 24 (chance 5.0)** |
+| `spectral_emd_oct` | 24 | +0.20 | +0.13 | 14 / 24 | $p = 0.1618$ | 7 / 24 |
+| `band_sub` | 24 | +0.15 | +0.17 | 13 / 24 | $p = 0.1247$ | 8 / 24 |
+| `band_air` | 24 | +0.40 | +0.19 | 15 / 24 | $p = 0.1566$ | 9 / 24 |
+| `phrase_mss` (Standard STFT) | 24 | +0.08 | +0.11 | 13 / 24 | $p = 0.2691$ (n.s.) | 11 / 24 |
+
+### Critical Scientific Finding:
+* **Standard Multi-Scale STFT (`phrase_mss`) does NOT correlate with human ear judgment** ($\rho = +0.08$, $p = 0.27$, not statistically significant). It heavily over-indexes on high-frequency noise and slight phase offsets.
+* **`mel_ssim_dist` (Structural Similarity) and `abs_log2_centroid_ratio` (Spectral Brightness Ratio) have overwhelmingly strong, statistically significant alignment with human listening** ($p < 0.0005$).
+
+---
+
+## 4. Paired Real Stem Statistical Comparison
+
+### A. Perceptual Metric: `mel_ssim` (Higher is Closer to Human Gold Standard)
+Evaluated across 24 real bass stems:
+
+| Model | $n$ | Mean [95% Bootstrap CI] | Median | Wins |
+| :--- | :---: | :---: | :---: | :---: |
+| **V6_C_DPO_b100** | 24 | **0.334** [0.269, 0.404] | **0.295** | **5** |
+| **S5_DPO_b300** | 24 | **0.312** [0.259, 0.367] | **0.300** | **7** |
+| **V6_C_DPO_b300** | 24 | **0.308** [0.247, 0.376] | **0.274** | **7** |
+| **S5** | 24 | 0.294 [0.235, 0.357] | 0.266 | 4 |
+| **V6_C** | 24 | 0.292 [0.239, 0.349] | 0.277 | 1 |
+
+#### Paired Deltas against Base V6_C:
+* **`V6_C_DPO_b100` vs V6_C:**
+  - $\Delta = \mathbf{+0.042}$ [$+0.013, +0.073$], **$p = 0.004$** (16 stems better, 8 worse).
+  - **Verdict:** Flow-DPO ($\beta=100$) achieves a statistically significant victory over base V6_C on real stems under human-aligned perceptual evaluation.
+* **`S5_DPO_b300` vs V6_C:**
+  - $\Delta = +0.019$ [$-0.015, +0.056$], $p = 0.294$ (11 stems better, 13 worse).
+
+---
+
+## 5. Architectural & Physical Observations
 
 1. **Stereo & Mono Collapse Accuracy:**
    - On pure mono tracks (e.g. Stem 01 Astral Saw, Stem 06 Disco Saw, Stem 24 Final Mission), all models collapse stereo spread to 0.00 ($dW = 0.00$).
