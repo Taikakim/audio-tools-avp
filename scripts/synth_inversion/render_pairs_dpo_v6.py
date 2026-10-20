@@ -233,4 +233,4 @@ def main(argv=None, pool=None, flow=None):
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    os._exit(main())

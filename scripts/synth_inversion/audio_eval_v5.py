@@ -278,4 +278,6 @@ def main(argv=None, pool=None, prior=None):
 
 
 if __name__ == "__main__":
+    import os
     main()
+    os._exit(0)
