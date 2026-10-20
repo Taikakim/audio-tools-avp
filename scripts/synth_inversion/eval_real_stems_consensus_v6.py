@@ -1101,3 +1101,5 @@ if __name__ == "__main__":
                               cond_lowpass=args.cond_lowpass, select=args.select, lexi_rel=args.lexi_rel,
                               lexi_abs=args.lexi_abs, freq_decay=args.freq_decay, decay_knee=args.decay_knee,
                               midi_scale={k: float(v) for k, v in (a.split("=", 1) for a in args.midi_scale)})
+    os._exit(0)
+

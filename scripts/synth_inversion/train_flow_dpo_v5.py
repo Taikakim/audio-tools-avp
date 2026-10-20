@@ -351,4 +351,6 @@ def build_parser():
 
 
 if __name__ == "__main__":
+    import os
     train(build_parser().parse_args())
+    os._exit(0)
