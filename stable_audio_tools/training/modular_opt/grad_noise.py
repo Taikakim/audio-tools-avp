@@ -2,6 +2,7 @@
 
 Owner: KUANG (created 2026-10-17, Kim's idea: measure whether a batch carries more signal than noise
 instead of borrowing an LLM batch size).
+Last edited: WINTERMUTE 2026-10-20 -- momentum_spectra skips zero/non-finite momentum and retries svdvals in float64 on CPU (P0 crashed at step 0)
 
 The trainer hands over two gradients computed from two independent halves of the same step's batch
 (each the MEAN gradient over its half). Per 2-D matrix and pooled over all of them this logs:
@@ -209,7 +210,16 @@ def momentum_spectra(opt, named_params: Iterable[tuple[str, Tensor]], k: int = 3
         m = None if not st else st.get("momentum", st.get("m"))
         if m is None or m.ndim != 2:
             continue
-        s = torch.linalg.svdvals(m.float())
+        mf = m.float()
+        if not bool(torch.isfinite(mf).all()) or not bool(mf.any()):
+            continue   # zero momentum at step 0 (or non-finite): no spectrum; GPU svdvals fails to converge on it
+        try:
+            s = torch.linalg.svdvals(mf)
+        except torch.linalg.LinAlgError:
+            try:   # ill-conditioned on the GPU solver: retry in float64 on the CPU, else skip this matrix
+                s = torch.linalg.svdvals(mf.detach().double().cpu()).to(mf.dtype)
+            except torch.linalg.LinAlgError:
+                continue
         if s.numel() == 0 or float(s[0]) == 0.0:
             continue
         e = float((s * s).sum())

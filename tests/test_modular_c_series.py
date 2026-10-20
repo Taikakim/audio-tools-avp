@@ -404,3 +404,15 @@ def test_momentum_spectra_reads_without_mutating():
     assert rows[0]["s_top"][0] == pytest.approx(1.0) and 1.0 <= rows[0]["stable_rank"] <= 64
     for k, v in before.items():
         assert torch.equal(v, opt.state[m.lin.weight][k])
+
+
+def test_momentum_spectra_skips_zero_and_nonfinite_momentum():
+    # P0 (2026-10-19) crashed at step 0: svdvals on the all-zero initial momentum raised LinAlgError on the GPU
+    from types import SimpleNamespace
+    from stable_audio_tools.training.modular_opt import momentum_spectra
+    pz, pn, pr = (torch.nn.Parameter(torch.zeros(16, 8)) for _ in range(3))
+    bad = torch.randn(16, 8); bad[0, 0] = float("nan")
+    opt = SimpleNamespace(state={pz: {"momentum": torch.zeros(16, 8)}, pn: {"momentum": bad},
+                                 pr: {"momentum": torch.randn(16, 8)}})
+    rows = momentum_spectra(opt, [("zero", pz), ("nan", pn), ("rand", pr)])
+    assert [r["name"] for r in rows] == ["rand"]
