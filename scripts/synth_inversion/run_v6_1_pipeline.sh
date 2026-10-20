@@ -4,6 +4,13 @@
 # Replaces scratch/run_v6_dpo_pipeline.sh (not in the repository). Edit the paths below; run from this directory.
 # Every step skips work that is already on disk (resumable), except the checks.
 set -euo pipefail
+cd "$(dirname "$0")"
+
+GUARD="/home/kim/Projects/SAO/Misc/gpu_guard.sh"
+if [ -x "$GUARD" ]; then
+    "$GUARD" acquire ANTIGRAVITY $$
+    trap '"$GUARD" release ANTIGRAVITY >/dev/null 2>&1' EXIT
+fi
 
 PY=${PY:-/home/kim/Projects/SAO/.venv/bin/python}
 B=${B:-/home/kim/sao_runs/real_manifold_v4_bass.npz}
