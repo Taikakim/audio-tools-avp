@@ -233,4 +233,7 @@ def main(argv=None, pool=None, flow=None):
     return 0
 
 if __name__ == "__main__":
-    os._exit(main())
+    _code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_code)     # skip interpreter teardown (the Surge plugin can hang it); flush first, os._exit does not

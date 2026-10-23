@@ -353,4 +353,6 @@ def build_parser():
 if __name__ == "__main__":
     import os
     train(build_parser().parse_args())
-    os._exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)     # skip interpreter teardown; flush first, os._exit does not

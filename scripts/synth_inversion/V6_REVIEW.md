@@ -466,3 +466,72 @@ predictor (4.4, V6.2 roadmap).
   augmentation of the conditioning audio is the cheaper first step and makes `--cond_lowpass` safe to use.
   Do this only if 5b / 5c show that ignoring the air helps on the separated stems.
 - V6_1_PLAN.md still says "shape = 0.000 is the symmetric square"; see the correction above.
+
+## 11. October 23, 2026: review of the V6.1 results, the DPO rounds and the IDM benchmark
+
+Read: `V6_1_RESULTS.md`, the V6.1 plan and synthesis edits (`28e871d`), `refine_v6_stems_cpu.py`, the exit and GPU-guard
+changes, the IDM runner, benchmark and `DRUM_SEPARATION_EVAL.md`, and avp-audio-craft `EXPERIMENTS.md` SJ1 and SJ2.
+
+**Correction to my section 10 (Surge's classic oscillator)** [V, `surge/src/common/dsp/oscillators/ClassicOscillator.cpp`]
+I wrote that shape 0 was most likely a triangle and the square at 1.0. That was wrong. Each cycle is four impulses
+plus a ramp whose slope is proportional to (1 + shape), with shape in −1..+1. At raw 0 (−100 %) the ramp vanishes
+and the wave is a pulse: a symmetric square at width 0.5. Raw 0.5 (0 %) is a saw, raw 1 (+100 %) a dual saw. There
+is no triangle. Antigravity's "shape 0.000 is the square" was right; its measured odd slope of −2.39 is a square's.
+
+The code was not affected. The scan's slope rule labels shape 0 "square" and proposes `--square_shape 0.000`, and
+the eval and guided pairs only take the measured value. The docstrings and the test's fake oscillator are fixed.
+`V6_1_PLAN.md` now calls shape 0 a "triangle (1/k², slope −2.39)". That is self-contradictory (1/k² gives about −4)
+and should read "square". `HUMAN_EVALUATION_SYNTHESIS.md` item 4 ("shape 0 is the symmetric square") is right.
+
+**V6.1 results: what holds and what does not**
+1. **The step-4 gate is half a pass.** DPO lowered single-draw MSS (6.10 to 5.17–5.21) but made best-of-8 *worse*
+   for both β: MSS 3.27 to 3.70 and 3.81, logmel 0.075 to 0.085 and 0.087. That is the signature of a narrower
+   candidate distribution. The real-stem pipeline reranks about 13 candidates per model and stem, so best-of-K is
+   the number that matters there. Report both, and track candidate spread (avp-audio-craft `EXPERIMENTS.md` G2,
+   "synth inversion equivalent"). Kim's SJ1 "more creative" is about timbre choices, which is a different thing from
+   sample spread.
+2. The paired-delta intervals are printed with the opposite sign to their deltas (for example −0.8899 with
+   [0.4341, 1.3725]). They are base minus DPO; label them.
+3. **Real stems: the +0.042 mel_ssim gain of `V6_C_DPO_b100` (p = 0.004) did not replicate** at that strength.
+   WINTERMUTE's SJ2 rerun gives +0.030 [−0.002, +0.063], p = 0.07. Each eval run draws new candidates, so the
+   run-to-run noise of a paired delta is unknown and may be as large as the effect. Measure it first: two runs of
+   V6_C alone with different `--seed`, and their paired delta should be zero within its interval.
+4. **The metric agreement is the useful finding.** Within stems, mel_ssim_dist agrees with Kim's ranks: median
+   ρ +0.67, 22 of 24 stems, p = 0.0004, which survives a 9-metric Bonferroni correction. Phrase MSS does not:
+   +0.08, p = 0.27.
+   - I checked the orientation: the foundation run must postdate the SSIM fix (`30375d6`), because 114-d V6
+     checkpoints only load from that commit on, so its `mel_ssim_dist` is the true 1 − SSIM.
+   - New: `eval_real_stems_consensus_v6.py --select ssim` reranks, polishes and simplifies (Occam) by mel_ssim_dist
+     first, with the old composite second. A run selected this way reports an optimistic mel_ssim, so compare
+     runs by ear.
+   - DPO pairs ranked by it need no code: `train_flow_dpo_v5.py --metric mel_ssim_dist=1`, since the pair shards
+     already store `score__mel_ssim_dist`. That is SJ2's proposed next step, and I agree with it.
+5. **Arms 5b (lexi, 4 kHz) and 5c (decay, 4 kHz) have no numbers and no listening verdict** in the results file, so
+   my section 10 ideas are still untested by ear.
+6. "Parity correctly avoids mapping hollow square basses to triangle waves" is not backed by any number in the
+   file. Surge has no triangle in any case.
+
+**SJ2 (on-policy DPO rounds 2–4, WINTERMUTE):** sound analysis, and I agree. The rewarded MSS keeps falling (R4
+4.86) while the ear-aligned mel_ssim returns to baseline (R4 −0.006, p = 0.71). More rounds over-optimize a reward
+that does not track listening.
+
+**Code fixed** [T]
+- `refine_v6_stems_cpu.py`:
+  - every render now starts from a flushed synth with the winner's retrigger setting. Before, voices and effect
+    tails leaked from one render to the next, and the retrigger state was whatever the plugin last had, so "raw"
+    was not what the eval auditioned;
+  - scores use the mid channel instead of the left only.
+  - Its objective (band dB, body + 0.5 sub + 0.1 air) is what it optimizes, so a lower refined score is guaranteed
+    by construction; judge refinement by ear or by mel_ssim_dist.
+- `os._exit` (four scripts): stdout and stderr are flushed first. `os._exit` skips Python's buffer flush, so the
+  last lines of a piped log could be lost.
+
+**IDM benchmark (`DRUM_SEPARATION_EVAL.md`)**
+- "Demucs bass stems carry heavy kick bleed" does not follow from the data. IDM was trained on drums only and must
+  explain all input energy as drum classes, so a bass note's onset reads as a kick. The "percussive energy" shares
+  are shares among IDM's own outputs, which sum to 100 % on any input. Listen to the KD stem of stems 21–24 before
+  acting on it.
+- "Sub-frame timestamp accuracy" is not what the runner does: it picks peaks on the 172 Hz activation frames
+  (5.8 ms) without interpolation.
+- Kim's verdict that the masked stems sound like crops around the hits is what masking with mismatched one-shots
+  produces. Next step: `DRUM_SEPARATION_SA3_PLAN.md`.

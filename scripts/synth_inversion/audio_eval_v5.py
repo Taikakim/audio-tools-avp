@@ -280,4 +280,6 @@ def main(argv=None, pool=None, prior=None):
 if __name__ == "__main__":
     import os
     main()
-    os._exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)     # skip interpreter teardown (the Surge plugin can hang it); flush first, os._exit does not

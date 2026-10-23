@@ -32,6 +32,11 @@ KUANG 2026-10-20, from Kim's 24-stem listening test (HUMAN_EVALUATION_SYNTHESIS.
   2500..4000 Hz) dB distances on the mid channel, compared in that order with tolerances (--lexi_rel, --lexi_abs),
   the old composite score (stereo, penalties) last. Occam then removes a feature only if no band gets worse beyond
   the tolerance (am6.lexi_no_worse) and the composite stays within --occam_tol.
+- --select ssim (KUANG 2026-10-23): the phrase score becomes LexiScore([mel_ssim_dist on the mid channel]), the old
+  composite last, with --ssim_rel / --ssim_abs tolerances (Occam the same way). On the foundation run's listening
+  ranks mel_ssim_dist was the metric that tracked the ear (within-stem median rho +0.67, 22 of 24 stems; phrase MSS
+  +0.08, V6_1_RESULTS.md section 3). Selecting by it makes the reported mel_ssim optimistic for this run: compare
+  runs by ear, or by a metric the selection did not use.
 - --midi_scale STEM_ID=FACTOR: multiply the stem's MIDI times by FACTOR (a MIDI exported at the wrong project tempo:
   100 BPM for a 141 BPM song -> 100/141). Every stem's MIDI is also checked against the audio onsets
   (onset_scale_check) and a warning printed when another tempo scale fits clearly better.
@@ -477,7 +482,8 @@ def compute_stereo_metrics(y, is_channels_first=False):
 def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k_per_note=2, steps=25, seed=42,
                               second_note="auto", occam_tol=None, occam_abs=0.0, max_midi=None, drop_polyphony=False,
                               polish=True, square_shape=None, max_eval_freq=None, cond_lowpass=None, select="mss",
-                              lexi_rel=0.05, lexi_abs=0.2, midi_scale=None, freq_decay=None, decay_knee=900.0):
+                              lexi_rel=0.05, lexi_abs=0.2, midi_scale=None, freq_decay=None, decay_knee=900.0,
+                              ssim_rel=0.02, ssim_abs=0.005):
     E = resolve_mantu("/run/media/kim/Mantu/surge_200k_models/real_stems_eval")
     audio_ref_dir = os.path.join(E, "audio")
     midi_muscriptor_dir = os.path.join(E, "midi_muscriptor")
@@ -507,6 +513,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
     midi_scale = dict(midi_scale or {})
     band = (lambda x: am6.lowpass(x, SAMPLE_RATE, max_eval_freq)) if max_eval_freq else (lambda x: x)
     lexi_bands = tuple(b for b in am6.BANDS_HZ if b[1] < (max_eval_freq or 4000.0))
+    sel_rel, sel_abs = (ssim_rel, ssim_abs) if select == "ssim" else (lexi_rel, lexi_abs)
 
     results = []
 
@@ -721,6 +728,9 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                 if select == "lexi":
                     bd = am6.band_dists(pred_mid_norm[:l], real_mid_norm[:l], sr, bands=lexi_bands)
                     score = am6.LexiScore([bd[b[0]] for b in lexi_bands], score, rel=lexi_rel, abs_db=lexi_abs)
+                elif select == "ssim":
+                    sd = float(am.mel_ssim_dist(real_mid_norm[:l], pred_mid_norm[:l]))
+                    score = am6.LexiScore([sd], score, rel=ssim_rel, abs_db=ssim_abs)
                 return score, pred_audio, pred_width, pred_corr
 
             # Re-rank candidates on full phrase in Surge XT (with stereo & retrigger search)
@@ -777,7 +787,7 @@ def evaluate_models_consensus(models_dict, out_dir, device="cpu", max_notes=6, k
                     s2, a2, w2, c2, fname, v2, p2 = min(trials, key=lambda tr: tr[0])
                     if float(s2) > float(best_score) + max(occam_abs, occam_tol * float(best_score)):
                         break
-                    if select == "lexi" and not am6.lexi_no_worse(s2, best_score, lexi_rel, lexi_abs):
+                    if select in ("lexi", "ssim") and not am6.lexi_no_worse(s2, best_score, sel_rel, sel_abs):
                         break
                     occam_log.append({"removed": fname, "score": round(float(s2), 4)})
                     best_score, best_audio, best_width, best_corr, win_vec, best_patch = s2, a2, w2, c2, v2, p2
@@ -1070,8 +1080,11 @@ if __name__ == "__main__":
                         help="score on audio lowpassed at this frequency (e.g. 4000); saved audio stays full band")
     parser.add_argument("--cond_lowpass", type=float, default=None,
                         help="also lowpass the conditioning audio (distribution shift: experiment)")
-    parser.add_argument("--select", choices=("mss", "lexi"), default="mss",
-                        help="lexi: band-hierarchical score (sub > body > air), see the module docstring")
+    parser.add_argument("--select", choices=("mss", "lexi", "ssim"), default="mss",
+                        help="lexi: band-hierarchical score (sub > body > air); ssim: mel_ssim_dist first (the "
+                             "ear-aligned metric); see the module docstring")
+    parser.add_argument("--ssim_rel", type=float, default=0.02, help="relative tolerance for --select ssim")
+    parser.add_argument("--ssim_abs", type=float, default=0.005, help="absolute tolerance (1 - SSIM) for --select ssim")
     parser.add_argument("--lexi_rel", type=float, default=0.05, help="relative band tolerance for --select lexi")
     parser.add_argument("--lexi_abs", type=float, default=0.2, help="absolute band tolerance (dB) for --select lexi")
     parser.add_argument("--freq_decay", type=float, default=None, metavar="GAMMA",
@@ -1100,6 +1113,9 @@ if __name__ == "__main__":
                               square_shape=args.square_shape, max_eval_freq=args.max_eval_freq,
                               cond_lowpass=args.cond_lowpass, select=args.select, lexi_rel=args.lexi_rel,
                               lexi_abs=args.lexi_abs, freq_decay=args.freq_decay, decay_knee=args.decay_knee,
+                              ssim_rel=args.ssim_rel, ssim_abs=args.ssim_abs,
                               midi_scale={k: float(v) for k, v in (a.split("=", 1) for a in args.midi_scale)})
-    os._exit(0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)     # skip interpreter teardown (the Surge plugin can hang it); flush first, os._exit does not
 

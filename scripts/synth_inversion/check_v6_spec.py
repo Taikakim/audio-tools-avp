@@ -10,12 +10,16 @@ measures the frequency of a harmonic peak with parabolic interpolation.
 Prints measured vs expected and exits 1 if any check is off by more than --tol_cents (default 3 cents).
 
 --shape_scan (V6.1): renders osc 1 alone at shape 0, 0.125, ..., 1 (width 0.5) and prints the harmonic parity
-(even / odd harmonic power; ~0 = odd harmonics only), the harmonic richness and the odd-harmonic slope. KUANG
-2026-10-20: parity ~0 does not mean square: a triangle is odd-only too. Antigravity's scan found parity 0 at shape 0
-and 0.289 at 0.5 (a saw's value), which fits Surge's classic oscillator going triangle (-100 %) -> saw (0 %) ->
-pulse (+100 %), i.e. shape 0 a triangle and the square at 1.0. The slope tells them apart (square amplitudes 1/k:
-slope ~-2 in log power; triangle 1/k^2: ~-4). The scan picks the odd-only shape with a square's slope and prints
-"use --square_shape X" only if there is one (render_pairs_dpo_v6.py / eval_real_stems_consensus_v6.py take it).
+(even / odd harmonic power; ~0 = odd harmonics only), the harmonic richness and the odd-harmonic slope. The scan
+picks the odd-only shape with a square's slope (1/k amplitudes: ~-2 in log power; a 1/k^2 triangle-like spectrum,
+e.g. a heavily filtered square, gives ~-4) and prints "use --square_shape X" only if there is one
+(render_pairs_dpo_v6.py / eval_real_stems_consensus_v6.py take it).
+KUANG 2026-10-23, correcting my 2026-10-20 note (which said shape 0 was most likely a triangle and the square at 1.0):
+Surge's ClassicOscillator.cpp builds each cycle from four impulses plus a ramp whose slope is proportional to
+(1 + shape), shape in -1..+1. At raw 0 (shape -100 %) the ramp vanishes and the wave is a pulse: a symmetric square
+at width 0.5. Raw 0.5 (0 %) is a saw (parity 0.289, as Antigravity measured), raw 1 (+100 %) a dual saw. The classic
+oscillator has no triangle. Antigravity's "shape 0.000 is the symmetric square" was right; its measured odd slope
+(-2.39) is a square's, and this scan labels it "square".
 """
 import argparse
 import sys
@@ -52,7 +56,7 @@ def base_vector(note):
               "ring_1x2_volume", "ring_2x3_volume", "noise_volume", "drift", "chorus_mix", "delay_mix", "delay_fb",
               "filter_configuration", "resonance", "feg_amount", "filter_2_resonance", "osc_3_volume"):
         v[I[n]] = 0.0
-    v[I["shape"]] = 0.5                                        # a saw (all harmonics; shape 0 has no even ones)
+    v[I["shape"]] = 0.5                                        # a saw (all harmonics; shape 0, a square, has no even ones)
     v[I["filter_feedback"]] = 0.5
     v[I["cutoff"]] = v[I["filter_2_cutoff"]] = 0.95
     v[I["aeg_sustain"]] = 0.85

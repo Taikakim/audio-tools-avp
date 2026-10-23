@@ -48,18 +48,23 @@ def test_square_triangle_and_sine_are_told_apart():
     assert np.isnan(am6.parity_over_notes(y, [{"note": 33, "start": 0.0, "dur": 0.2}]))
 
 
-def test_shape_scan_picks_the_square_not_the_triangle():
+def test_shape_scan_picks_the_square():
     import check_v6_spec as chk
     import surge_spec_v6 as S
     I = S.PARAM_INDEX
 
-    def render(v):                                  # Surge's classic osc as we read it: tri (0) -> saw (.5) -> pulse (1)
+    def render(v):          # Surge's classic osc (ClassicOscillator.cpp): pulse (0) -> saw (.5) -> dual saw (1)
         sh = float(v[I["shape"]])
-        return wave("triangle" if sh < 0.25 else ("saw" if sh < 0.75 else "square"), f0=110.0, seconds=0.5)
+        if sh < 0.25:
+            return wave("square", f0=110.0, seconds=0.5)
+        return wave("saw", f0=110.0 if sh < 0.75 else 220.0, seconds=0.5)      # dual saw at width 0.5: saw an octave up
     rows, square = chk.shape_scan(render, 45, log=lambda *_: None)
-    assert square == pytest.approx(0.75) and rows[0][3] == "triangle" and rows[4][3] == "saw/mixed"
+    assert square == pytest.approx(0.0) and rows[0][3] == "square"
+    assert rows[4][3] == "saw/mixed" and rows[8][3] == "saw/mixed"
     _, none = chk.shape_scan(lambda v: wave("saw", 110.0, 0.5), 45, log=lambda *_: None)
     assert none is None
+    _, steep = chk.shape_scan(lambda v: wave("triangle", 110.0, 0.5), 45, log=lambda *_: None)
+    assert steep is None                            # odd-only but 1/k^2 (a heavily filtered square): not proposed
 
 
 def test_guided_parity_rule_needs_a_measured_square_shape():
@@ -70,8 +75,8 @@ def test_guided_parity_rule_needs_a_measured_square_shape():
     target = np.zeros(35280)
     target[:int(0.125 * SR)] = wave("square", 130.81, 0.125)
     assert "parity" not in rp.guide_candidate_vector(v, target, target, 48)[1]
-    g, fired = rp.guide_candidate_vector(v, target, target, 48, square_shape=1.0)
-    assert "parity" in fired and g[I["shape"]] == pytest.approx(1.0)
+    g, fired = rp.guide_candidate_vector(v, target, target, 48, square_shape=0.0)
+    assert "parity" in fired and g[I["shape"]] == pytest.approx(0.0)
 
 
 # ------------------------------------------------------------------------------------------------ resonance / EMD
@@ -219,7 +224,7 @@ class _AutoParams(dict):
         return self[k]
 
 
-@pytest.mark.parametrize("select", ["mss", "lexi"])
+@pytest.mark.parametrize("select", ["mss", "lexi", "ssim"])
 def test_real_stem_eval_runs_with_the_new_options(tmp_path, monkeypatch, select):
     import json
     import soundfile as sf
@@ -245,7 +250,7 @@ def test_real_stem_eval_runs_with_the_new_options(tmp_path, monkeypatch, select)
     torch.manual_seed(0)
     out = tmp_path / "out"
     E.evaluate_models_consensus({"M": "unused.pt"}, str(out), max_notes=2, k_per_note=1, steps=2, occam_tol=0.02,
-                                max_eval_freq=4000.0, select=select, midi_scale={"stem_x": 1.0}, square_shape=1.0,
+                                max_eval_freq=4000.0, select=select, midi_scale={"stem_x": 1.0}, square_shape=0.0,
                                 freq_decay=1.25 if select == "lexi" else None)
     res = json.loads((out / "consensus_eval_summary.json").read_text())[0]
     m = res["models"]["M"]
@@ -272,3 +277,28 @@ def test_decay_stft_loss_and_linear_emd():
     assert decay(a, target) / decay(b, target) < plain(a, target) / plain(b, target)   # hiss counts less
     assert am6.spectral_emd_linear(a, a) == pytest.approx(0.0, abs=1e-12)
     assert am6.spectral_emd_linear(a, target) < am6.spectral_emd_linear(b, target)
+
+
+def test_refine_renders_start_flushed_with_the_winners_retrigger():
+    import eval_real_stems_consensus_v6 as E
+    import refine_v6_stems_cpu as R
+    import surge_spec_v5 as S5
+    fake, calls = _FakeSurge(), []
+    render = fake.process
+
+    def process(events, duration, sample_rate=SR, num_channels=2):
+        calls.append((round(float(duration), 3), fake.parameters["a_osc_1_retrigger"].raw_value))
+        return render(events, duration, sample_rate, num_channels)
+    fake.process = process
+    notes = [{"note": 33, "start": 0.25 * i, "dur": 0.2, "vel": 100} for i in range(4)]
+    events = E.events_from_notes(notes, 1.0)
+    real = am6.lowpass(render(events, 1.0).mean(0), SR, 4000.0)
+    patch = S5.vector_to_patch(np.full(S5.NUM_PARAMS, 0.5, np.float32))
+    p, s, out, d, n, trace = R.refine_patch_bracket(fake, patch, events, 1.0, SR, real, axes=[("cutoff", 0.1)],
+                                                    n_coarse=3, n_fine=1, retrig=False)
+    renders = [c for c in calls if c[0] == 1.0]
+    assert len(renders) == n + 1 and out.shape == (2, SR)        # n counted renders + the final one
+    assert all(c[1] == 0.0 for c in renders)                      # the winner's retrigger (Off) on every render
+    for i, c in enumerate(calls):                                 # every phrase render right after a flush
+        if c[0] == 1.0:
+            assert i > 0 and calls[i - 1][0] == 0.05

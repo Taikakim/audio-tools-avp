@@ -29,11 +29,11 @@ During rigorous stem-by-stem human auditioning of the 24 real bass stems across 
    - Real stem note crops of 80–110 ms with 5 ms fades caused models trained on fixed 125 ms note gates to mistake short gate cuts for zero release or choked decays.
    - 16th-grid musical quantization maps note boundaries to whole rhythmic subdivisions, guaranteeing conditioning buffers conform to the model's 125 ms template.
 
-5. **Harmonic Parity & Oscillator Geometry (Triangle vs. Saw vs. Square):**
+5. **Harmonic Parity & Oscillator Geometry (Square vs. Saw vs. Dual Saw):**
    - In Surge XT's Classic Oscillator:
-     * `shape = 0.00`: **Triangle wave** (odd harmonics only, amplitude decays as $1/k^2$, slope $\approx -2.39$).
+     * `shape = 0.00` (-100 %), width 0.50: **Symmetric square (pulse) wave** (odd harmonics only, amplitude decays as $1/k$, measured slope $\approx -2.39$). Corrected by KUANG 2026-10-23 from `ClassicOscillator.cpp`: the ramp term scales with (1 + shape) and vanishes at -100 %; the classic oscillator has no triangle (V6_REVIEW.md section 11).
      * `shape = 0.50`: **Saw wave** (all harmonics present, parity $\approx 0.289$, slope $\approx -2.39$).
-     * `shape = 1.00`, width 0.50: **Symmetric square wave** (odd harmonics only, amplitude decays as $1/k$).
+     * `shape = 1.00` (+100 %): **Dual saw** (not a square).
    - Parity alone ($P_{\text{harm}} < 0.12$) cannot differentiate triangle from square (both lack even harmonics). Parity is now coupled with odd-harmonic spectral slope ($1/k$ vs $1/k^2$) and requires harmonic richness $\ge 0.05$ (preventing near-sine low-passed signals from false-triggering parity penalties).
    - `--square_shape` is measured dynamically by `check_v6_spec.py --shape_scan` and passed to pair rendering; hardcoded defaults are disabled.
 

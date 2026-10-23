@@ -7,6 +7,13 @@ benchmark (consensus_eval_summary.json), tuning salient continuous axes (cutoff,
 feg_amount, feg_decay, aeg_decay, aeg_release) against lowpassed (<=4kHz) real stems.
 
 Runs entirely on CPU in ~1-2 minutes, without touching the GPU or interfering with training.
+
+KUANG 2026-10-23 (V6_REVIEW.md section 11): every render now starts from a flushed synth (flush_synth, as the eval
+does) and with the winner's retrigger setting; before, voices and effect tails of the previous render carried into
+the next and the retrigger state was whatever the plugin last had, so "raw" was not the audio the eval auditioned.
+Scores use the mid channel (L+R)/2 of both signals, as the eval, not the left channel only. The objective
+(body + 0.5 sub + 0.1 air, band dB below 4 kHz) is the one being optimised, so a lower refined score is expected
+by construction: judge refinement by ear or by a metric it did not optimise (mel_ssim_dist).
 """
 import argparse
 import json
@@ -38,10 +45,19 @@ DEFAULT_AXES = [
 ]
 
 
-def score_patch(synth, patch, events, dur, sr, real_lp, max_eval_freq=4000.0):
+def render_patch(synth, patch, events, dur, sr, retrig=None):
+    """Flushed render of one patch (as the eval's phrase_score): -> (2, n) audio."""
+    spec_v5.flush_synth(synth, sr)
     spec_v5.apply_patch(synth, patch)
-    out = synth.process(events, dur, sample_rate=sr, num_channels=2)
-    mono = out[0]
+    if retrig is not None:
+        for k in ("a_osc_1_retrigger", "a_osc_2_retrigger", "a_osc_3_retrigger"):
+            synth.parameters[k].raw_value = 1.0 if retrig else 0.0
+    return synth.process(events, dur, sample_rate=sr, num_channels=2)
+
+
+def score_patch(synth, patch, events, dur, sr, real_lp, max_eval_freq=4000.0, retrig=None):
+    out = render_patch(synth, patch, events, dur, sr, retrig)
+    mono = out.mean(axis=0)
     peak = np.max(np.abs(mono))
     if peak > 1e-7:
         mono = mono / peak
@@ -53,9 +69,9 @@ def score_patch(synth, patch, events, dur, sr, real_lp, max_eval_freq=4000.0):
 
 
 def refine_patch_bracket(synth, initial_patch, events, dur, sr, real_lp, axes=DEFAULT_AXES,
-                         n_coarse=7, n_fine=4, max_eval_freq=4000.0):
+                         n_coarse=7, n_fine=4, max_eval_freq=4000.0, retrig=None):
     cur_patch = dict(initial_patch)
-    cur_score, cur_out, cur_dists = score_patch(synth, cur_patch, events, dur, sr, real_lp, max_eval_freq)
+    cur_score, cur_out, cur_dists = score_patch(synth, cur_patch, events, dur, sr, real_lp, max_eval_freq, retrig)
     trace = []
     total_renders = 1
 
@@ -70,7 +86,7 @@ def refine_patch_bracket(synth, initial_patch, events, dur, sr, real_lp, axes=DE
         # Coarse pass
         for v in grid:
             cand = dict(cur_patch, **{key: float(v)})
-            s, _, _ = score_patch(synth, cand, events, dur, sr, real_lp, max_eval_freq)
+            s, _, _ = score_patch(synth, cand, events, dur, sr, real_lp, max_eval_freq, retrig)
             total_renders += 1
             if s < best_s:
                 best_s = s
@@ -83,7 +99,7 @@ def refine_patch_bracket(synth, initial_patch, events, dur, sr, real_lp, axes=DE
         if fhi > flo:
             for v in np.linspace(flo, fhi, n_fine + 2)[1:-1]:
                 cand = dict(cur_patch, **{key: float(v)})
-                s, _, _ = score_patch(synth, cand, events, dur, sr, real_lp, max_eval_freq)
+                s, _, _ = score_patch(synth, cand, events, dur, sr, real_lp, max_eval_freq, retrig)
                 total_renders += 1
                 if s < best_s:
                     best_s = s
@@ -95,7 +111,7 @@ def refine_patch_bracket(synth, initial_patch, events, dur, sr, real_lp, axes=DE
             cur_score = best_s
 
     # Final render with updated patch
-    final_score, final_out, final_dists = score_patch(synth, cur_patch, events, dur, sr, real_lp, max_eval_freq)
+    final_score, final_out, final_dists = score_patch(synth, cur_patch, events, dur, sr, real_lp, max_eval_freq, retrig)
     return cur_patch, final_score, final_out, final_dists, total_renders, trace
 
 
@@ -237,7 +253,7 @@ def main():
 
         real_audio, sr = sf.read(real_wav_path)
         if real_audio.ndim == 2:
-            real_audio_mono = real_audio[:, 0]
+            real_audio_mono = real_audio.mean(axis=1)                # mid, as the eval (was: left channel only)
         else:
             real_audio_mono = real_audio
 
@@ -266,16 +282,16 @@ def main():
                 continue
             m_data = item["models"][m_name]
             init_patch = dict(m_data["best_patch"])
+            retrig = {"On": True, "Off": False}.get(m_data.get("retrigger"))   # the eval's winner setting
 
-            # 1. Render initial raw patch
-            spec_v5.apply_patch(synth, init_patch)
-            raw_audio = synth.process(events, dur, sample_rate=sr, num_channels=2)
-            raw_score, _, raw_dists = score_patch(synth, init_patch, events, dur, sr, real_lp, args.max_eval_freq)
+            # 1. Render initial raw patch (flushed, with the winner's retrigger)
+            raw_score, raw_audio, raw_dists = score_patch(synth, init_patch, events, dur, sr, real_lp,
+                                                          args.max_eval_freq, retrig)
             sf.write(os.path.join(listen_dir, f"{stem_id}__{m_name}_raw.wav"), raw_audio.T, sr)
 
             # 2. Refine patch
             ref_patch, ref_score, ref_audio, ref_dists, n_renders, trace = refine_patch_bracket(
-                synth, init_patch, events, dur, sr, real_lp, max_eval_freq=args.max_eval_freq
+                synth, init_patch, events, dur, sr, real_lp, max_eval_freq=args.max_eval_freq, retrig=retrig
             )
             sf.write(os.path.join(listen_dir, f"{stem_id}__{m_name}_refined.wav"), ref_audio.T, sr)
 
