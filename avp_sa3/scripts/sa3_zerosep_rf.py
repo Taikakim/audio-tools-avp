@@ -21,7 +21,7 @@ dx/dt = v(x,t) is deterministic and INVERTIBLE. So we:
      to the mixture; the prompt selects the source.
 
 Contrast with sa3_flowsep.py (FlowEdit): that is inversion-FREE (difference field,
-never visits noise) and is the published SOTA on SA3. This script recovers the
+never visits noise; AUDEDIT 2606.15149 reports it for EDITING on SA3, not separation). This script recovers the
 actual noise state, at the cost of inversion error on SAME-L's 256-d latent.
 
 Use a -base checkpoint (deterministic Euler velocity, live cfg). All inversion
