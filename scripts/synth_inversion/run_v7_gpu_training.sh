@@ -3,6 +3,7 @@
 # Automated Stage 1 & Stage 2 V7 Mixture-to-Patch Synth Inversion training pipeline
 
 set -euo pipefail
+export CUDA_VISIBLE_DEVICES=0
 
 SAO_DIR="/home/kim/Projects/SAO"
 PYTHON="/home/kim/Projects/SAO/.venv-rocm10-amd/bin/python"
