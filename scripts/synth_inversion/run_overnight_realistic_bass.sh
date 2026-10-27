@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the trainer launch (ModularOptimizer refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # Overnight joint Synth-JEPA + flow training on the real-preset bass prior, under the crash-only
 # watchdog. Prerequisite: a v2 manifold (extract_real_bass_manifold.py; see README.md).
 # Resumes automatically if OUT_DIR already holds a v2 checkpoint_latest.pt.
@@ -12,6 +13,7 @@ mkdir -p "$OUT_DIR"
 echo "=== Realistic-bass overnight training -> $OUT_DIR ($(date)) ==="
 "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
   "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
+  --allow-uniform-lr \
   --out_dir "$OUT_DIR" \
   --hours 8.0 \
   --batch_size 32 \

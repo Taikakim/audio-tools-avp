@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # Continue H6 (cond-noise recipe) from step 33230 for ~6 h (2026-10-09, Kim).
 # Resumes from /run/media/kim/Mantu/surge_200k_models/h6_cont4h_b64/checkpoint_latest.pt
 # Outputs to /run/media/kim/Mantu/surge_200k_models/h6_cont6h_b64
@@ -66,7 +67,7 @@ KIND=batch NOTE="synth-inversion H6 continuation, ${HOURS} h" \
   "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
   --out_dir "$OUT_DIR" --manifold "$ROOT/real_bass_manifold.npz" "${RESUME_ARGS[@]}" \
   --hours "$HOURS" --max_steps 0 --batch_size 64 \
-  --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
+  --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05 --ff_dim 1152 \
   --num_workers 8 --prefetch_factor 4 \
   --lr_jepa 2.7e-4 --lr_flow 1.8e-4 --lr_floor 0.333 --decay_frac 0.3 \

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # Fresh training run from scratch using ModularOptimizer with advanced options from recent audio runs:
 # - SCION role-based LMOs (SpectralLMO, SignLMO, ColNormLMO)
 # - SCION Table 3 radius scaling rho_ell = max(1, sqrt(d_out / d_in))
@@ -32,7 +33,7 @@ exec "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
   --out_dir "$OUT_DIR" \
   --hours 14.0 \
   --batch_size 64 \
-  --optimizer modular \
+  --optimizer modular --allow-uniform-lr \
   --whitening shampoo \
   --ns_poly cubic5 \
   --radial_brake 0.8 \

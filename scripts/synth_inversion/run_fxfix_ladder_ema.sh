@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # Rerun of modular_shampoo_sf_b64 after the Surge FX state-leak fix (commit 'fix Surge FX state leak'):
 # the previous run trained on poisoned renders (train JEPA 0.13 vs 2.8 on clean renders).
 # Same recipe and step count (78,416), plus:
@@ -27,7 +28,7 @@ KIND=batch NOTE="synth-inversion fxfix_ladder_ema_b64 training (~16 h), then CPU
 "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
   "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
   --out_dir "$OUT_DIR" --hours 30.0 --max_steps 78416 --batch_size 64 \
-  --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
+  --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05 --ff_dim 1152 \
   --num_workers 8 --prefetch_factor 4 \
   --lr_jepa 2.7e-4 --lr_flow 1.8e-4 --lr_floor 0.333 --decay_frac 0.3 \

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 set -uo pipefail
 export FLASH_ATTENTION_TRITON_AMD_ENABLE=FALSE MIOPEN_FIND_MODE=2 PYTORCH_TUNABLEOP_ENABLED=0 PYTORCH_TUNABLEOP_TUNING=0
 export ROCR_VISIBLE_DEVICES=0 PYTHONUNBUFFERED=1
@@ -25,7 +26,7 @@ KIND=batch NOTE="synth-inversion smoke test" \
   --out_dir "$OUT_DIR" --manifold "$ROOT/real_bass_manifold.npz" \
   --max_steps 0 --hours 14.0 --batch_size 64 \
   --embed_dim 768 --flow_dim 768 --ff_dim 2048 \
-  --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
+  --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05 \
   --num_workers 8 --prefetch_factor 4 \
   --lr_jepa 3.0e-4 --lr_flow 2.0e-4 --lr_floor 0.333 --decay_frac 0.3 \

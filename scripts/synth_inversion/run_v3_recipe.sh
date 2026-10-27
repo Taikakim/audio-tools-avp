@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # Reference-recipe launcher for the v3 trainer (train_realistic_bass_v3.py). Decision D9: a NEW launcher; run_v3.sh
 # is left as it is (it calls the v1-stack trainer) and gets a "superseded" header only.
 #
@@ -60,7 +61,7 @@ CMD=( "$PYTHON" "$HERE/train_realistic_bass_v3.py"
   --out_dir "$OUT_DIR" --hours "$HOURS" --max_steps "$MAX_STEPS" --batch_size "$BATCH_SIZE"
   --embed_dim "$EMBED_DIM" --flow_dim "$FLOW_DIM" --ff_dim "$FF_DIM"
   --jepa_layers "$JEPA_LAYERS" --flow_layers "$FLOW_LAYERS" --predictor_hidden "$PREDICTOR_HIDDEN"
-  --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15
+  --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05
   --num_workers "$NUM_WORKERS" --prefetch_factor 4
   --lr_jepa "$LR_JEPA" --lr_flow "$LR_FLOW" --lr_floor 0.333 --decay_frac 0.3

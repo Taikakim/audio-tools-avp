@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # EXPERIMENTS H6 post-step, called by run_h6_condnoise.sh after training (GPU lock already released).
 # 1. If the 30 h wall-clock cap stopped training short of --max_steps (the GPU is power-capped at 225 W this
 #    week, ~20% slower than H1), re-take the GPU lock and resume to the full step count. The modular optimizer's
@@ -30,7 +31,7 @@ for attempt in 1 2; do
   "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
     "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
     --out_dir "$OUT_DIR" --hours 30.0 --max_steps $MAX_STEPS --batch_size 64 \
-    --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
+    --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
     --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05 --ff_dim 1152 \
     --num_workers 8 --prefetch_factor 4 \
     --lr_jepa 2.7e-4 --lr_flow 1.8e-4 --lr_floor 0.333 --decay_frac 0.3 \

@@ -487,6 +487,8 @@ def build_parser():
     ap.add_argument("--resume_from", default="", help="explicit checkpoint path to resume from (overrides latest)")
     ap.add_argument("--optimizer", choices=["modular", "adamw", "fusion"], default="modular",
                     help="optimizer choice: modular (ModularOptimizer with SCION LMOs), adamw, or fusion")
+    ap.add_argument("--allow-uniform-lr", dest="allow_uniform_lr", action="store_true",
+                   help="--optimizer modular: accept ONE learning rate for the spectral and the 1-D groups (default: refuse; docs/TRAINING.md D34). The groups here share --lr_flow / --lr_jepa by construction.")
     ap.add_argument("--whitening", choices=["shampoo", "soap", "none"], default="none",
                     help="whitening preconditioner for ModularOptimizer (default: none; shampoo requires large B>=128)")
     ap.add_argument("--scalar_opt", choices=["sign", "adam"], default="adam",
@@ -708,6 +710,7 @@ def train(args):
             var_dampening_threshold=args.var_dampening,
             wd_overtraining=args.wd_overtraining,
             warmup_steps=args.warmup_steps,
+            strict_group_lrs=not args.allow_uniform_lr,
         )
         opt_flow = ModularOptimizer(
             flow_groups,
@@ -722,6 +725,7 @@ def train(args):
             var_dampening_threshold=args.var_dampening,
             wd_overtraining=args.wd_overtraining,
             warmup_steps=args.warmup_steps,
+            strict_group_lrs=not args.allow_uniform_lr,
         )
         log(f"Optimizer: ModularOptimizer (ns_poly={args.ns_poly}, whitening={args.whitening}, "
             f"scalar_opt={args.scalar_opt}, grad_clip={args.grad_clip}, "

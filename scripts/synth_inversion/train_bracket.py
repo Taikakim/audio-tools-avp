@@ -263,6 +263,7 @@ def train(args):
             warmup_steps=args.adam_warmup_steps,
             snr_gate=False,
             escape_velocity=True,
+            strict_group_lrs=False  # legacy bracket tool: uniform lr by design (docs/TRAINING.md D34),
         )
         opt_muon = None
         opt_adam = None

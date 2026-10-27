@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # v3 clean retrain (2026-10-07). The first synth-inversion run whose renders have Surge FX truly OFF: setting a
 # slot's output mix to 0 never silenced the init preset's delay, so H1/H6 and all earlier training sets carried a
 # loud fixed delay (surge_spec.apply_patch, test_fx_off_single_note_has_no_delay_trail). Retrained directly with
@@ -35,7 +36,7 @@ echo "=== $(date) GPU acquired after 30 min free"
 "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
   "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
   --out_dir "$OUT_DIR" --hours 30.0 --max_steps 78416 --batch_size 64 \
-  --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
+  --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05 --ff_dim 1152 \
   --num_workers 8 --prefetch_factor 4 \
   --lr_jepa 2.7e-4 --lr_flow 1.8e-4 --lr_floor 0.333 --decay_frac 0.3 \

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the trainer launch (ModularOptimizer refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # Resume training from checkpoint_best.pt with dynamic batch decay over 6 hours (32 -> 2)
 # Under crash-only watchdog supervisor on cuda:0
 set -euo pipefail
@@ -11,6 +12,7 @@ mkdir -p "$OUT_DIR"
 echo "=== Realistic-bass dynamic batch decay training -> $OUT_DIR ($(date)) ==="
 exec "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
   "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
+  --allow-uniform-lr \
   --out_dir "$OUT_DIR" \
   --resume_from "$OUT_DIR/checkpoint_best.pt" \
   --hours 6.0 \

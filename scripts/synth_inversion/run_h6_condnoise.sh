@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Last edited: CONTINUITY 2026-10-27 -- --allow-uniform-lr added to the modular launch (ModularOptimizer now refuses one lr for matrices and 1-D parameters unless told; docs/TRAINING.md D34)
 # EXPERIMENTS H6 (2026-10-07): H1 (run_fxfix_ladder_ema.sh) recipe with ONE change, --cond_noise: the flow
 # trains on partly noised audio conditions (30% clean, otherwise tau ~ logit-normal(0,1)), tau is a model input.
 # The Synth-JDF ablation that paper did not run: is the off-manifold gain from the joint objective, or just from
@@ -21,7 +22,7 @@ KIND=batch NOTE="synth-inversion H6 cond-noise training (~24 h), then CPU clip r
 "$PYTHON" "$HERE/watchdog_supervisor.py" --out_dir "$OUT_DIR" -- \
   "$PYTHON" "$HERE/train_realistic_bass_overnight.py" \
   --out_dir "$OUT_DIR" --hours 30.0 --max_steps 78416 --batch_size 64 \
-  --optimizer modular --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
+  --optimizer modular --allow-uniform-lr --whitening shampoo --ns_poly cubic5 --radial_brake 0.8 --var_dampening 1.15 \
   --sf_c_warmup 1000 --sf_r 1.0 --wd_jepa 0.02 --wd_overtraining --random_patch_frac 0.05 --ff_dim 1152 \
   --num_workers 8 --prefetch_factor 4 \
   --lr_jepa 2.7e-4 --lr_flow 1.8e-4 --lr_floor 0.333 --decay_frac 0.3 \
