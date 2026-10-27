@@ -4,6 +4,7 @@
 
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SAO_DIR="/home/kim/Projects/SAO"
 PYTHON="/home/kim/Projects/SAO/.venv-rocm10-amd/bin/python"
@@ -29,7 +30,8 @@ echo "[run_v7] Launching Stage 1 CGSP Extractor training (18,000 steps)..."
 
 $PYTHON "$SCRIPT_DIR/train_cgsp_extractor.py" \
     --steps 18000 \
-    --batch-size 16 \
+    --batch-size 8 \
+    --accum-grad 2 \
     --lr 3e-4 \
     --min-lr 3e-5 \
     --warmup-steps 500 \

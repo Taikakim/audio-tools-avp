@@ -73,33 +73,43 @@ class PairedMixtureDataset(Dataset):
     def _load_audio_excerpt(self, path: str, target_sr: int, duration_samples: int) -> torch.Tensor:
         """Loads and crops/loops an audio excerpt to exact duration, ensuring active sounding energy."""
         try:
-            wav, sr = torchaudio.load(path)
-            if sr != target_sr:
-                wav = torchaudio.functional.resample(wav, sr, target_sr)
+            info = torchaudio.info(path)
+            sr = info.sample_rate
+            total_src_frames = info.num_frames
+
+            # Calculate source frames needed for target duration
+            src_frames_needed = int(duration_samples * (sr / target_sr)) + 256
+
+            if total_src_frames <= src_frames_needed:
+                wav, _ = torchaudio.load(path)
+            else:
+                max_offset = total_src_frames - src_frames_needed
+                best_wav = None
+                max_energy = 0.0
+                for _ in range(3):
+                    offset = random.randint(0, max_offset)
+                    w, _ = torchaudio.load(path, frame_offset=offset, num_frames=src_frames_needed)
+                    if w.shape[0] > 1:
+                        w = w.mean(dim=0, keepdim=True)
+                    peak = w.abs().max().item()
+                    if peak > 0.05:
+                        best_wav = w
+                        break
+                    if peak > max_energy:
+                        max_energy = peak
+                        best_wav = w
+                wav = best_wav if best_wav is not None else torchaudio.load(path, num_frames=src_frames_needed)[0]
+
             if wav.shape[0] > 1:
                 wav = wav.mean(dim=0, keepdim=True)
+            if sr != target_sr:
+                wav = torchaudio.functional.resample(wav, sr, target_sr)
             wav = wav.squeeze(0)
 
-            total_samples = wav.shape[0]
-            if total_samples <= duration_samples:
-                repeats = (duration_samples // total_samples) + 1
-                return wav.repeat(repeats)[:duration_samples]
-
-            best_excerpt = None
-            max_energy = 0.0
-
-            # Try up to 10 random offsets to find an active section (skip silent intros/breaks)
-            for _ in range(10):
-                start = random.randint(0, total_samples - duration_samples)
-                excerpt = wav[start : start + duration_samples]
-                peak = excerpt.abs().max().item()
-                if peak > 0.05:
-                    return excerpt
-                if peak > max_energy:
-                    max_energy = peak
-                    best_excerpt = excerpt
-
-            return best_excerpt if best_excerpt is not None else wav[:duration_samples]
+            if wav.shape[0] < duration_samples:
+                repeats = (duration_samples // max(1, wav.shape[0])) + 1
+                wav = wav.repeat(repeats)
+            return wav[:duration_samples]
         except Exception:
             return torch.zeros(duration_samples, dtype=torch.float32)
 

@@ -69,7 +69,7 @@ def train(args):
     dataset = PairedMixtureDataset(
         multitrack_dir=args.multitrack_dir,
         bank_v6_dir=args.bank_v6_dir,
-        epoch_length=args.steps * args.batch_size,
+        epoch_length=args.steps * args.batch_size * args.accum_grad,
     )
     dataloader = DataLoader(
         dataset,
@@ -100,10 +100,15 @@ def train(args):
 
     extractor.train()
     step = 0
+    microstep = 0
     start_time = time.time()
     best_loss = float("inf")
 
-    print(f"Starting training for {args.steps} steps...")
+    use_amp = args.amp and (device.type == "cuda")
+    amp_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float16
+    print(f"Starting training for {args.steps} steps (AMP={use_amp}, dtype={amp_dtype}, accum_grad={args.accum_grad})...")
+
+    optimizer.zero_grad()
 
     for batch in dataloader:
         if step >= args.steps:
@@ -121,81 +126,86 @@ def train(args):
         cue_audio_neg = batch["cue_audio_neg"].to(device)
         text_pos = list(batch["text_pos"])
 
-        # 1. Teacher embedding of clean target
-        with torch.no_grad():
-            t = extractor.encode_audio_cue(target_clean)
-            q_audio_pos = extractor.encode_audio_cue(cue_audio_pos)
-            q_audio_neg = extractor.encode_audio_cue(cue_audio_neg)
-            q_text_pos = extractor.encode_text_cue(text_pos)
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            # 1. Teacher embedding of clean target
+            with torch.no_grad():
+                t = extractor.encode_audio_cue(target_clean)
+                q_audio_pos = extractor.encode_audio_cue(cue_audio_pos)
+                q_audio_neg = extractor.encode_audio_cue(cue_audio_neg)
+                q_text_pos = extractor.encode_text_cue(text_pos)
 
-        # 2. Extract from Mixture A and Mixture B
-        # Audio cue extraction on Mix A
-        z_a_audio, g_a = extractor(mix_a, q_audio_pos)
-        # Text cue extraction on Mix A
-        z_a_text, _ = extractor(mix_a, q_text_pos)
-        # Audio cue extraction on Mix B (paired content)
-        _, g_b = extractor(mix_b, q_audio_pos)
-        # Negative audio cue extraction on Mix A (for selectivity)
-        z_a_neg, _ = extractor(mix_a, q_audio_neg)
+            # 2. Extract from Mixture A and Mixture B
+            # Single forward pass of HTSAT backbone on Mix A
+            H_a, g_a = extractor.encode_mixture(mix_a)
+            # Lightweight cue-gated pooling on extracted frame tokens
+            z_a_audio = extractor.cgsp(H_a, q_audio_pos)
+            z_a_text = extractor.cgsp(H_a, q_text_pos)
+            z_a_neg = extractor.cgsp(H_a, q_audio_neg)
 
-        # 3. Compute loss terms
-        loss_inv = info_nce_loss(g_a, g_b, temperature=args.temperature)
-        loss_algn_a = info_nce_loss(z_a_audio, t, temperature=args.temperature)
-        loss_algn_t = info_nce_loss(z_a_text, t, temperature=args.temperature)
-        loss_sel = selectivity_hinge_loss(z_a_neg, t, margin=args.sel_margin)
+            # Global embedding for paired Mixture B (content invariance)
+            _, g_b = extractor.encode_mixture(mix_b)
 
-        total_loss = (
-            args.lambda_inv * loss_inv
-            + args.lambda_algn_a * loss_algn_a
-            + args.lambda_algn_t * loss_algn_t
-            + args.lambda_sel * loss_sel
-        )
+            # 3. Compute loss terms
+            loss_inv = info_nce_loss(g_a, g_b, temperature=args.temperature)
+            loss_algn_a = info_nce_loss(z_a_audio, t, temperature=args.temperature)
+            loss_algn_t = info_nce_loss(z_a_text, t, temperature=args.temperature)
+            loss_sel = selectivity_hinge_loss(z_a_neg, t, margin=args.sel_margin)
 
-        optimizer.zero_grad()
+            total_loss_raw = (
+                args.lambda_inv * loss_inv
+                + args.lambda_algn_a * loss_algn_a
+                + args.lambda_algn_t * loss_algn_t
+                + args.lambda_sel * loss_sel
+            )
+            total_loss = total_loss_raw / args.accum_grad
+
         total_loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
-        optimizer.step()
+        microstep += 1
 
-        step += 1
+        if microstep % args.accum_grad == 0:
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
+            step += 1
 
-        if step % args.log_interval == 0:
-            elapsed = time.time() - start_time
-            steps_per_sec = step / max(1, elapsed)
-            print(
-                f"Step {step:05d}/{args.steps} | Loss: {total_loss.item():.4f} "
-                f"(Inv: {loss_inv.item():.4f}, Algn_A: {loss_algn_a.item():.4f}, Algn_T: {loss_algn_t.item():.4f}, Sel: {loss_sel.item():.4f}) "
-                f"| LR: {curr_lr:.2e} | Speed: {steps_per_sec:.2f} step/s"
-            )
+            if step % args.log_interval == 0:
+                elapsed = time.time() - start_time
+                steps_per_sec = step / max(1, elapsed)
+                print(
+                    f"Step {step:05d}/{args.steps} | Loss: {total_loss_raw.item():.4f} "
+                    f"(Inv: {loss_inv.item():.4f}, Algn_A: {loss_algn_a.item():.4f}, Algn_T: {loss_algn_t.item():.4f}, Sel: {loss_sel.item():.4f}) "
+                    f"| LR: {curr_lr:.2e} | Speed: {steps_per_sec:.2f} step/s"
+                )
 
-        if step % args.save_interval == 0 or step == args.steps:
-            ckpt_path = os.path.join(args.output_dir, f"cgsp_extractor_step_{step}.pt")
-            torch.save(
-                {
-                    "step": step,
-                    "lora_state": {k: v for k, v in extractor.state_dict().items() if "lora_" in k},
-                    "cgsp_state": extractor.cgsp.state_dict(),
-                    "args": vars(args),
-                    "loss": total_loss.item(),
-                },
-                ckpt_path,
-            )
-            print(f"Saved checkpoint to {ckpt_path}")
-
-            if total_loss.item() < best_loss:
-                best_loss = total_loss.item()
-                best_path = os.path.join(args.output_dir, "cgsp_extractor_best.pt")
+            if step % args.save_interval == 0 or step == args.steps:
+                ckpt_path = os.path.join(args.output_dir, f"cgsp_extractor_step_{step}.pt")
                 torch.save(
                     {
                         "step": step,
                         "lora_state": {k: v for k, v in extractor.state_dict().items() if "lora_" in k},
                         "cgsp_state": extractor.cgsp.state_dict(),
                         "args": vars(args),
-                        "loss": best_loss,
+                        "loss": total_loss_raw.item(),
                     },
-                    best_path,
+                    ckpt_path,
                 )
-                print(f"Saved best checkpoint to {best_path} (loss: {best_loss:.4f})")
+                print(f"Saved checkpoint to {ckpt_path}")
+
+                if total_loss_raw.item() < best_loss:
+                    best_loss = total_loss_raw.item()
+                    best_path = os.path.join(args.output_dir, "cgsp_extractor_best.pt")
+                    torch.save(
+                        {
+                            "step": step,
+                            "lora_state": {k: v for k, v in extractor.state_dict().items() if "lora_" in k},
+                            "cgsp_state": extractor.cgsp.state_dict(),
+                            "args": vars(args),
+                            "loss": best_loss,
+                        },
+                        best_path,
+                    )
+                    print(f"Saved best checkpoint to {best_path} (loss: {best_loss:.4f})")
 
     print(f"Training completed in {time.time() - start_time:.1f}s.")
 
@@ -222,6 +232,9 @@ if __name__ == "__main__":
     parser.add_argument("--save-interval", type=int, default=1000, help="Checkpoint interval")
     parser.add_argument("--output-dir", type=str, default="/home/kim/sao_runs/cgsp_extractor_v7", help="Output directory")
     parser.add_argument("--multitrack-dir", type=str, default="/run/media/kim/Mantu/avp-stems-original-classified", help="Classified stems directory")
+    parser.add_argument("--accum-grad", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--amp", action="store_true", default=True, help="Enable bfloat16 automatic mixed precision")
+    parser.add_argument("--no-amp", dest="amp", action="store_false", help="Disable AMP")
     parser.add_argument("--bank-v6-dir", type=str, default="/home/kim/sao_runs/bank_v6", help="Surge patch bank directory")
     parser.add_argument("--device", type=str, default="cuda", help="Target device")
 
