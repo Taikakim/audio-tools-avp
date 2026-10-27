@@ -12,6 +12,12 @@ import torch.nn as nn
 from stable_audio_tools.training.modular_opt import ModularOptimizer, build_modular_param_groups
 
 
+def _MO(*a, **k):
+    """These tests use ONE lr for every group on purpose; strict_group_lrs (default True) would refuse it."""
+    k.setdefault("strict_group_lrs", False)
+    return ModularOptimizer(*a, **k)
+
+
 def _model(mag_value):
     torch.manual_seed(0)
     m = nn.Module()
@@ -26,7 +32,7 @@ def _model(mag_value):
 
 def _run(mode, sf, steps, mag_value=0.13, lr=6e-4, grad_sign=+1.0):
     m = _model(mag_value)
-    opt = ModularOptimizer(build_modular_param_groups(m), lr=lr, schedule_free=sf,
+    opt = _MO(build_modular_param_groups(m), lr=lr, schedule_free=sf,
                            normuon=True, magnitude_update=mode)
     for _ in range(steps):
         for p in m.parameters():
@@ -71,5 +77,5 @@ def test_non_magnitude_params_unchanged_by_mode():
 
 def test_default_is_additive():
     m = _model(0.13)
-    opt = ModularOptimizer(build_modular_param_groups(m), lr=1e-3)
+    opt = _MO(build_modular_param_groups(m), lr=1e-3)
     assert all(g.get("magnitude_update") == "additive" for g in opt.param_groups)

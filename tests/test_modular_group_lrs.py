@@ -1,6 +1,6 @@
-"""ModularOptimizer strict_group_lrs: a spectral group and a 1-D group on one lr warn, or raise when strict (CONTINUITY 2026-10-27).
+"""ModularOptimizer strict_group_lrs (default True): a spectral group and a 1-D group on one lr is refused (CONTINUITY 2026-10-27).
 
-Kim's ask (guide review): the optimizer should not silently accept one uniform lr for a spectral matrix and a sign-step bias.
+Kim's rule (Muon guide review): old scripts should fail with parameters that anticipate problems, unless explicitly overdriven.
 Run: .venv/bin/python -m pytest stable-audio-tools/tests/test_modular_group_lrs.py -q
 """
 import warnings
@@ -32,28 +32,26 @@ def _groups(m, lr_scalar=None):
     return groups
 
 
-def test_uniform_lr_warns():
-    with pytest.warns(UserWarning, match="share one learning rate"):
+def test_default_refuses_a_uniform_lr():
+    with pytest.raises(ValueError, match="share one learning rate"):
         ModularOptimizer(_groups(_model()), lr=3e-3)
 
 
-def test_strict_raises():
-    with pytest.raises(ValueError, match="share one learning rate"):
-        ModularOptimizer(_groups(_model()), lr=3e-3, strict_group_lrs=True)
-
-
-def test_separate_lrs_silent_even_when_strict():
+def test_explicit_override_accepts_it_silently():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        ModularOptimizer(_groups(_model(), lr_scalar=3e-4), lr=3e-3, strict_group_lrs=True)
+        ModularOptimizer(_groups(_model()), lr=3e-3, strict_group_lrs=False)
+
+
+def test_separate_lrs_pass_the_default():
+    ModularOptimizer(_groups(_model(), lr_scalar=3e-4), lr=3e-3)
 
 
 def test_step_unchanged_by_the_check():
     torch.manual_seed(1)
     ms = [_model(), _model()]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        opts = [ModularOptimizer(_groups(m), lr=1e-3, schedule_free=False, warmup_steps=0) for m in ms]
+    opts = [ModularOptimizer(_groups(ms[0]), lr=1e-3, schedule_free=False, warmup_steps=0, strict_group_lrs=False),
+            ModularOptimizer(_groups(ms[1]), lr=1e-3, schedule_free=False, warmup_steps=0, strict_group_lrs=False)]
     for _ in range(3):
         g = [torch.randn_like(p) for p in ms[0].parameters()]
         for m, o in zip(ms, opts):

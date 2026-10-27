@@ -14,12 +14,18 @@ from stable_audio_tools.training.modular_opt import (
 )
 
 
+def _MO(*a, **k):
+    """These tests use ONE lr for every group on purpose; strict_group_lrs (default True) would refuse it."""
+    k.setdefault("strict_group_lrs", False)
+    return ModularOptimizer(*a, **k)
+
+
 def _single(shape, radius=1.0, seed=0, dtype=torch.float32, **kw):
     torch.manual_seed(seed)
     w = nn.Parameter((torch.randn(*shape) * 0.02).to(dtype))
     g = {"params": [w], "group_type": "spectral", "param_names": ["w"], "radii": [radius], "blocks": [1],
          "whitening": kw.pop("whitening", "none"), "weight_decay": kw.pop("weight_decay", 0.0)}
-    opt = ModularOptimizer([g], **kw)
+    opt = _MO([g], **kw)
     opt._telem_on = False
     return w, opt
 
@@ -192,7 +198,7 @@ def test_scalar_opt_adam_routing():
 def test_adam_group_matches_manual_adam_without_sf():
     torch.manual_seed(0)
     w = nn.Parameter(torch.randn(32))
-    opt = ModularOptimizer([{"params": [w], "group_type": "adam", "param_names": ["b"], "radii": [1.0],
+    opt = _MO([{"params": [w], "group_type": "adam", "param_names": ["b"], "radii": [1.0],
                              "blocks": [1], "whitening": "none", "weight_decay": 0.0}],
                            lr=1e-2, schedule_free=False, beta1=0.9, adam_beta2=0.99)
     opt._telem_on = False
@@ -215,7 +221,7 @@ def test_adam_group_under_schedule_free_has_no_momentum():
     lr * g / sqrt(v_hat), which on step 1 is lr * sign(g)."""
     torch.manual_seed(0)
     w = nn.Parameter(torch.randn(16))
-    opt = ModularOptimizer([{"params": [w], "group_type": "adam", "param_names": ["b"], "radii": [1.0],
+    opt = _MO([{"params": [w], "group_type": "adam", "param_names": ["b"], "radii": [1.0],
                              "blocks": [1], "whitening": "none", "weight_decay": 0.0}], lr=1e-2)
     opt._telem_on = False
     z0 = w.detach().clone()
@@ -229,7 +235,7 @@ def test_adam_group_under_schedule_free_has_no_momentum():
 # C4 -----------------------------------------------------------------------------------------------
 def test_per_group_telemetry():
     m = _scalar_model()
-    opt = ModularOptimizer(build_modular_param_groups(m), lr=1e-2)
+    opt = _MO(build_modular_param_groups(m), lr=1e-2)
     for p in m.parameters():
         p.grad = torch.randn_like(p)
     opt.step()
@@ -296,7 +302,7 @@ def test_fp32_state_survives_resume():
     _, opt, w = _moved_state(torch.bfloat16, 1e-3, "fp32", steps=5)
     sd = opt.state_dict()
     w2 = nn.Parameter(w.detach().clone())
-    opt2 = ModularOptimizer([{"params": [w2], "group_type": "spectral", "param_names": ["w"], "radii": [1.0],
+    opt2 = _MO([{"params": [w2], "group_type": "spectral", "param_names": ["w"], "radii": [1.0],
                               "blocks": [1], "whitening": "none", "weight_decay": 0.01}],
                             lr=1e-3, state_dtype="fp32")
     opt2.load_state_dict(sd)
@@ -325,8 +331,8 @@ def test_ns_batch_matches_per_matrix(kw):
     kw = dict(kw)
     wh = kw.pop("default_whitening", "none")
     ma, mb = _batch_model(), _batch_model()
-    oa = ModularOptimizer(build_modular_param_groups(ma, default_whitening=wh), lr=1e-2, **kw)
-    ob = ModularOptimizer(build_modular_param_groups(mb, default_whitening=wh), lr=1e-2, ns_batch=True, **kw)
+    oa = _MO(build_modular_param_groups(ma, default_whitening=wh), lr=1e-2, **kw)
+    ob = _MO(build_modular_param_groups(mb, default_whitening=wh), lr=1e-2, ns_batch=True, **kw)
     gen = torch.Generator().manual_seed(4)
     for _ in range(15):
         for pa, pb in zip(ma.parameters(), mb.parameters()):
@@ -340,8 +346,8 @@ def test_ns_batch_matches_per_matrix(kw):
 
 def test_ns_batch_with_bf16_params_and_fp32_state():
     ma, mb = _batch_model().to(torch.bfloat16), _batch_model().to(torch.bfloat16)
-    oa = ModularOptimizer(build_modular_param_groups(ma), lr=1e-3, state_dtype="fp32", ns_dtype="bf16")
-    ob = ModularOptimizer(build_modular_param_groups(mb), lr=1e-3, state_dtype="fp32", ns_dtype="bf16", ns_batch=True)
+    oa = _MO(build_modular_param_groups(ma), lr=1e-3, state_dtype="fp32", ns_dtype="bf16")
+    ob = _MO(build_modular_param_groups(mb), lr=1e-3, state_dtype="fp32", ns_dtype="bf16", ns_batch=True)
     gen = torch.Generator().manual_seed(5)
     for _ in range(10):
         for pa, pb in zip(ma.parameters(), mb.parameters()):
@@ -394,7 +400,7 @@ def test_direction_agreement_band_is_rotation_invariant():
 def test_momentum_spectra_reads_without_mutating():
     from stable_audio_tools.training.modular_opt import momentum_spectra
     m = _scalar_model()
-    opt = ModularOptimizer(build_modular_param_groups(m), lr=1e-2)
+    opt = _MO(build_modular_param_groups(m), lr=1e-2)
     for p in m.parameters():
         p.grad = torch.randn_like(p)
     opt.step()

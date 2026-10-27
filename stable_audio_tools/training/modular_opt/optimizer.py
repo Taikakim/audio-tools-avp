@@ -19,7 +19,6 @@ Design principles:
 from __future__ import annotations
 
 import math
-import warnings
 from typing import Iterable, Any
 
 import torch
@@ -263,11 +262,12 @@ class ModularOptimizer(Optimizer):
         # ns_batch: run the Newton-Schulz of all same-shape spectral matrices of a group as one batched call
         # (speed; same per-matrix arithmetic up to floating-point reassociation). Default off.
         ns_batch: bool = False,
-        # strict_group_lrs (CONTINUITY 2026-10-27, Kim): a spectral group and a 1-D group (sign / colnorm / adam)
-        # on ONE learning rate get very different per-weight steps (the sign step moves each entry by the full lr,
-        # a spectral entry by ~lr/sqrt(max(m, n)); guide section 4). By default this only WARNS; True raises, so a
-        # uniform lr needs an explicit choice (give the groups their own "lr", or leave strict off).
-        strict_group_lrs: bool = False,
+        # strict_group_lrs (CONTINUITY 2026-10-27, Kim: "old scripts should fail with parameters that anticipate problems,
+        # unless explicitly overdriven"). A spectral group and a 1-D group (sign / colnorm / adam) on ONE learning rate
+        # get very different per-weight steps (the sign step moves each entry by the full lr, a spectral entry by about
+        # lr/sqrt(max(m, n)); guide section 4). Default True: that raises. Give the groups their own "lr" (trainers:
+        # --mod-sign-lr), or pass strict_group_lrs=False (trainers: --allow-uniform-lr) to accept it knowingly.
+        strict_group_lrs: bool = True,
         # Global
         eps: float = 1e-12,
     ):
@@ -1084,27 +1084,25 @@ class ModularOptimizer(Optimizer):
         self._step_count = int(n)
 
     def _check_group_lrs(self, strict: bool) -> None:
-        """Warn (or raise, when strict) if a spectral group and a 1-D group share one learning rate.
+        """Raise when a spectral group and a 1-D group share one learning rate, unless the caller overrides it.
 
-        Not an estimate of step sizes: it only detects the situation the guide's section 4 describes as a
-        trap, a spectral matrix and a sign / colnorm / adam list on the same lr (per-weight steps differ by
-        ~sqrt(max(m, n)) or more). Give the groups their own "lr" (routing / --scalar-lr style options) to
-        silence it. Pure check: it changes nothing about the step.
+        Not an estimate of step sizes: it only detects the situation the guide's section 4 describes as a trap,
+        a spectral matrix and a sign / colnorm / adam list on the same lr (per-weight steps differ by ~sqrt(max(m, n))
+        or more). Pure check: it changes nothing about the step. strict=False accepts a uniform lr silently.
         """
+        if not strict:
+            return
         types = {g["group_type"] for g in self.param_groups if g["params"]}
         lrs = {float(g["lr"]) for g in self.param_groups if g["params"]}
         if "spectral" not in types or not (types & {"sign", "colnorm", "adam"}) or len(lrs) != 1:
             return
-        msg = (
+        raise ValueError(
             f"ModularOptimizer: the spectral group and the {'/'.join(sorted(types - {'spectral'}))} group(s) share "
             f"one learning rate ({next(iter(lrs)):.2e}). The same number gives very different per-weight steps "
             f"(a sign step moves every entry by the full lr, a spectral entry by about lr/sqrt(max(m, n))), so "
-            f"biases and gains can run away first. Set a separate lr per group, or pass strict_group_lrs=False "
-            f"and accept it explicitly."
+            f"biases and gains can run away first. Give the groups their own lr (trainers: --mod-sign-lr), or accept "
+            f"it knowingly with strict_group_lrs=False (trainers: --allow-uniform-lr). See docs/TRAINING.md D34."
         )
-        if strict:
-            raise ValueError(msg)
-        warnings.warn(msg, UserWarning, stacklevel=3)
 
     def summary(self) -> str:
         """Return a human-readable summary of the optimizer configuration."""
