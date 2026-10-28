@@ -221,9 +221,13 @@ class PointAndPlayExtractor(nn.Module):
     @torch.no_grad()
     def encode_text_cue(self, texts: List[str]) -> torch.Tensor:
         """Encodes text prompts to normalized cue embedding q_text."""
-        q = self.clap.get_text_embedding(texts, use_tensor=True)
+        is_single = (len(texts) == 1)
+        query_texts = [texts[0], texts[0]] if is_single else texts
+        q = self.clap.get_text_embedding(query_texts, use_tensor=True)
         if not isinstance(q, torch.Tensor):
             q = torch.tensor(q, dtype=torch.float32)
+        if is_single:
+            q = q[0:1]
         return F.normalize(q, p=2, dim=-1)
 
     @torch.no_grad()
