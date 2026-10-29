@@ -58,30 +58,17 @@ def release_gpu_guard():
     subprocess.run(["bash", GUARD_SCRIPT, "release", "ANTIGRAVITY"])
 
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print("=" * 80)
-    print("V8 Phase 1: Asymmetric TSE Evaluation & Separation Tax Benchmark")
-    print(f"Device: {device}")
-    print("=" * 80)
-
-    if "cuda" in device:
-        print("Checking GPU lock via gpu_guard.sh...")
-        if not acquire_gpu_guard():
-            print("GPU is currently busy. Refusing to run.")
-            sys.exit(0)
-
-    try:
-        # 1. Load V8 Asymmetric TSE Model
-        tse_ckpt_path = "/home/kim/sao_runs/v8_phase1_tse/tse_best.pt"
-        if not os.path.exists(tse_ckpt_path):
-            print(f"Error: TSE checkpoint not found at {tse_ckpt_path}", file=sys.stderr)
-            sys.exit(1)
-        print(f"Loading V8 TSE model from {tse_ckpt_path}...")
-        tse_model = AsymmetricTSEModel().to(device).eval()
-        ckpt = torch.load(tse_ckpt_path, map_location=device, weights_only=False)
-        tse_model.load_state_dict(ckpt["model"])
-        print(f"Loaded TSE model (Epoch {ckpt.get('epoch', '?')}, val_loss={ckpt.get('val_loss', 0.0):.4f}).")
+def run_eval(device: str):
+    # 1. Load V8 Asymmetric TSE Model
+    tse_ckpt_path = "/home/kim/sao_runs/v8_phase1_tse/tse_best.pt"
+    if not os.path.exists(tse_ckpt_path):
+        print(f"Error: TSE checkpoint not found at {tse_ckpt_path}", file=sys.stderr)
+        sys.exit(1)
+    print(f"Loading V8 TSE model from {tse_ckpt_path}...")
+    tse_model = AsymmetricTSEModel().to(device).eval()
+    ckpt = torch.load(tse_ckpt_path, map_location=device, weights_only=False)
+    tse_model.load_state_dict(ckpt["model"])
+    print(f"Loaded TSE model (Epoch {ckpt.get('epoch', '?')}, val_loss={ckpt.get('val_loss', 0.0):.4f}).")
 
     # 2. Load V6 C Inverter
     v6c_path = "/home/kim/sao_runs/v6_C/flow_best.pt"
@@ -311,6 +298,24 @@ def main():
             f,
             indent=2,
         )
+    print(f"Saved results to {summary_path}")
+
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("=" * 80)
+    print("V8 Phase 1: Asymmetric TSE Evaluation & Separation Tax Benchmark")
+    print(f"Device: {device}")
+    print("=" * 80)
+
+    if "cuda" in device:
+        print("Checking GPU lock via gpu_guard.sh...")
+        if not acquire_gpu_guard():
+            print("GPU is currently busy. Refusing to run.")
+            sys.exit(0)
+
+    try:
+        run_eval(device)
     finally:
         if "cuda" in device:
             release_gpu_guard()
