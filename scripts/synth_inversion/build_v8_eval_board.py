@@ -3,17 +3,24 @@
 """V8 Interactive Evaluation Board Builder.
 
 Generates the complete evaluation suite and interactive HTML audition board:
-1. Renders 4 diverse phrase scenarios:
-   - Phrase 1: Acid Alien (Rising Filter Cutoff Sweep over Goa rhythm track)
-   - Phrase 2: Goddess Guerrilla (Sinusoidal LFO Cutoff & Resonance Wobble)
-   - Phrase 3: Dance of Tomorrow (Exponential Snappy Punch + Rising Drive)
-   - Phrase 4: Commodore Shiva (Cascading Metallic Resonance & FM Sweep)
+1. Renders 4 synthetic test phrases (a constant test patch with automated lanes) over held-out backing clips:
+   - Phrase 1: rising filter cutoff sweep
+   - Phrase 2: sinusoidal cutoff and resonance
+   - Phrase 3: exponential cutoff fall with rising drive
+   - Phrase 4: falling cutoff, rising resonance, falling FM depth
 2. Compares 5 audio arms for each phrase:
    - Target Clean Synth
-   - 0 dB SNR Mixture (with authentic held-out multitrack drums/bass)
+   - 0 dB SNR Mixture (held-out multitrack drums/bass/synth clips from the val stem cache)
    - Phase 1 Asymmetric TSE Separated Stem
-   - Best Previous Static Model (V6 C Flow / static inverter with flat parameters)
+   - V6-C static inverter on the same separated stem, played with its own values held flat
    - V8 Dynamic Inversion (Static Core + 10.76 Hz parameter automation lanes)
+
+KUANG 2026-10-29 (docs/synth-v8-code-review-2026-10-29.md, M9): the static arm used to be V8's own static head with
+flat lanes, labeled "V6 C"; it is now V6-C itself (required). Phrase titles no longer name songs (the targets are
+synthetic and the backing clips are val-cache indices, not clips of named songs), the cue is the same patch at
+another note instead of a slice of the target, the inverter's mel uses the training settings (n_fft 1024), and the
+summary cards come from the results JSON files instead of hard-coded numbers. Four phrases illustrate behavior; they
+are not a benchmark.
 3. Computes and plots 43-frame dynamic parameter trajectories:
    - Cutoff (Lane 0)
    - Resonance (Lane 1)
@@ -41,12 +48,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio_utils import ExactGpuMel
 from train_v8_asymmetric_tse import AsymmetricTSEModel
 from dynamic_inverter_v8 import DynamicParameterInverterV8
-from dynamic_dataset_v8 import generate_sweep_curve, render_dynamic_patch
+from dynamic_dataset_v8 import generate_sweep_curve, render_dynamic_patch, rendered_static_vector
 import surge_spec_v5 as S5
 import surge_spec_v6 as S6
 
 try:
     from models_v4 import load_inverter_v4
+    import param_codec_v6 as codec
     HAS_V6C = True
 except ImportError:
     HAS_V6C = False
@@ -75,7 +83,7 @@ def transcode_to_aac(wav_path: Path, aac_path: Path):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 
-def build_eval_board():
+def build_eval_board(phase1_json=None, phase2_json=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     base_dir = Path("/home/kim/evals_aac/synth_inversion_v8")
     audio_dir = base_dir / "audio"
@@ -109,8 +117,10 @@ def build_eval_board():
             v6c_flow = load_inverter_v4(str(v6c_path), device=device).eval()
         except Exception as e:
             print(f"Warning: could not load V6 C flow: {e}")
+    if v6c_flow is None:
+        raise SystemExit("The comparison arm is V6-C; its checkpoint is required (no stand-in arm is built).")
 
-    mel_fn = ExactGpuMel(sample_rate=44100, n_mels=128, n_fft=2048, hop_length=441)
+    mel_fn = ExactGpuMel(device="cpu")  # the settings the Phase 2 caches were built with (n_fft 1024, hop 441)
     plugin = pedalboard.load_plugin(os.path.expanduser(S5.DEFAULT_PLUGIN_PATH))
 
     # 2. Load Real Multitrack Stems for authentic mixture backing
@@ -123,8 +133,8 @@ def build_eval_board():
     phrases = [
         {
             "id": "phrase_01_acid_sweep",
-            "title": "Phrase 1: Acid Alien — Soaring 24dB Lowpass Sweep",
-            "desc": "A dynamic 4-bar Goa lead opening from 350 Hz to 11 kHz with authentic drum/bass backing from Acid Alien.",
+            "title": "Phrase 1: rising cutoff sweep (LP 24 dB)",
+            "desc": "Synthetic test lead (constant test patch) with a rising filter 1 cutoff and rising drive, over held-out backing clip 0.",
             "midi_note": 38,
             "static_seed": 0.52,
             "filter_idx": 1,  # Lowpass 24dB
@@ -137,12 +147,12 @@ def build_eval_board():
             "fm_type": "static",
             "fm_val": 0.0,
             "backing_idx": 0,
-            "song_name": "Acid Alien",
+            "song_name": "held-out backing clip 0",
         },
         {
             "id": "phrase_02_lfo_wobble",
-            "title": "Phrase 2: Goddess Guerrilla — Sinusoidal LFO Cutoff & Resonance Wobble",
-            "desc": "Expressive pulsating lead with dual-cycle cutoff oscillations and resonance peaks over rhythm backing from Goddess Guerrilla.",
+            "title": "Phrase 2: sinusoidal cutoff and resonance (LP 12 dB)",
+            "desc": "Synthetic test lead with two cutoff cycles and a resonance cycle, over held-out backing clip 1.",
             "midi_note": 42,
             "static_seed": 0.45,
             "filter_idx": 2,  # Lowpass 12dB
@@ -155,12 +165,12 @@ def build_eval_board():
             "fm_type": "static",
             "fm_val": 0.15,
             "backing_idx": 1,
-            "song_name": "Goddess Guerrilla",
+            "song_name": "held-out backing clip 1",
         },
         {
             "id": "phrase_03_snappy_punch",
-            "title": "Phrase 3: Dance of Tomorrow — Exponential Punch & Escalating Drive",
-            "desc": "Aggressive pluck with fast exponential decay transitioning into rising waveshaper saturation, backed by Dance of Tomorrow.",
+            "title": "Phrase 3: exponential cutoff fall and rising drive (LP 12 dB)",
+            "desc": "Synthetic test lead whose cutoff falls exponentially while the waveshaper drive rises, over held-out backing clip 2.",
             "midi_note": 36,
             "static_seed": 0.60,
             "filter_idx": 0,  # Lowpass 24dB Clean
@@ -173,12 +183,12 @@ def build_eval_board():
             "fm_type": "static",
             "fm_val": 0.05,
             "backing_idx": 2,
-            "song_name": "Dance of Tomorrow",
+            "song_name": "held-out backing clip 2",
         },
         {
             "id": "phrase_04_cascading_sweep",
-            "title": "Phrase 4: Commodore Shiva — Cascading Downward Resonance & Harmonic Sidebands",
-            "desc": "Descending resonant filter sweep with active inter-oscillator harmonic modulation over dense polyphonic multitracks.",
+            "title": "Phrase 4: falling cutoff, rising resonance, falling FM depth (Legacy Ladder)",
+            "desc": "Synthetic test lead with a falling cutoff, rising resonance and FM (osc 2 to 1) depth falling, over held-out backing clip 3.",
             "midi_note": 45,
             "static_seed": 0.48,
             "filter_idx": 4,  # Lowpass 24dB Ladder
@@ -191,7 +201,7 @@ def build_eval_board():
             "fm_type": "falling",
             "fm_val": 0.35,
             "backing_idx": 3,
-            "song_name": "Commodore Shiva",
+            "song_name": "held-out backing clip 3",
         },
     ]
 
@@ -235,11 +245,11 @@ def build_eval_board():
 
         # 2. Render Ground Truth Synth Stem
         true_static_vec = np.full(59, p_info["static_seed"], dtype=np.float32)
-        true_patch = S5.vector_to_patch(S6.to_v5(true_static_vec))
-        true_patch["filter_idx"] = p_info["filter_idx"]
-        true_patch["filter_balance"] = 0.0
-        if p_info["fm_val"] > 0.05:
-            true_patch["fm_routing"] = 1  # 2 -> 1 FM
+        true_static_vec[S6.PARAM_INDEX["midi_note"]] = (p_info["midi_note"] - S6.NOTE_LOW) / (S6.NOTE_HIGH - S6.NOTE_LOW)
+        true_static_vec[S6.PARAM_INDEX["fm_routing"]] = (1 if p_info["fm_val"] > 0.05 else 0) / 3.0  # 2 -> 1 FM
+        lanes_true = np.stack([cutoff_lane, res_lane, drive_lane, fm_lane])
+        true_static_vec = rendered_static_vector(true_static_vec, p_info["filter_idx"], lanes_true)
+        true_patch = S6.vector_to_patch(true_static_vec)
 
         clean_wav = render_dynamic_patch(plugin, true_patch, p_info["midi_note"], cutoff_lane, res_lane, drive_lane, fm_lane)
 
@@ -258,7 +268,9 @@ def build_eval_board():
         clean_wav = clean_wav / peak
 
         # 4. Phase 1 Asymmetric TSE Extraction
-        cue_wav = clean_wav[:22050]  # 0.5s cue
+        # 1.0 s cue: the same patch a fourth higher with the lanes at their means (never a slice of the target)
+        flat_true = [np.full(43, float(l.mean()), dtype=np.float32) for l in lanes_true]
+        cue_wav = render_dynamic_patch(plugin, true_patch, p_info["midi_note"] + 5, *flat_true)[:44100] / peak
         mix_t = torch.from_numpy(mix_wav).float().unsqueeze(0).unsqueeze(0).to(device)
         cue_t = torch.from_numpy(cue_wav).float().unsqueeze(0).unsqueeze(0).to(device)
 
@@ -280,7 +292,7 @@ def build_eval_board():
         p_dynamic_np = p_dynamic.squeeze(0).cpu().float().numpy()  # [4, 43]
 
         # Render V8 Dynamic Re-synthesis
-        pred_patch_v8 = S5.vector_to_patch(S6.to_v5(p_static_np))
+        pred_patch_v8 = S6.vector_to_patch(p_static_np)
         v8_resynth_wav = render_dynamic_patch(
             plugin, pred_patch_v8, p_info["midi_note"],
             p_dynamic_np[0], p_dynamic_np[1], p_dynamic_np[2], p_dynamic_np[3]
@@ -288,12 +300,19 @@ def build_eval_board():
         v8_peak = max(1.0, float(np.abs(v8_resynth_wav).max()))
         v8_resynth_wav = v8_resynth_wav / v8_peak
 
-        # 6. Best Previous Static Model Re-synthesis (Flat Parameters across phrase)
-        # Static baseline uses the static head's core parameter values as flat lines
-        static_cutoff_val = float(p_static_np[S6.PARAM_INDEX["cutoff"]])
-        static_res_val = float(p_static_np[S6.PARAM_INDEX["resonance"]])
-        static_drive_val = float(p_static_np[S6.PARAM_INDEX["drive"]])
-        static_fm_val = float(p_static_np[S6.PARAM_INDEX["fm_depth"]])
+        # 6. V6-C static baseline: V6-C inverts the first 0.8 s of the same separated stem (its input length) with
+        # the phrase's note, and its patch is played over the whole phrase with its own values held flat
+        mel_v6 = mel_fn(torch.from_numpy(np.ascontiguousarray(sep_tse_wav[:35280])).float()).unsqueeze(0).to(device)
+        note_v6 = torch.tensor([(p_info["midi_note"] - S6.NOTE_LOW) / (S6.NOTE_HIGH - S6.NOTE_LOW)], device=device)
+        gen = torch.Generator(device=device).manual_seed(1337 + p_idx)
+        with torch.no_grad():
+            v6_vec = codec.decode(v6c_flow.sample(mel_v6, note=note_v6, num_steps=25, generator=gen), note_v6)[0]
+        v6_vec = v6_vec.float().cpu().numpy()
+        v6_patch = S6.vector_to_patch(v6_vec)
+        static_cutoff_val = float(v6_vec[S6.PARAM_INDEX["cutoff"]])
+        static_res_val = float(v6_vec[S6.PARAM_INDEX["resonance"]])
+        static_drive_val = float(v6_vec[S6.PARAM_INDEX["drive"]])
+        static_fm_val = float(v6_vec[S6.PARAM_INDEX["fm_depth"]])
 
         static_cutoff_lane = np.full(43, static_cutoff_val, dtype=np.float32)
         static_res_lane = np.full(43, static_res_val, dtype=np.float32)
@@ -301,7 +320,7 @@ def build_eval_board():
         static_fm_lane = np.full(43, static_fm_val, dtype=np.float32)
 
         static_resynth_wav = render_dynamic_patch(
-            plugin, pred_patch_v8, p_info["midi_note"],
+            plugin, v6_patch, p_info["midi_note"],
             static_cutoff_lane, static_res_lane, static_drive_lane, static_fm_lane
         )
         static_peak = max(1.0, float(np.abs(static_resynth_wav).max()))
@@ -391,7 +410,7 @@ def build_eval_board():
         json.dump(phrase_data_for_web, f, indent=2)
 
     # 4. Generate Interactive HTML Page
-    html_content = generate_html_board(phrase_data_for_web)
+    html_content = generate_html_board(phrase_data_for_web, load_stats(phase1_json, phase2_json))
     html_path = base_dir / "index.html"
     with open(html_path, "w") as f:
         f.write(html_content)
@@ -405,8 +424,34 @@ def build_eval_board():
     print(f"Staged 4 phrases x 5 audio arms in {audio_dir}.")
 
 
-def generate_html_board(data: list) -> str:
+def load_stats(phase1_json=None, phase2_json=None) -> list:
+    """Summary cards from the results files: (value, label) pairs. Nothing is shown for a file that is missing."""
+    cards = []
+    for path in (phase1_json, phase2_json):
+        if not path or not Path(path).exists():
+            continue
+        d = json.loads(Path(path).read_text())
+        s = d.get("summary", d)
+        if "tax_ratio_mse" in s:
+            gate = "passed" if s.get("gate_pass") else "not passed"
+            cards.append((f"{s['tax_ratio_mse']:.2f}x / {s['tax_demucs_mse']:.2f}x",
+                          f"Phase 1 separation tax, TSE / Demucs (gate &le; 1.25: {gate}; n = {s.get('n_items', '?')})"))
+        if "cutoff_rho_mean" in s:
+            fam = s.get("cutoff_rho_by_family", {}).get("sinusoidal", {})
+            cards.append((f"{s['cutoff_rho_mean']:.2f}",
+                          f"Phase 2 cutoff &rho;, all sweeps (sinusoidal only: {fam.get('mean', float('nan')):.2f}; "
+                          f"n = {s.get('cutoff_rho_n', '?')})"))
+            for lane, v in s.get("lanes", {}).items():
+                if "r2" in v:
+                    cards.append((f"{v['r2']:.2f}", f"Phase 2 {lane} lane R&sup2; against a constant guess"))
+    return cards
+
+
+def generate_html_board(data: list, stats: list = ()) -> str:
     data_json_str = json.dumps(data)
+    stat_cards = "\n".join(
+        f'      <div class="stat-card">\n        <div class="val">{v}</div>\n        <div class="lbl">{l}</div>\n      </div>'
+        for v, l in stats) or '      <div class="stat-card"><div class="lbl">No results files given.</div></div>'
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -729,28 +774,13 @@ def generate_html_board(data: list) -> str:
         <span class="badge">Dynamic 10 Hz Automation Evaluation</span>
       </h1>
       <div class="subtitle">
-        Comparing Dynamic 10.76 Hz Parameter Trajectories (V8) against Best Previous Static Inversion Models on Authentic Multitrack Clashes.
+        V8 dynamic lanes (10.76 Hz) against the V6-C static inverter on four synthetic test phrases over held-out backing. An illustration, not a benchmark.
       </div>
     </header>
 
     <!-- Stat Highlights -->
     <div class="stat-grid">
-      <div class="stat-card">
-        <div class="val green">0.8646</div>
-        <div class="lbl">Cutoff Trajectory Correlation (Spearman &rho; &ge; 0.80)</div>
-      </div>
-      <div class="stat-card">
-        <div class="val">0.000097</div>
-        <div class="lbl">Curvature Penalty (Zero Chatter &le; 0.005)</div>
-      </div>
-      <div class="stat-card">
-        <div class="val green">0.3644</div>
-        <div class="lbl">Phase 1 Mel-SSIM (Beats Demucs 0.3666)</div>
-      </div>
-      <div class="stat-card">
-        <div class="val">0.2637</div>
-        <div class="lbl">V8 Re-Synthesis Mel L1 (vs Static 0.6120)</div>
-      </div>
+{stat_cards}
     </div>
 
     <!-- Explainer Q&A Section -->
@@ -779,10 +809,12 @@ def generate_html_board(data: list) -> str:
       </div>
 
       <div class="qa-item">
-        <div class="qa-q">3. How does V8 Dynamic Inversion surpass the previous best static models?</div>
+        <div class="qa-q">3. What do the arms compare?</div>
         <div class="qa-a">
-          Previous state-of-the-art models (such as V6 C Flow and V5) were <strong>static</strong>: they took a 4-second audio phrase and predicted a single, fixed 59-parameter vector. When faced with live synth leads featuring phrase-level filter opening, manual resonance tweaks, or escalating overdrive, static models had to average the parameter across time. This produced flat, lifeless sounds (Mel L1 distance &sim; 0.61) that completely missed musical sweeps.<br><br>
-          <strong>V8 Dynamic Inversion</strong> decouples the static patch core from 4 dynamic automation curves sampled at <strong>10.76 Hz (43 frames across 4.0s)</strong> with second-order curvature regularization. It exports native Steinberg <code>.vstpreset</code> patches and accompanying <code>.mid</code> CC automation tracks (CC 74 Cutoff, CC 71 Resonance, CC 1 Drive, CC 11 FM Depth) directly into DAWs (Bitwig/Ableton/FL/Reaper).
+          The orange arm is <strong>V6-C</strong>, the static inverter: it reads 0.8 s of the separated stem (the first phrase) with the note, predicts one patch, and that patch plays the whole phrase with its values held flat.
+          The blue arm is <strong>V8</strong>: a static patch plus four lanes (cutoff, resonance, drive, FM depth) on the 43-frame latent grid (10.76 Hz), smoothed by a curvature penalty.
+          The test patches are synthetic and the four phrases are chosen by hand, so the page shows behavior, not a measured advantage; the summary cards above come from the evaluation runs.
+          The export writes a Surge <code>.fxp</code> / <code>.vstpreset</code> and a <code>.mid</code> with CC 74, 71, 1 and 11; Surge needs each CC MIDI-learned to its parameter before the curves do anything.
         </div>
       </div>
     </div>
@@ -807,10 +839,10 @@ def generate_html_board(data: list) -> str:
           <div class="phrase-header">
             <div>
               <div class="phrase-title">${{p.title}}</div>
-              <div class="phrase-song">Authentic Multitrack Backing: ${{p.song_name}} (MIDI Note ${{p.midi_note}})</div>
+              <div class="phrase-song">Backing: ${{p.song_name}} (MIDI note ${{p.midi_note}})</div>
             </div>
             <div>
-              <span class="badge-pass">V8 Mel L1: ${{p.metrics.v8_mel_l1.toFixed(4)}} (${{p.metrics.improvement}} better than Static)</span>
+              <span class="badge-pass">Mel L1: V8 ${{p.metrics.v8_mel_l1.toFixed(4)}} / V6-C ${{p.metrics.static_mel_l1.toFixed(4)}}</span>
             </div>
           </div>
           <div class="phrase-desc">${{p.desc}}</div>
@@ -827,7 +859,7 @@ def generate_html_board(data: list) -> str:
               <span>⚡</span> Phase 1 TSE Separated
             </button>
             <button class="arm-btn static" onclick="switchArm('${{p.id}}', 'static', this)">
-              <span>⏹️</span> Static Model (Flat)
+              <span>⏹️</span> V6-C static (flat)
             </button>
             <button class="arm-btn v8" onclick="switchArm('${{p.id}}', 'v8', this)">
               <span>🔥</span> V8 Dynamic Inversion
@@ -854,7 +886,7 @@ def generate_html_board(data: list) -> str:
             <div class="graph-legend">
               <div class="legend-item"><div class="legend-line" style="background: #10b981;"></div> Ground Truth Target</div>
               <div class="legend-item"><div class="legend-line" style="background: #38bdf8;"></div> V8 Dynamic Inverter (10.76 Hz)</div>
-              <div class="legend-item"><div class="legend-line" style="background: #f97316; border-top: 2px dashed #f97316; height:0;"></div> Best Previous Static Model</div>
+              <div class="legend-item"><div class="legend-line" style="background: #f97316; border-top: 2px dashed #f97316; height:0;"></div> V6-C static (held flat)</div>
               <div class="legend-item"><div class="legend-line" style="background: #fff; width: 2px; height: 14px;"></div> Live Audio Playhead</div>
             </div>
           </div>
@@ -879,14 +911,14 @@ def generate_html_board(data: list) -> str:
                 <td>Native Surge XT Patch</td>
               </tr>
               <tr style="color: #38bdf8; font-weight: 600;">
-                <td><strong>V8 Dynamic Inverter (Ours)</strong></td>
+                <td><strong>V8 Dynamic Inverter</strong></td>
                 <td>${{p.metrics.v8_mel_l1.toFixed(4)}}</td>
                 <td>${{p.metrics.cutoff_mse_v8.toFixed(5)}}</td>
-                <td>10.76 Hz Spline (${{p.metrics.improvement}} closer)</td>
+                <td>43 steps at 10.76 Hz</td>
                 <td><code>.vstpreset</code> + <code>.mid</code> (CC 74/71/1/11)</td>
               </tr>
               <tr style="color: #f97316;">
-                <td><strong>Best Previous Static Model (V6 C Flow)</strong></td>
+                <td><strong>V6-C static inverter</strong></td>
                 <td>${{p.metrics.static_mel_l1.toFixed(4)}}</td>
                 <td>${{p.metrics.cutoff_mse_static.toFixed(5)}}</td>
                 <td>Flat constant line (0 Hz modulation)</td>
@@ -1065,14 +1097,20 @@ def generate_html_board(data: list) -> str:
 
 
 def main():
-    if "cuda" in ("cuda" if torch.cuda.is_available() else "cpu"):
-        if not acquire_gpu_guard():
-            print("GPU is currently busy. Exiting.", file=sys.stderr)
-            sys.exit(0)
+    import argparse
+    ap = argparse.ArgumentParser(description="Build the V8 audition board")
+    ap.add_argument("--phase1-json", default="/home/kim/Projects/SAO/eval/v8_phase1_tse_results_v2.json")
+    ap.add_argument("--phase2-json", default="/home/kim/Projects/SAO/eval/v8_phase2_dynamic_results_v2.json")
+    a = ap.parse_args()
+    on_gpu = torch.cuda.is_available()
+    if on_gpu and not acquire_gpu_guard():
+        print("GPU is currently busy. Exiting.", file=sys.stderr)
+        sys.exit(0)
     try:
-        build_eval_board()
+        build_eval_board(a.phase1_json, a.phase2_json)
     finally:
-        release_gpu_guard()
+        if on_gpu:
+            release_gpu_guard()
 
 
 if __name__ == "__main__":

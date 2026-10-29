@@ -9,7 +9,11 @@ Trains an Asymmetric Target Sound Extractor on authentic multitrack mixtures:
    - Target-to-interference reliability mask W(t, f) in [0, 1].
 3. Single-target loss (minimizing ||S_hat - S_target|| without drum conservation).
 4. Integrated GPU locking with --wait-gpu flag to automatically acquire /tmp/gpu.lock.
-5. ModularOptimizer (Fusion v2) compatible routing for Conv2d kernels.
+5. AdamW, with half the learning rate for 1-D parameters. (An earlier docstring said ModularOptimizer with a
+   Conv2d kernel reshape; that is not implemented: KUANG 2026-10-29, docs/synth-v8-code-review-2026-10-29.md M4.)
+
+The dataset now draws each positive cue from a different clip of the target's stem (C4); the stem caches must
+carry stem ids (cache_v8_stems.py --split train and --split val).
 """
 
 import argparse
@@ -271,7 +275,7 @@ def main():
         model = AsymmetricTSEModel().to(args.device)
         stft_loss_fn = MultiResolutionSTFTLoss()
 
-        # ModularOptimizer parameter grouping (4D conv kernel reshape)
+        # Two AdamW groups: weights (2-D and conv kernels) and 1-D parameters at half the lr
         spectral_params = []
         sign_params = []
         for name, p in model.named_parameters():

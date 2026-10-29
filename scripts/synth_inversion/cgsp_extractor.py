@@ -24,6 +24,42 @@ except ImportError:
 DEFAULT_CLAP_CKPT = "/home/kim/Projects/SAO/stable-audio-tools/sat-venv/lib/python3.10/site-packages/laion_clap/630k-audioset-best.pt"
 
 
+# Keys a laion CLAP checkpoint may lack or carry without harm (a registered buffer of the text branch)
+CLAP_KEYS_ALLOWED_TO_DIFFER = ("position_ids",)
+
+
+def load_clap_weights(model: nn.Module, ckpt_path: Optional[str], state_dict_loader=None) -> int:
+    """Loads pretrained CLAP weights into model (a CLAP_Module's .model) and fails loudly.
+
+    V7 ran with an untrained CLAP because the load failed without an error. Here a missing path, a missing file or
+    any missing / unexpected key (other than CLAP_KEYS_ALLOWED_TO_DIFFER) raises; a shape mismatch raises in
+    load_state_dict itself. Returns the number of tensors loaded. (KUANG 2026-10-29, review C6.)
+    """
+    if not ckpt_path:
+        raise ValueError("clap_ckpt is required: without its pretrained weights CLAP is a random projection")
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"CLAP checkpoint not found: {ckpt_path}")
+    if state_dict_loader is None:
+        from laion_clap.clap_module.factory import load_state_dict as state_dict_loader
+    orig_load = torch.load
+    try:  # the 630k checkpoints pickle numpy scalars, which weights_only=True (PyTorch >= 2.6) refuses
+        torch.load = lambda *a, **k: orig_load(*a, **{**k, "weights_only": False})
+        sd = state_dict_loader(ckpt_path)
+    finally:
+        torch.load = orig_load
+    result = model.load_state_dict(sd, strict=False)
+    ok = lambda k: any(s in k for s in CLAP_KEYS_ALLOWED_TO_DIFFER)
+    missing = [k for k in result.missing_keys if not ok(k)]
+    unexpected = [k for k in result.unexpected_keys if not ok(k)]
+    if missing or unexpected:
+        raise RuntimeError(
+            f"CLAP checkpoint {ckpt_path} does not match the model: {len(missing)} missing and {len(unexpected)} "
+            f"unexpected keys, e.g. {(missing + unexpected)[:5]}")
+    n = len(sd) - len([k for k in result.unexpected_keys if ok(k)])
+    print(f"Loaded pretrained CLAP weights from {ckpt_path} ({n} tensors, every model key matched)")
+    return n
+
+
 class LoRALinear(nn.Module):
     """Low-Rank Adaptation (LoRA) layer wrapping a frozen Linear layer."""
 
@@ -184,16 +220,7 @@ class PointAndPlayExtractor(nn.Module):
             if laion_clap is None:
                 raise ImportError("laion_clap is required to instantiate PointAndPlayExtractor")
             self.clap = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-tiny", device=self.device)
-            if clap_ckpt and os.path.exists(clap_ckpt):
-                orig_load = torch.load
-                try:
-                    torch.load = lambda *a, **k: orig_load(*a, **{**k, "weights_only": False})
-                    from laion_clap.clap_module.factory import load_state_dict
-                    sd = load_state_dict(clap_ckpt)
-                    self.clap.model.load_state_dict(sd, strict=False)
-                    print(f"Loaded pretrained CLAP weights from {clap_ckpt}")
-                finally:
-                    torch.load = orig_load
+            load_clap_weights(self.clap.model, clap_ckpt)
         else:
             self.clap = clap_module
 

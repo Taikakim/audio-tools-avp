@@ -4,15 +4,23 @@
 
 Pillar 1 of the V8 Architecture:
 1. Loads 40 multitracks from the AVP studio archive, holding out 6 songs completely.
-2. Dual Target Distribution:
-   - 50% known Surge renders (with ground-truth parameter vectors)
-   - 50% authentic synth stems from the archive (unlabeled for parameters, but real analog timbre)
+2. Target distribution:
+   - authentic synth stems from the archive (unlabeled for parameters, but real analog timbre)
+   - optionally (surge_frac > 0) known Surge renders from bank_v6, tiled to 4 s
 3. Live Pedalboard FX Rack applied to target:
    - Chorus, Delay, Reverb, Distortion
 4. Backing Arrangement:
-   - Authentic Goa/psytrance drum loops + isolated kick hit substitution
+   - Authentic Goa/psytrance drum loops or isolated kick stems (random crops; no shared grid with the target yet)
    - Dynamic mixing at realistic SNRs (-6 dB to +6 dB)
 5. Returns (mix, target, cue_pos, cue_neg) for Asymmetric TSE training.
+
+KUANG 2026-10-29 (docs/synth-v8-code-review-2026-10-29.md, C4):
+- The positive cue never overlaps the target window. With the stem cache it is a 1 s window of another clip of the
+  same stem (cache_v8_stems.py stores stem ids); from files it is a 1 s window outside the target crop. At use time
+  the cue comes from elsewhere in the track, so a cue cut from the target taught a shortcut the model cannot use.
+- Surge bank items are off by default (surge_frac = 0.0): a bank item is a 0.8 s loop, so any cue taken from it is
+  the target itself. With surge_frac > 0 that overlap is kept and flagged (cue_disjoint = False) for ablations.
+- Targets and cues that are near-silent are redrawn.
 """
 
 import os
@@ -29,6 +37,7 @@ import pedalboard
 from pedalboard import Chorus, Delay, Distortion, HighpassFilter, LowpassFilter, Reverb
 
 DEFAULT_ARCHIVE_ROOT = Path(os.environ.get("ARCHIVE_ROOT", "/run/media/kim/Mantu/avp-stems-original-classified"))
+DEFAULT_CACHE_DIR = Path("/home/kim/sao_runs/v8_stem_cache")
 HOLDOUT_SONGS = [
     "Summamutikka - Acid Alien aggressive powerful psychedelic melodic goa trance",
     "Aavepyörä - Goddess Guerrilla  goa morning bright energetic trance",
@@ -37,6 +46,53 @@ HOLDOUT_SONGS = [
     "Summamutikka - Lohikäärmelaulu - furious goa trance",
     "Summamutikka - Naidenie Flowers furious oldschool goa trance",
 ]
+SILENCE_RMS = 0.003  # cue / target windows quieter than this are redrawn
+MAX_DRAWS = 16
+
+
+def _rms(x: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(x)))) if len(x) else 0.0
+
+
+def loudest_window(clip: np.ndarray, length: int, tries: int = 4) -> np.ndarray:
+    """A random length-sample window of clip, the loudest of a few tries (cues should hold the sound)."""
+    if len(clip) <= length:
+        return np.pad(clip, (0, length - len(clip)))
+    best, best_rms = None, -1.0
+    for _ in range(tries):
+        s = random.randint(0, len(clip) - length)
+        w = clip[s:s + length]
+        r = _rms(w)
+        if r > best_rms:
+            best, best_rms = w, r
+    return np.array(best, dtype=np.float32, copy=True)
+
+
+def pick_start(total: int, length: int, avoid: Optional[Tuple[int, int]] = None) -> Optional[int]:
+    """A uniform random start s with [s, s + length) inside [0, total) and, given avoid = (a0, a1), not overlapping
+    [a0, a1). None when no such start exists."""
+    last = total - length
+    if last < 0:
+        return None
+    if avoid is None:
+        return random.randint(0, last)
+    a0, a1 = avoid
+    ranges = [(0, min(last, a0 - length)), (max(0, a1), last)]  # inclusive start ranges
+    ranges = [(lo, hi) for lo, hi in ranges if hi >= lo]
+    if not ranges:
+        return None
+    sizes = [hi - lo + 1 for lo, hi in ranges]
+    k = random.choices(range(len(ranges)), weights=sizes)[0]
+    return random.randint(*ranges[k])
+
+
+def group_by_stem(stem_ids: np.ndarray) -> Tuple[Dict[int, List[int]], List[int]]:
+    """{stem id: clip indices} and the clip indices whose stem has at least one other clip (usable as cued targets)."""
+    groups: Dict[int, List[int]] = {}
+    for i, s in enumerate(np.asarray(stem_ids).tolist()):
+        groups.setdefault(int(s), []).append(i)
+    eligible = [i for idx in groups.values() if len(idx) > 1 for i in idx]
+    return groups, eligible
 
 
 class MusicalDatasetV8(Dataset):
@@ -51,6 +107,8 @@ class MusicalDatasetV8(Dataset):
         epoch_length: int = 10000,
         split: str = "train",  # 'train' or 'val'
         cue_duration_s: float = 1.0,
+        surge_frac: float = 0.0,
+        cache_dir: Optional[Path] = DEFAULT_CACHE_DIR,
     ):
         super().__init__()
         self.archive_root = Path(archive_root)
@@ -59,6 +117,7 @@ class MusicalDatasetV8(Dataset):
         self.cue_samples = int(sample_rate * cue_duration_s)
         self.epoch_length = epoch_length
         self.split = split
+        self.surge_frac = float(surge_frac)
 
         # 1. Discover multitrack stems
         self.kicks: List[Path] = []
@@ -98,9 +157,9 @@ class MusicalDatasetV8(Dataset):
                     if cdir.exists():
                         self.other_synths.extend(list(cdir.glob("*.flac")) + list(cdir.glob("*.wav")))
 
-        # 2. Check Surge bank_v6 availability
+        # 2. Check Surge bank_v6 availability (only read when surge_frac > 0)
         self.has_bank_v6 = False
-        if bank_v6_dir and os.path.exists(bank_v6_dir):
+        if self.surge_frac > 0 and bank_v6_dir and os.path.exists(bank_v6_dir):
             audio_path = os.path.join(bank_v6_dir, "main_00000_audio.npy")
             meta_path = os.path.join(bank_v6_dir, "main_00000_meta.npz")
             if os.path.exists(audio_path) and os.path.exists(meta_path):
@@ -109,47 +168,59 @@ class MusicalDatasetV8(Dataset):
                 self.has_bank_v6 = True
                 self.num_bank_patches = len(self.bank_audio)
 
-        # 3. Check fast NVMe stem cache
-        cache_dir = Path("/home/kim/sao_runs/v8_stem_cache")
+        # 3. Check fast NVMe stem cache (needs stem ids for disjoint cues)
         self.use_cache = False
         prefix = "val_" if self.split == "val" else ""
-        kick_file = cache_dir / f"{prefix}kicks.npy"
-        if cache_dir.exists() and kick_file.exists():
-            try:
-                self.cached_kicks = np.load(kick_file, mmap_mode="r")
-                self.cached_drums = np.load(cache_dir / f"{prefix}drums.npy", mmap_mode="r")
-                self.cached_bass = np.load(cache_dir / f"{prefix}bass.npy", mmap_mode="r")
-                self.cached_synths = np.load(cache_dir / f"{prefix}synths.npy", mmap_mode="r")
-                self.use_cache = True
-            except Exception:
-                self.use_cache = False
+        cache_dir = Path(cache_dir) if cache_dir else None
+        if cache_dir is not None and (cache_dir / f"{prefix}kicks.npy").exists():
+            if not (cache_dir / f"{prefix}bass_stem_ids.npy").exists():
+                raise RuntimeError(
+                    f"{cache_dir} holds a stem cache without stem ids, so cues cannot be kept apart from targets. "
+                    f"Rebuild it: python cache_v8_stems.py --split {self.split}")
+            self.cached_kicks = np.load(cache_dir / f"{prefix}kicks.npy", mmap_mode="r")
+            self.cached_drums = np.load(cache_dir / f"{prefix}drums.npy", mmap_mode="r")
+            self.cached_bass = np.load(cache_dir / f"{prefix}bass.npy", mmap_mode="r")
+            self.cached_synths = np.load(cache_dir / f"{prefix}synths.npy", mmap_mode="r")
+            self.bass_ids = np.load(cache_dir / f"{prefix}bass_stem_ids.npy")
+            self.synth_ids = np.load(cache_dir / f"{prefix}synths_stem_ids.npy")
+            self.bass_groups, self.bass_eligible = group_by_stem(self.bass_ids)
+            self.synth_groups, self.synth_eligible = group_by_stem(self.synth_ids)
+            if not self.bass_eligible and not self.synth_eligible:
+                raise RuntimeError("No cached stem has two or more clips; disjoint cues are impossible.")
+            self.use_cache = True
 
-    def _random_crop(self, path: Path) -> np.ndarray:
-        """Reads a random 4.0s mono slice from an audio file."""
+    def _random_crop(self, path: Path, avoid: Optional[Tuple[int, int]] = None,
+                     length: Optional[int] = None) -> Tuple[Optional[np.ndarray], int]:
+        """Reads a random mono slice (length samples, default the clip length) from an audio file.
+
+        avoid: (start, end) in output-rate samples that the slice must not overlap. Returns (audio, start) with
+        audio None when the file cannot give such a slice.
+        """
+        length = self.clip_samples if length is None else length
         try:
             info = sf.info(path)
-            total_frames = info.frames
-            needed_frames = int(self.clip_samples * (info.samplerate / self.sample_rate)) + 256
-            if total_frames <= needed_frames:
+            ratio = info.samplerate / self.sample_rate
+            total = int(info.frames / ratio)
+            if total < length:
+                if avoid is not None:
+                    return None, 0
                 data, sr = sf.read(path, dtype="float32")
+                start = 0
             else:
-                max_start = total_frames - needed_frames
-                start = random.randint(0, max_start)
-                data, sr = sf.read(path, start=start, frames=needed_frames, dtype="float32")
+                start = pick_start(total, length, avoid)
+                if start is None:
+                    return None, 0
+                data, sr = sf.read(path, start=int(start * ratio), frames=int(length * ratio) + 256, dtype="float32")
             if data.ndim > 1:
                 data = data.mean(axis=1)
             if sr != self.sample_rate:
-                data = torchaudio.functional.resample(
-                    torch.from_numpy(data), sr, self.sample_rate
-                ).numpy()
+                data = torchaudio.functional.resample(torch.from_numpy(data), sr, self.sample_rate).numpy()
             # Ensure exact length
-            if len(data) < self.clip_samples:
-                data = np.pad(data, (0, self.clip_samples - len(data)))
-            else:
-                data = data[:self.clip_samples]
-            return data
+            if len(data) < length:
+                data = np.pad(data, (0, length - len(data)))
+            return data[:length].astype(np.float32), start
         except Exception:
-            return np.zeros(self.clip_samples, dtype=np.float32)
+            return None, 0
 
     def _apply_live_fx(self, wav: np.ndarray) -> np.ndarray:
         """Applies a randomized Pedalboard effects chain on the fly."""
@@ -184,32 +255,45 @@ class MusicalDatasetV8(Dataset):
     def __len__(self) -> int:
         return self.epoch_length
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # 1. Target Selection
-        is_surge = self.has_bank_v6 and (random.random() < 0.5)
-        if is_surge:
+    def _target_and_cue(self) -> Tuple[np.ndarray, np.ndarray, bool, Optional[int]]:
+        """(target [clip], cue [cue], cue_disjoint, target stem id or None)."""
+        if self.has_bank_v6 and random.random() < self.surge_frac:
             patch_idx = random.randint(0, self.num_bank_patches - 1)
             raw_audio = self.bank_audio[patch_idx].astype(np.float32) / 32768.0  # 35280 samples (0.8s)
             repeats = (self.clip_samples // len(raw_audio)) + 1
-            target_clean = np.tile(raw_audio, repeats)[:self.clip_samples]
-        elif self.use_cache:
-            if random.random() < 0.7 and len(self.cached_bass) > 0:
-                idx_b = random.randint(0, len(self.cached_bass) - 1)
-                target_clean = self.cached_bass[idx_b].copy()
-            elif len(self.cached_synths) > 0:
-                idx_s = random.randint(0, len(self.cached_synths) - 1)
-                target_clean = self.cached_synths[idx_s].copy()
+            target = np.tile(raw_audio, repeats)[:self.clip_samples]
+            return target, loudest_window(target, self.cue_samples), False, None
+
+        for _ in range(MAX_DRAWS):
+            if self.use_cache:
+                use_bass = self.bass_eligible and (random.random() < 0.7 or not self.synth_eligible)
+                bank, ids, groups, eligible = (
+                    (self.cached_bass, self.bass_ids, self.bass_groups, self.bass_eligible) if use_bass else
+                    (self.cached_synths, self.synth_ids, self.synth_groups, self.synth_eligible))
+                t_idx = random.choice(eligible)
+                stem = int(ids[t_idx])
+                c_idx = random.choice([i for i in groups[stem] if i != t_idx])
+                target = np.array(bank[t_idx], dtype=np.float32, copy=True)
+                cue = loudest_window(np.asarray(bank[c_idx], dtype=np.float32), self.cue_samples)
             else:
-                target_clean = np.zeros(self.clip_samples, dtype=np.float32)
-        else:
-            if self.bass_stems and (random.random() < 0.7):
-                stem_path = random.choice(self.bass_stems)
-            elif self.other_synths:
-                stem_path = random.choice(self.other_synths)
-            else:
-                stem_path = random.choice(self.kicks) if self.kicks else None
-            
-            target_clean = self._random_crop(stem_path) if stem_path else np.zeros(self.clip_samples, dtype=np.float32)
+                pool = self.bass_stems if (self.bass_stems and random.random() < 0.7) else self.other_synths
+                if not pool:
+                    raise RuntimeError("No bass or synth stems found for the V8 dataset.")
+                path = random.choice(pool)
+                target, start = self._random_crop(path)
+                if target is None:
+                    continue
+                cue, _ = self._random_crop(path, avoid=(start, start + self.clip_samples), length=self.cue_samples)
+                if cue is None:
+                    continue
+                stem = None
+            if _rms(target) > SILENCE_RMS and _rms(cue) > SILENCE_RMS:
+                return target, cue, True, stem
+        raise RuntimeError(f"No audible target with a disjoint cue in {MAX_DRAWS} draws.")
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        # 1. Target selection, with a positive cue that does not overlap the target window
+        target_clean, cue_pos, cue_disjoint, target_stem = self._target_and_cue()
 
         # 2. Apply Live Pedalboard FX to target in mix
         target_in_mix = self._apply_live_fx(target_clean)
@@ -223,23 +307,26 @@ class MusicalDatasetV8(Dataset):
             else:
                 drum_stem = np.zeros(self.clip_samples, dtype=np.float32)
 
+            acc_stem = np.zeros(self.clip_samples, dtype=np.float32)
             if random.random() < 0.6 and len(self.cached_synths) > 0:
-                acc_stem = self.cached_synths[random.randint(0, len(self.cached_synths) - 1)].copy()
-            else:
-                acc_stem = np.zeros(self.clip_samples, dtype=np.float32)
+                a_idx = random.randint(0, len(self.cached_synths) - 1)
+                if target_stem is None or int(self.synth_ids[a_idx]) != target_stem:
+                    acc_stem = self.cached_synths[a_idx].copy()
         else:
             # Drum stem
+            drum_stem = None
             if self.drums and (random.random() < 0.6):
-                drum_stem = self._random_crop(random.choice(self.drums))
+                drum_stem, _ = self._random_crop(random.choice(self.drums))
             elif self.kicks:
-                drum_stem = self._random_crop(random.choice(self.kicks))
-            else:
+                drum_stem, _ = self._random_crop(random.choice(self.kicks))
+            if drum_stem is None:
                 drum_stem = np.zeros(self.clip_samples, dtype=np.float32)
 
             # Melodic accompaniment
+            acc_stem = None
             if self.other_synths and (random.random() < 0.6):
-                acc_stem = self._random_crop(random.choice(self.other_synths))
-            else:
+                acc_stem, _ = self._random_crop(random.choice(self.other_synths))
+            if acc_stem is None:
                 acc_stem = np.zeros(self.clip_samples, dtype=np.float32)
 
         # 4. Mixing at target SNR
@@ -255,30 +342,32 @@ class MusicalDatasetV8(Dataset):
         scaled_noise = noise_stem * desired_scale
         mixture = target_in_mix + scaled_noise
 
-        # Peak normalization
+        # Peak normalization (the cue keeps the target's scale)
         max_val = max(1.0, float(np.abs(mixture).max()))
         mixture = mixture / max_val
         target_clean = target_clean / max_val
+        cue_pos = cue_pos / max_val
 
-        # 5. Positive Audio Cue (1.0s slice of clean target)
-        cue_start = random.randint(0, max(0, self.clip_samples - self.cue_samples))
-        cue_pos = target_clean[cue_start : cue_start + self.cue_samples]
-
-        # 6. Negative Audio Cue (mismatched)
+        # 5. Negative Audio Cue (mismatched)
         if self.use_cache and len(self.cached_synths) > 0:
-            cue_neg = self.cached_synths[random.randint(0, len(self.cached_synths) - 1)][:self.cue_samples].copy()
+            n_idx = random.randint(0, len(self.cached_synths) - 1)
+            if target_stem is not None and int(self.synth_ids[n_idx]) == target_stem and len(self.cached_synths) > 1:
+                n_idx = (n_idx + 1) % len(self.cached_synths)
+            cue_neg = self.cached_synths[n_idx][:self.cue_samples].copy()
         elif self.other_synths:
-            neg_path = random.choice(self.other_synths)
-            cue_neg = self._random_crop(neg_path)[:self.cue_samples]
+            cue_neg, _ = self._random_crop(random.choice(self.other_synths), length=self.cue_samples)
+            if cue_neg is None:
+                cue_neg = np.zeros(self.cue_samples, dtype=np.float32)
         else:
             cue_neg = np.zeros(self.cue_samples, dtype=np.float32)
 
         return {
-            "mix": torch.from_numpy(mixture).float().unsqueeze(0),
-            "target": torch.from_numpy(target_clean).float().unsqueeze(0),
-            "cue_pos": torch.from_numpy(cue_pos).float().unsqueeze(0),
-            "cue_neg": torch.from_numpy(cue_neg).float().unsqueeze(0),
+            "mix": torch.from_numpy(np.asarray(mixture, dtype=np.float32)).unsqueeze(0),
+            "target": torch.from_numpy(np.asarray(target_clean, dtype=np.float32)).unsqueeze(0),
+            "cue_pos": torch.from_numpy(np.asarray(cue_pos, dtype=np.float32)).unsqueeze(0),
+            "cue_neg": torch.from_numpy(np.asarray(cue_neg, dtype=np.float32)).unsqueeze(0),
             "snr_db": torch.tensor(snr_db, dtype=torch.float32),
+            "cue_disjoint": torch.tensor(cue_disjoint),
         }
 
 

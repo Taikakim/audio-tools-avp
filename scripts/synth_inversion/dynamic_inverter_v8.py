@@ -140,6 +140,13 @@ def curvature_smoothness_loss(pred_dynamic: torch.Tensor) -> torch.Tensor:
     return torch.mean(diff2 ** 2)
 
 
+# The four lane parameters are predicted by the dynamic head; their static entries are left out of the static loss
+# (KUANG 2026-10-29: before, those targets held bank values the render never used).
+LANE_PARAM_NAMES = ("cutoff", "resonance", "drive", "fm_depth")
+STATIC_LOSS_MASK = torch.ones(S6.NUM_PARAMS)
+STATIC_LOSS_MASK[[S6.PARAM_INDEX[n] for n in LANE_PARAM_NAMES]] = 0.0
+
+
 def dynamic_inverter_loss(
     pred_static: torch.Tensor,
     true_static: torch.Tensor,
@@ -147,10 +154,19 @@ def dynamic_inverter_loss(
     true_dynamic: torch.Tensor,
     lambda_smooth: float = 0.5,
     lambda_dynamic: float = 2.0,
+    lane_active: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Calculates multi-task static + dynamic parameter loss with Occam curvature penalty."""
-    static_loss = F.mse_loss(pred_static, true_static)
-    dynamic_loss = F.mse_loss(pred_dynamic, true_dynamic)
+    """Calculates multi-task static + dynamic parameter loss with Occam curvature penalty.
+
+    lane_active: [B, 4] bool, lanes the patch can hear (drive needs a waveshaper, FM depth an FM routing). Inactive
+    lanes carry no target; the static loss skips the lane parameters (STATIC_LOSS_MASK).
+    """
+    w_static = STATIC_LOSS_MASK.to(pred_static.device, pred_static.dtype)
+    static_loss = (((pred_static - true_static) ** 2) * w_static).sum(-1).mean() / w_static.sum()
+    if lane_active is None:
+        lane_active = torch.ones(pred_dynamic.shape[:2], dtype=torch.bool, device=pred_dynamic.device)
+    w_dyn = lane_active.to(pred_dynamic.dtype).unsqueeze(-1).expand_as(pred_dynamic)
+    dynamic_loss = (((pred_dynamic - true_dynamic) ** 2) * w_dyn).sum() / w_dyn.sum().clamp_min(1.0)
     smooth_loss = curvature_smoothness_loss(pred_dynamic)
 
     total_loss = static_loss + lambda_dynamic * dynamic_loss + lambda_smooth * smooth_loss

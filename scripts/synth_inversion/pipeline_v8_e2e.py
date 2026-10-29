@@ -11,6 +11,11 @@ Demonstrates the complete Deep V8 inverted-audio pipeline:
    - 4 dynamic automation curves at 10.76 Hz (Cutoff CC 74, Resonance CC 71, Drive CC 1, FM Depth CC 11).
 5. DAW Export Bundle (Phase 3): Generates native Steinberg .vstpreset container + .mid automation track.
 6. Re-synthesis: Renders the inverted patch + automation in Surge XT to verify acoustic match.
+
+KUANG 2026-10-29 (docs/synth-v8-code-review-2026-10-29.md, M7): the mel uses the training settings
+(ExactGpuMel defaults: n_fft 1024, hop 441; it was n_fft 2048), the test patch sets its note and filter through
+the v6 vector, and the 1.0 s cue is the same patch rendered at another note, not a slice of the target.
+A single demo: it shows the pipeline runs, it is not a measurement.
 """
 
 import argparse
@@ -34,7 +39,7 @@ from dynamic_inverter_v8 import DynamicParameterInverterV8
 from daw_export_v8 import export_v8_daw_bundle
 import surge_spec_v5 as S5
 import surge_spec_v6 as S6
-from dynamic_dataset_v8 import render_dynamic_patch
+from dynamic_dataset_v8 import render_dynamic_patch, rendered_static_vector
 
 GUARD_SCRIPT = "/home/kim/Projects/SAO/Misc/gpu_guard.sh"
 
@@ -82,21 +87,21 @@ def run_e2e_pipeline(device: str = "cuda", out_dir: str = "/home/kim/sao_runs/v8
     # 3. Create a Realistic Polyphonic Test Mixture
     print("\nSynthesizing realistic test phrase (Lead Synth with dynamic cutoff sweep)...")
     plugin = pedalboard.load_plugin(os.path.expanduser(S5.DEFAULT_PLUGIN_PATH))
-    mel_fn = ExactGpuMel(sample_rate=44100, n_mels=128, n_fft=2048, hop_length=441)
+    mel_fn = ExactGpuMel(device="cpu")  # the settings the Phase 2 caches were built with
 
-    # True synth patch
-    true_static = np.full(59, 0.5, dtype=np.float32)
-    true_static[0] = 0.0606  # Filter LP 24
-    true_patch = S5.vector_to_patch(S6.to_v5(true_static))
-    true_patch["filter_idx"] = 1
-    true_patch["filter_balance"] = 0.0
-
-    # Dynamic sweep: rising filter cutoff across 4.0s
+    # Dynamic sweep: rising filter cutoff across 4.0s (lanes in v6 vector units)
     t = np.linspace(0.15, 0.85, 43, dtype=np.float32)
     cutoff_lane = t
     res_lane = np.full(43, 0.45, dtype=np.float32)
     drive_lane = np.linspace(0.1, 0.5, 43, dtype=np.float32)
     fm_lane = np.full(43, 0.0, dtype=np.float32)
+    lanes = np.stack([cutoff_lane, res_lane, drive_lane, fm_lane])
+
+    # True synth patch: a neutral test vector at MIDI note 38 with filter 1 = LP 24 dB (LP_FILTERS index 1)
+    true_static = np.full(59, 0.5, dtype=np.float32)
+    true_static[S6.PARAM_INDEX["midi_note"]] = (38 - S6.NOTE_LOW) / (S6.NOTE_HIGH - S6.NOTE_LOW)
+    true_static = rendered_static_vector(true_static, 1, lanes)
+    true_patch = S6.vector_to_patch(true_static)
 
     target_synth_wav = render_dynamic_patch(
         plugin, true_patch, 38, cutoff_lane, res_lane, drive_lane, fm_lane
@@ -122,9 +127,11 @@ def run_e2e_pipeline(device: str = "cuda", out_dir: str = "/home/kim/sao_runs/v8
     if mix_peak > 1e-4:
         mix_wav = mix_wav / max(1.0, mix_peak)
 
-    # Cue: 0.5s from target synth
-    cue_samples = int(44100 * 0.5)
-    cue_wav = target_synth_wav[:cue_samples]
+    # Cue: 1.0 s of the same patch at another note with the lanes held at their means (as in training, the cue
+    # never contains the audio being extracted)
+    cue_samples = 44100
+    flat = [np.full(43, float(l.mean()), dtype=np.float32) for l in lanes]
+    cue_wav = render_dynamic_patch(plugin, true_patch, 43, *flat)[:cue_samples]
 
     print(f"Phrase generated: 4.0s mixture (Peak={mix_peak:.3f}), cue length={len(cue_wav)} samples.")
 
@@ -173,7 +180,7 @@ def run_e2e_pipeline(device: str = "cuda", out_dir: str = "/home/kim/sao_runs/v8
 
     # 7. Re-Synthesis & Verification
     print("\nStep 4: Re-Synthesizing from Inverted Patch & Automation...")
-    pred_patch = S5.vector_to_patch(S6.to_v5(pred_static_np))
+    pred_patch = S6.vector_to_patch(pred_static_np)
     resynth_wav = render_dynamic_patch(
         plugin, pred_patch, 38,
         pred_dynamic_np[0], pred_dynamic_np[1], pred_dynamic_np[2], pred_dynamic_np[3]

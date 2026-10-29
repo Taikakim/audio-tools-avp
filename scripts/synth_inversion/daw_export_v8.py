@@ -9,6 +9,10 @@ or Reaper with full parametric control and 10 Hz automation lanes:
 - CC 71: Filter 1 Resonance
 - CC 1:  Waveshaper Drive (Mod Wheel)
 - CC 11: FM Depth (Expression)
+
+KUANG 2026-10-29: lanes arrive in v6 vector units (dynamic_dataset_v8) and are converted to Surge raw values
+(lane_to_raw: drive raw = 0.5 + 0.5 * drive) for the plugin and for the CC curves, so a CC that is MIDI-learned
+to the parameter reproduces the lane. Surge does not map these CCs by itself; the manifest says so.
 """
 
 import json
@@ -26,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from audio_utils import save_patch
 import surge_spec_v5 as S5
 import surge_spec_v6 as S6
+from dynamic_dataset_v8 import LANE_PLUGIN_PARAMS, lane_to_raw
 
 
 CC_MAPPING = {
@@ -46,7 +51,7 @@ def create_daw_automation_midi(
     """Creates a MIDI file containing notes and 10.76 Hz CC automation curves.
 
     Args:
-        dynamic_lanes: [4, 43] float array in [0.0, 1.0] for the 4 automation lanes.
+        dynamic_lanes: [4, 43] float array of Surge raw values in [0.0, 1.0] for the 4 automation lanes.
         notes: list of (midi_note, velocity, start_time_s, duration_s).
                If None, defaults to 16th-note phrase across 4.0s.
         bpm: Project tempo.
@@ -126,7 +131,7 @@ def export_v8_daw_bundle(
     Args:
         plugin: Pedalboard Surge XT plugin instance.
         static_params: 59-dim static parameter vector.
-        dynamic_lanes: [4, 43] dynamic parameter trajectory.
+        dynamic_lanes: [4, 43] dynamic parameter trajectory in v6 vector units.
         output_stem: Base path for generated files (without extension).
         notes: Optional note list.
         bpm: Tempo for MIDI export.
@@ -152,11 +157,10 @@ def export_v8_daw_bundle(
     patch = S6.vector_to_patch(static_params)
     S5.apply_patch(plugin, patch)
 
-    # Initial frame sets the default starting position for automated lanes
-    plugin.parameters["a_filter_1_cutoff"].raw_value = float(dynamic_lanes[0, 0])
-    plugin.parameters["a_filter_1_resonance"].raw_value = float(dynamic_lanes[1, 0])
-    plugin.parameters["a_waveshaper_drive"].raw_value = float(dynamic_lanes[2, 0])
-    plugin.parameters["a_fm_depth"].raw_value = float(dynamic_lanes[3, 0])
+    # Initial frame sets the default starting position for automated lanes (Surge raw values)
+    raw_lanes = np.stack([lane_to_raw(k, dynamic_lanes[k]) for k in range(len(LANE_PLUGIN_PARAMS))])
+    for k, name in enumerate(LANE_PLUGIN_PARAMS):
+        plugin.parameters[name].raw_value = float(raw_lanes[k, 0])
 
     # 2. Export Presets (.fxp, .vstpreset, .pedalboard_state, .json)
     extra_meta = {
@@ -175,7 +179,7 @@ def export_v8_daw_bundle(
     save_patch(plugin, patch, str(output_stem), extra=extra_meta, copy_to_user_dir=copy_to_user_dir)
 
     # 3. Export MIDI CC Automation (.mid)
-    midi_file = create_daw_automation_midi(dynamic_lanes, notes=notes, bpm=bpm)
+    midi_file = create_daw_automation_midi(raw_lanes, notes=notes, bpm=bpm)
     midi_path = f"{output_stem}_automation.mid"
     midi_file.save(midi_path)
 
@@ -191,8 +195,10 @@ def export_v8_daw_bundle(
         "instructions": (
             "1. In your DAW (Bitwig/Ableton/FL/Reaper), load Surge XT onto an instrument track.\n"
             "2. Load the exported preset (.fxp or .vstpreset).\n"
-            "3. Import the automation MIDI track. Route CC 74 -> Filter Cutoff, CC 71 -> Resonance, "
-            "CC 1 -> Drive, CC 11 -> FM Depth."
+            "3. Surge does not map these CCs by itself. MIDI-learn each parameter first (right-click the "
+            "control > MIDI Learn, then send the CC): CC 74 -> Filter 1 Cutoff, CC 71 -> Filter 1 Resonance, "
+            "CC 1 -> Waveshaper Drive, CC 11 -> FM Depth. CC 1 is also Surge's mod wheel source.\n"
+            "4. Import the automation MIDI track."
         ),
     }
     with open(manifest_path, "w") as f:

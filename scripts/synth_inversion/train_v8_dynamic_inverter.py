@@ -7,6 +7,9 @@ Trains DynamicParameterInverterV8 to simultaneously predict:
 2. 4 dynamic automation lanes (Cutoff, Resonance, Drive, FM Depth) at 10.76 Hz (43 frames).
 3. Enforces second-order curvature penalty to prevent high-frequency chatter.
 4. Manages GPU lock via gpu_guard.sh.
+
+KUANG 2026-10-29: lanes the patch cannot hear are masked (lane_active), and the cache and output default to new
+*_v2 directories so runs on the pre-fix renders are not overwritten.
 """
 
 import argparse
@@ -51,7 +54,7 @@ def run_training(args):
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cache_dir = Path("/home/kim/sao_runs/v8_dynamic_cache")
+    cache_dir = Path(args.cache_dir)
     train_cache = cache_dir / "dynamic_train.npz"
     val_cache = cache_dir / "dynamic_val.npz"
 
@@ -67,6 +70,9 @@ def run_training(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
 
     print(f"Datasets loaded: {len(train_ds)} train, {len(val_ds)} val samples.")
+    if not train_ds.fixed_renderer:
+        print("Warning: this cache was rendered before the renderer fix (synth reset every 93 ms chunk, stale "
+              "static targets). Rebuild it with dynamic_dataset_v8.py.", file=sys.stderr)
 
     # Model & Optimizer
     model = DynamicParameterInverterV8().to(device)
@@ -89,6 +95,7 @@ def run_training(args):
             mel = batch["mel"].to(device, non_blocking=True)
             t_static = batch["target_static"].to(device, non_blocking=True)
             t_dyn = batch["target_dynamic"].to(device, non_blocking=True)
+            t_active = batch["lane_active"].to(device, non_blocking=True)
 
             optimizer.zero_grad()
             with torch.amp.autocast("cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
@@ -97,6 +104,7 @@ def run_training(args):
                     p_static, t_static, p_dyn, t_dyn,
                     lambda_smooth=args.lambda_smooth,
                     lambda_dynamic=args.lambda_dynamic,
+                    lane_active=t_active,
                 )
 
             loss.backward()
@@ -122,6 +130,7 @@ def run_training(args):
                 v_mel = v_batch["mel"].to(device)
                 v_static = v_batch["target_static"].to(device)
                 v_dyn = v_batch["target_dynamic"].to(device)
+                v_active = v_batch["lane_active"].to(device)
 
                 with torch.amp.autocast("cuda" if "cuda" in device else "cpu", dtype=torch.bfloat16):
                     vp_static, vp_dyn = model(v_mel)
@@ -129,6 +138,7 @@ def run_training(args):
                         vp_static, v_static, vp_dyn, v_dyn,
                         lambda_smooth=args.lambda_smooth,
                         lambda_dynamic=args.lambda_dynamic,
+                        lane_active=v_active,
                     )
                 val_loss += v_m["loss_total"]
                 val_static_loss += v_m["loss_static"]
@@ -169,7 +179,8 @@ def main():
     parser.add_argument("--lambda-smooth", type=float, default=0.5, help="Curvature smoothness loss weight")
     parser.add_argument("--lambda-dynamic", type=float, default=2.0, help="Dynamic lane loss weight")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output-dir", type=str, default="/home/kim/sao_runs/v8_phase2_inverter")
+    parser.add_argument("--output-dir", type=str, default="/home/kim/sao_runs/v8_phase2_inverter_v2")
+    parser.add_argument("--cache-dir", type=str, default="/home/kim/sao_runs/v8_dynamic_cache_v2")
     parser.add_argument("--wait-gpu", action="store_true", help="Wait on GPU lock if busy")
     args = parser.parse_args()
 
