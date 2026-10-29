@@ -114,6 +114,8 @@ class DynamicParameterInverterV8(nn.Module):
             pred_dynamic: [B, 4, 43] dynamic automation curves
         """
         # Feature extraction
+        if mel.ndim == 4:
+            mel = mel.squeeze(1)
         h = self.front(mel)
         h = self.backbone(h)
         seq_features = self.pool_to_grid(h)  # [B, hidden_dim, 43]

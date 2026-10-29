@@ -14,7 +14,9 @@ Evaluates the trained DynamicParameterInverterV8 on held-out dynamic sweeps:
 
 import json
 import os
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -28,9 +30,22 @@ from dynamic_dataset_v8 import DynamicSweepDataset
 from dynamic_inverter_v8 import DynamicParameterInverterV8, curvature_smoothness_loss
 import surge_spec_v6 as S6
 
+GUARD_SCRIPT = "/home/kim/Projects/SAO/Misc/gpu_guard.sh"
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+def acquire_gpu_guard() -> bool:
+    pid = str(os.getpid())
+    env = os.environ.copy()
+    env["TARGET_GPU"] = "0"
+    res = subprocess.run(["bash", GUARD_SCRIPT, "acquire", "ANTIGRAVITY", pid], env=env)
+    return res.returncode == 0
+
+
+def release_gpu_guard():
+    subprocess.run(["bash", GUARD_SCRIPT, "release", "ANTIGRAVITY"])
+
+
+def run_eval(device: str):
     print("=" * 80)
     print("V8 Phase 2: Dynamic Inverter Evaluation & Trajectory Correlation Gate")
     print(f"Device: {device}")
@@ -148,6 +163,19 @@ def main():
             indent=2,
         )
     print(f"Saved results to {out_file}")
+
+
+def main():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if "cuda" in device:
+        if not acquire_gpu_guard():
+            print("GPU is currently busy. Exiting.", file=sys.stderr)
+            sys.exit(0)
+    try:
+        run_eval(device)
+    finally:
+        if "cuda" in device:
+            release_gpu_guard()
 
 
 if __name__ == "__main__":
