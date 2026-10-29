@@ -112,12 +112,14 @@ class MusicalDatasetV8(Dataset):
         # 3. Check fast NVMe stem cache
         cache_dir = Path("/home/kim/sao_runs/v8_stem_cache")
         self.use_cache = False
-        if cache_dir.exists() and (cache_dir / "kicks.npy").exists() and self.split == "train":
+        prefix = "val_" if self.split == "val" else ""
+        kick_file = cache_dir / f"{prefix}kicks.npy"
+        if cache_dir.exists() and kick_file.exists():
             try:
-                self.cached_kicks = np.load(cache_dir / "kicks.npy", mmap_mode="r")
-                self.cached_drums = np.load(cache_dir / "drums.npy", mmap_mode="r")
-                self.cached_bass = np.load(cache_dir / "bass.npy", mmap_mode="r")
-                self.cached_synths = np.load(cache_dir / "synths.npy", mmap_mode="r")
+                self.cached_kicks = np.load(kick_file, mmap_mode="r")
+                self.cached_drums = np.load(cache_dir / f"{prefix}drums.npy", mmap_mode="r")
+                self.cached_bass = np.load(cache_dir / f"{prefix}bass.npy", mmap_mode="r")
+                self.cached_synths = np.load(cache_dir / f"{prefix}synths.npy", mmap_mode="r")
                 self.use_cache = True
             except Exception:
                 self.use_cache = False
