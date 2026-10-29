@@ -109,6 +109,19 @@ class MusicalDatasetV8(Dataset):
                 self.has_bank_v6 = True
                 self.num_bank_patches = len(self.bank_audio)
 
+        # 3. Check fast NVMe stem cache
+        cache_dir = Path("/home/kim/sao_runs/v8_stem_cache")
+        self.use_cache = False
+        if cache_dir.exists() and (cache_dir / "kicks.npy").exists() and self.split == "train":
+            try:
+                self.cached_kicks = np.load(cache_dir / "kicks.npy", mmap_mode="r")
+                self.cached_drums = np.load(cache_dir / "drums.npy", mmap_mode="r")
+                self.cached_bass = np.load(cache_dir / "bass.npy", mmap_mode="r")
+                self.cached_synths = np.load(cache_dir / "synths.npy", mmap_mode="r")
+                self.use_cache = True
+            except Exception:
+                self.use_cache = False
+
     def _random_crop(self, path: Path) -> np.ndarray:
         """Reads a random 4.0s mono slice from an audio file."""
         try:
@@ -175,9 +188,17 @@ class MusicalDatasetV8(Dataset):
         if is_surge:
             patch_idx = random.randint(0, self.num_bank_patches - 1)
             raw_audio = self.bank_audio[patch_idx].astype(np.float32) / 32768.0  # 35280 samples (0.8s)
-            # Repeat to 4.0s
             repeats = (self.clip_samples // len(raw_audio)) + 1
             target_clean = np.tile(raw_audio, repeats)[:self.clip_samples]
+        elif self.use_cache:
+            if random.random() < 0.7 and len(self.cached_bass) > 0:
+                idx_b = random.randint(0, len(self.cached_bass) - 1)
+                target_clean = self.cached_bass[idx_b].copy()
+            elif len(self.cached_synths) > 0:
+                idx_s = random.randint(0, len(self.cached_synths) - 1)
+                target_clean = self.cached_synths[idx_s].copy()
+            else:
+                target_clean = np.zeros(self.clip_samples, dtype=np.float32)
         else:
             if self.bass_stems and (random.random() < 0.7):
                 stem_path = random.choice(self.bass_stems)
@@ -192,19 +213,32 @@ class MusicalDatasetV8(Dataset):
         target_in_mix = self._apply_live_fx(target_clean)
 
         # 3. Backing Arrangement
-        # Drum stem
-        if self.drums and (random.random() < 0.6):
-            drum_stem = self._random_crop(random.choice(self.drums))
-        elif self.kicks:
-            drum_stem = self._random_crop(random.choice(self.kicks))
-        else:
-            drum_stem = np.zeros(self.clip_samples, dtype=np.float32)
+        if self.use_cache:
+            if random.random() < 0.6 and len(self.cached_drums) > 0:
+                drum_stem = self.cached_drums[random.randint(0, len(self.cached_drums) - 1)].copy()
+            elif len(self.cached_kicks) > 0:
+                drum_stem = self.cached_kicks[random.randint(0, len(self.cached_kicks) - 1)].copy()
+            else:
+                drum_stem = np.zeros(self.clip_samples, dtype=np.float32)
 
-        # Melodic accompaniment
-        if self.other_synths and (random.random() < 0.6):
-            acc_stem = self._random_crop(random.choice(self.other_synths))
+            if random.random() < 0.6 and len(self.cached_synths) > 0:
+                acc_stem = self.cached_synths[random.randint(0, len(self.cached_synths) - 1)].copy()
+            else:
+                acc_stem = np.zeros(self.clip_samples, dtype=np.float32)
         else:
-            acc_stem = np.zeros(self.clip_samples, dtype=np.float32)
+            # Drum stem
+            if self.drums and (random.random() < 0.6):
+                drum_stem = self._random_crop(random.choice(self.drums))
+            elif self.kicks:
+                drum_stem = self._random_crop(random.choice(self.kicks))
+            else:
+                drum_stem = np.zeros(self.clip_samples, dtype=np.float32)
+
+            # Melodic accompaniment
+            if self.other_synths and (random.random() < 0.6):
+                acc_stem = self._random_crop(random.choice(self.other_synths))
+            else:
+                acc_stem = np.zeros(self.clip_samples, dtype=np.float32)
 
         # 4. Mixing at target SNR
         snr_db = random.uniform(-6.0, 6.0)
@@ -229,7 +263,9 @@ class MusicalDatasetV8(Dataset):
         cue_pos = target_clean[cue_start : cue_start + self.cue_samples]
 
         # 6. Negative Audio Cue (mismatched)
-        if self.other_synths:
+        if self.use_cache and len(self.cached_synths) > 0:
+            cue_neg = self.cached_synths[random.randint(0, len(self.cached_synths) - 1)][:self.cue_samples].copy()
+        elif self.other_synths:
             neg_path = random.choice(self.other_synths)
             cue_neg = self._random_crop(neg_path)[:self.cue_samples]
         else:

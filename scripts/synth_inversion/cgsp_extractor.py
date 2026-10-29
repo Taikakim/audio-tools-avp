@@ -9,6 +9,7 @@ mixtures without intermediate source separation artifacts.
 """
 
 import math
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -19,6 +20,8 @@ try:
     import laion_clap
 except ImportError:
     laion_clap = None
+
+DEFAULT_CLAP_CKPT = "/home/kim/Projects/SAO/stable-audio-tools/sat-venv/lib/python3.10/site-packages/laion_clap/630k-audioset-best.pt"
 
 
 class LoRALinear(nn.Module):
@@ -36,8 +39,10 @@ class LoRALinear(nn.Module):
         self.alpha = alpha
         self.scaling = alpha / rank
 
-        self.lora_A = nn.Linear(self.in_features, rank, bias=False)
-        self.lora_B = nn.Linear(rank, self.out_features, bias=False)
+        dev = original_linear.weight.device
+        dtype = original_linear.weight.dtype
+        self.lora_A = nn.Linear(self.in_features, rank, bias=False, device=dev, dtype=dtype)
+        self.lora_B = nn.Linear(rank, self.out_features, bias=False, device=dev, dtype=dtype)
 
         # Zero-init B, Kaiming-init A
         nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
@@ -162,7 +167,8 @@ class PointAndPlayExtractor(nn.Module):
     def __init__(
         self,
         clap_module: Optional[nn.Module] = None,
-        token_dim: int = 1024,
+        clap_ckpt: Optional[str] = DEFAULT_CLAP_CKPT,
+        token_dim: int = 768,
         cue_dim: int = 512,
         proj_dim: int = 256,
         lora_rank: int = 8,
@@ -177,7 +183,17 @@ class PointAndPlayExtractor(nn.Module):
         if clap_module is None:
             if laion_clap is None:
                 raise ImportError("laion_clap is required to instantiate PointAndPlayExtractor")
-            self.clap = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-base")
+            self.clap = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-tiny", device=self.device)
+            if clap_ckpt and os.path.exists(clap_ckpt):
+                orig_load = torch.load
+                try:
+                    torch.load = lambda *a, **k: orig_load(*a, **{**k, "weights_only": False})
+                    from laion_clap.clap_module.factory import load_state_dict
+                    sd = load_state_dict(clap_ckpt)
+                    self.clap.model.load_state_dict(sd, strict=False)
+                    print(f"Loaded pretrained CLAP weights from {clap_ckpt}")
+                finally:
+                    torch.load = orig_load
         else:
             self.clap = clap_module
 
@@ -200,6 +216,7 @@ class PointAndPlayExtractor(nn.Module):
             proj_dim=proj_dim,
             hidden_dim=cue_dim,
         )
+        self.to(self.device)
 
     def encode_mixture(self, mix_wav: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encodes mixture waveform to frame tokens H and global normalized code g.

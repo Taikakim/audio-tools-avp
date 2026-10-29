@@ -17,8 +17,10 @@ import fcntl
 import math
 import os
 import sys
+import subprocess
 import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -214,6 +216,27 @@ class MultiResolutionSTFTLoss(nn.Module):
 # Training Harness with GPU Lock Management
 # ==============================================================================
 
+GUARD_SCRIPT = "/home/kim/Projects/SAO/Misc/gpu_guard.sh"
+
+
+def acquire_gpu_guard(wait: bool = False) -> bool:
+    pid = str(os.getpid())
+    env = os.environ.copy()
+    env["TARGET_GPU"] = "0"
+    while True:
+        res = subprocess.run(["bash", GUARD_SCRIPT, "acquire", "ANTIGRAVITY", pid], env=env)
+        if res.returncode == 0:
+            return True
+        if not wait:
+            return False
+        print("GPU busy. Waiting 15s before retry...")
+        time.sleep(15)
+
+
+def release_gpu_guard():
+    subprocess.run(["bash", GUARD_SCRIPT, "release", "ANTIGRAVITY"])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train V8 Asymmetric Target Sound Extractor")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs")
@@ -221,7 +244,7 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output-dir", type=str, default="/home/kim/sao_runs/v8_phase1_tse")
-    parser.add_argument("--wait-gpu", action="store_true", help="Wait on /tmp/gpu.lock until GPU becomes free")
+    parser.add_argument("--wait-gpu", action="store_true", help="Wait on GPU lock until GPU becomes free")
     args = parser.parse_args()
 
     print("=" * 80)
@@ -229,20 +252,11 @@ def main():
     print(f"Device: {args.device} | Epochs: {args.epochs} | Batch Size: {args.batch_size}")
     print("=" * 80)
 
-    # 1. Acquire GPU Lock if on CUDA
-    lock_file = "/tmp/gpu.lock"
-    lock_fd = None
+    # 1. Acquire GPU Guard if on CUDA
     if "cuda" in args.device:
-        print(f"Checking GPU lock at {lock_file}...")
-        lock_fd = open(lock_file, "w")
-        flags = fcntl.LOCK_EX
-        if not args.wait_gpu:
-            flags |= fcntl.LOCK_NB
-        try:
-            fcntl.flock(lock_fd, flags)
-            print("Successfully acquired GPU lock (/tmp/gpu.lock)!")
-        except BlockingIOError:
-            print("GPU is currently busy (held by another process). Pass --wait-gpu to queue.")
+        print("Checking GPU availability via gpu_guard.sh...")
+        if not acquire_gpu_guard(wait=args.wait_gpu):
+            print("GPU is currently busy. Refusing to start without --wait-gpu.")
             sys.exit(0)
 
     try:
@@ -277,56 +291,84 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
-        print("Starting training loop...")
+        print("Starting training loop with bfloat16 AMP...")
+
+        best_val_loss = float("inf")
 
         for epoch in range(1, args.epochs + 1):
             model.train()
-            total_loss = 0.0
+            train_loss = 0.0
             start_t = time.time()
 
             for step, batch in enumerate(train_loader):
-                mix = batch["mix"].to(args.device)
-                target = batch["target"].to(args.device)
-                cue = batch["cue_pos"].to(args.device)
+                mix = batch["mix"].to(args.device, non_blocking=True)
+                target = batch["target"].to(args.device, non_blocking=True)
+                cue = batch["cue_pos"].to(args.device, non_blocking=True)
 
                 optimizer.zero_grad()
-                pred_wav, rel_mask = model(mix, cue)
 
-                # Audio reconstruction loss
-                l1_loss = F.l1_loss(pred_wav, target)
-                mr_loss = stft_loss_fn(pred_wav, target)
-                audio_loss = l1_loss + mr_loss
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16 if "cuda" in args.device else torch.float32):
+                    pred_wav, rel_mask = model(mix, cue)
 
-                # Reliability mask supervision (Target-to-Interference Ratio)
-                with torch.no_grad():
-                    window = torch.hann_window(model.n_fft, device=mix.device)
-                    t_stft = torch.abs(torch.stft(target.squeeze(1), n_fft=model.n_fft, hop_length=model.hop_length, window=window, return_complex=True))
-                    m_stft = torch.abs(torch.stft(mix.squeeze(1), n_fft=model.n_fft, hop_length=model.hop_length, window=window, return_complex=True))
-                    tir_target = (t_stft / (m_stft + 1e-6)).clamp(0.0, 1.0)
-                mask_loss = F.mse_loss(rel_mask, tir_target)
+                    # Audio reconstruction loss
+                    l1_loss = F.l1_loss(pred_wav, target)
+                    mr_loss = stft_loss_fn(pred_wav, target)
+                    audio_loss = l1_loss + mr_loss
 
-                loss = audio_loss + 0.5 * mask_loss
+                    # Reliability mask supervision (Target-to-Interference Ratio)
+                    with torch.no_grad():
+                        window = torch.hann_window(model.n_fft, device=mix.device)
+                        t_stft = torch.abs(torch.stft(target.squeeze(1), n_fft=model.n_fft, hop_length=model.hop_length, window=window, return_complex=True))
+                        m_stft = torch.abs(torch.stft(mix.squeeze(1), n_fft=model.n_fft, hop_length=model.hop_length, window=window, return_complex=True))
+                        tir_target = (t_stft / (m_stft + 1e-6)).clamp(0.0, 1.0)
+                    mask_loss = F.mse_loss(rel_mask, tir_target)
+
+                    loss = audio_loss + 0.5 * mask_loss
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
 
-                total_loss += loss.item()
+                train_loss += loss.item()
                 if (step + 1) % 50 == 0:
                     print(f"Epoch {epoch:02d} [{step+1:04d}/{len(train_loader)}] | Loss: {loss.item():.4f} (L1: {l1_loss.item():.4f}, MR: {mr_loss.item():.4f}, Mask: {mask_loss.item():.4f})")
 
             epoch_dur = time.time() - start_t
-            print(f"--> Epoch {epoch:02d} complete in {epoch_dur:.1f}s | Mean Loss: {total_loss/len(train_loader):.4f}")
+            mean_train_loss = train_loss / len(train_loader)
+            print(f"--> Epoch {epoch:02d} complete in {epoch_dur:.1f}s | Train Loss: {mean_train_loss:.4f}")
 
-            # Save checkpoint
+            # Validation Loop
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for v_batch in val_loader:
+                    v_mix = v_batch["mix"].to(args.device)
+                    v_target = v_batch["target"].to(args.device)
+                    v_cue = v_batch["cue_pos"].to(args.device)
+
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16 if "cuda" in args.device else torch.float32):
+                        v_pred, v_rel = model(v_mix, v_cue)
+                        v_l1 = F.l1_loss(v_pred, v_target)
+                        v_mr = stft_loss_fn(v_pred, v_target)
+                        v_loss = v_l1 + v_mr
+                    val_loss += v_loss.item()
+
+            mean_val_loss = val_loss / len(val_loader)
+            print(f"    Validation Loss: {mean_val_loss:.4f}")
+
+            # Save epoch checkpoint
             ckpt_path = out_dir / f"tse_epoch_{epoch:02d}.pt"
             torch.save({"epoch": epoch, "model": model.state_dict(), "opt": optimizer.state_dict()}, ckpt_path)
-            print(f"Saved checkpoint to {ckpt_path}")
+
+            if mean_val_loss < best_val_loss:
+                best_val_loss = mean_val_loss
+                best_ckpt = out_dir / "tse_best.pt"
+                torch.save({"epoch": epoch, "model": model.state_dict(), "val_loss": best_val_loss}, best_ckpt)
+                print(f"    * New best validation loss! Saved {best_ckpt}")
 
     finally:
-        if lock_fd:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            lock_fd.close()
-            print("Released GPU lock.")
+        if "cuda" in args.device:
+            release_gpu_guard()
 
 
 if __name__ == "__main__":
