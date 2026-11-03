@@ -54,6 +54,12 @@ E
 }
 
 STAGE=${1:-}
+# One stage at a time. The GPU lock does not block its own handle, so two runners would both get the card.
+case "$STAGE" in
+  data|phase2|phase1|board)
+    exec 9>"$ROOT/.stage.lock"
+    flock -n 9 || { echo "STOP [$STAGE]: another stage of this runner is already running. Wait for it to end; do not start a second one."; exit 1; } ;;
+esac
 case "$STAGE" in
 check)
   : > "$LOG/check.log"
