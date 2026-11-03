@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Owner: ANTIGRAVITY <antigravity@aavepyora.online>
+# Last edited: WINTERMUTE 2026-11-03 -- defaults point at the post-fix v2 runs; board takes --base-dir, trainer --epoch-length
 """Phase 1: Asymmetric Target Sound Extractor Evaluation & Separation Tax Gate.
 
 Evaluates trained Asymmetric TSE (tse_best.pt) vs Demucs baseline on held-out songs:
@@ -224,7 +225,7 @@ def main():
     ap.add_argument("--n-items", type=int, default=40)
     ap.add_argument("--draws", type=int, default=4)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--tse-ckpt", default="/home/kim/sao_runs/v8_phase1_tse/tse_best.pt")
+    ap.add_argument("--tse-ckpt", default="/home/kim/sao_runs/v8_phase1_tse_v2/tse_best.pt")
     ap.add_argument("--v6c", default="/home/kim/sao_runs/v6_C/flow_best.pt")
     ap.add_argument("--cache-dir", default="/home/kim/sao_runs/v8_stem_cache")
     ap.add_argument("--out", default="/home/kim/Projects/SAO/eval/v8_phase1_tse_results_v2.json")

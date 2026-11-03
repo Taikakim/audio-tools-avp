@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Owner: ANTIGRAVITY <antigravity@aavepyora.online>
+# Last edited: WINTERMUTE 2026-11-03 -- defaults point at the post-fix v2 runs; board takes --base-dir, trainer --epoch-length
 """V8 Interactive Evaluation Board Builder.
 
 Generates the complete evaluation suite and interactive HTML audition board:
@@ -83,9 +84,11 @@ def transcode_to_aac(wav_path: Path, aac_path: Path):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
 
-def build_eval_board(phase1_json=None, phase2_json=None):
+def build_eval_board(phase1_json=None, phase2_json=None, base_dir="/home/kim/evals_aac/synth_inversion_v8",
+                     tse_ckpt="/home/kim/sao_runs/v8_phase1_tse_v2/tse_best.pt",
+                     inv_ckpt="/home/kim/sao_runs/v8_phase2_inverter_v2/dynamic_inverter_best.pt"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    base_dir = Path("/home/kim/evals_aac/synth_inversion_v8")
+    base_dir = Path(base_dir)
     audio_dir = base_dir / "audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,8 +98,8 @@ def build_eval_board(phase1_json=None, phase2_json=None):
     print("=" * 80)
 
     # 1. Load Models
-    tse_ckpt_path = Path("/home/kim/sao_runs/v8_phase1_tse/tse_best.pt")
-    inv_ckpt_path = Path("/home/kim/sao_runs/v8_phase2_inverter/dynamic_inverter_best.pt")
+    tse_ckpt_path = Path(tse_ckpt)
+    inv_ckpt_path = Path(inv_ckpt)
 
     print("Loading Phase 1 TSE model...")
     tse_model = AsymmetricTSEModel().to(device).eval()
@@ -416,7 +419,7 @@ def build_eval_board(phase1_json=None, phase2_json=None):
         f.write(html_content)
 
     # Create root redirect
-    redirect_path = Path("/home/kim/evals_aac/synth_inversion_v8.html")
+    redirect_path = base_dir.parent / (base_dir.name + ".html")
     with open(redirect_path, "w") as f:
         f.write('<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0; url=synth_inversion_v8/index.html"></head><body>Redirecting to <a href="synth_inversion_v8/index.html">V8 Audition Dashboard</a>...</body></html>\n')
 
@@ -1101,13 +1104,16 @@ def main():
     ap = argparse.ArgumentParser(description="Build the V8 audition board")
     ap.add_argument("--phase1-json", default="/home/kim/Projects/SAO/eval/v8_phase1_tse_results_v2.json")
     ap.add_argument("--phase2-json", default="/home/kim/Projects/SAO/eval/v8_phase2_dynamic_results_v2.json")
+    ap.add_argument("--base-dir", default="/home/kim/evals_aac/synth_inversion_v8")
+    ap.add_argument("--tse-ckpt", default="/home/kim/sao_runs/v8_phase1_tse_v2/tse_best.pt")
+    ap.add_argument("--inv-ckpt", default="/home/kim/sao_runs/v8_phase2_inverter_v2/dynamic_inverter_best.pt")
     a = ap.parse_args()
     on_gpu = torch.cuda.is_available()
     if on_gpu and not acquire_gpu_guard():
         print("GPU is currently busy. Exiting.", file=sys.stderr)
         sys.exit(0)
     try:
-        build_eval_board(a.phase1_json, a.phase2_json)
+        build_eval_board(a.phase1_json, a.phase2_json, a.base_dir, a.tse_ckpt, a.inv_ckpt)
     finally:
         if on_gpu:
             release_gpu_guard()

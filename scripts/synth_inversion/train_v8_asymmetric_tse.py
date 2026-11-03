@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Owner: ANTIGRAVITY <antigravity@aavepyora.online>
+# Last edited: WINTERMUTE 2026-11-03 -- defaults point at the post-fix v2 runs; board takes --base-dir, trainer --epoch-length
 """Phase 1: Asymmetric Target Sound Extractor (TSE) Training Pipeline.
 
 Trains an Asymmetric Target Sound Extractor on authentic multitrack mixtures:
@@ -247,7 +248,8 @@ def main():
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size per worker")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--output-dir", type=str, default="/home/kim/sao_runs/v8_phase1_tse")
+    parser.add_argument("--output-dir", type=str, default="/home/kim/sao_runs/v8_phase1_tse_v2")
+    parser.add_argument("--epoch-length", type=int, default=2000, help="Training samples per epoch")
     parser.add_argument("--wait-gpu", action="store_true", help="Wait on GPU lock until GPU becomes free")
     args = parser.parse_args()
 
@@ -265,7 +267,7 @@ def main():
 
     try:
         # 2. Setup Dataset & Dataloader
-        train_ds = MusicalDatasetV8(split="train", epoch_length=2000)
+        train_ds = MusicalDatasetV8(split="train", epoch_length=args.epoch_length)
         val_ds = MusicalDatasetV8(split="val", epoch_length=200)
 
         train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)

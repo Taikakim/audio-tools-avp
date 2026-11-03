@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Owner: ANTIGRAVITY <antigravity@aavepyora.online>
+# Last edited: WINTERMUTE 2026-11-03 -- defaults point at the post-fix v2 runs; board takes --base-dir, trainer --epoch-length
 """V8 End-to-End Pipeline: Asymmetric TSE + Dynamic Parameter Inversion + DAW Export Bundle.
 
 Demonstrates the complete Deep V8 inverted-audio pipeline:
@@ -66,7 +67,7 @@ def run_e2e_pipeline(device: str = "cuda", out_dir: str = "/home/kim/sao_runs/v8
     print("=" * 80)
 
     # 1. Load TSE Model (Phase 1)
-    tse_ckpt_path = Path("/home/kim/sao_runs/v8_phase1_tse/tse_best.pt")
+    tse_ckpt_path = Path("/home/kim/sao_runs/v8_phase1_tse_v2/tse_best.pt")
     if not tse_ckpt_path.exists():
         print(f"Error: TSE checkpoint not found at {tse_ckpt_path}", file=sys.stderr)
         return False
@@ -75,7 +76,7 @@ def run_e2e_pipeline(device: str = "cuda", out_dir: str = "/home/kim/sao_runs/v8
     tse_model.load_state_dict(tse_ckpt["model"])
 
     # 2. Load Dynamic Inverter Model (Phase 2)
-    inv_ckpt_path = Path("/home/kim/sao_runs/v8_phase2_inverter/dynamic_inverter_best.pt")
+    inv_ckpt_path = Path("/home/kim/sao_runs/v8_phase2_inverter_v2/dynamic_inverter_best.pt")
     if not inv_ckpt_path.exists():
         print(f"Error: Inverter checkpoint not found at {inv_ckpt_path}", file=sys.stderr)
         return False
