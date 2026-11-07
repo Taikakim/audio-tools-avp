@@ -1,0 +1,53 @@
+{
+  "title": "Phase 9 \u2014 Experiment A.1: Oracle Interaction Residual Predictability",
+  "timestamp": "2026-11-07 11:52:11",
+  "hardware": "AMD Radeon RX 9070 XT",
+  "reference_baselines": {
+    "untouched_mixture_sdr": -32.210328189531964,
+    "autoencoder_ceiling_sdr": -11.030251240730285
+  },
+  "models": {
+    "zero_baseline": {
+      "name": "Zero Baseline (Additive Null)",
+      "nmse": 1.0,
+      "r2": 0.18264402210712433,
+      "mean_sdr": -12.952627485990524,
+      "delta_sdr_vs_mix": 19.25770070354144
+    },
+    "global_mean": {
+      "name": "Global Mean Baseline",
+      "nmse": 1.3330840891599656,
+      "r2": 0.0,
+      "mean_sdr": -12.955888639887174,
+      "delta_sdr_vs_mix": 19.25443954964479
+    },
+    "class_mean": {
+      "name": "Class Mean Baseline",
+      "nmse": 1.2994057017564773,
+      "r2": 0.022120570540428163,
+      "mean_sdr": -12.920962100227674,
+      "delta_sdr_vs_mix": 19.289366089304288
+    },
+    "bilinear": {
+      "name": "Bilinear Interaction Model",
+      "nmse": 0.9489013762772083,
+      "r2": 0.2959969353675842,
+      "mean_sdr": -12.454189691940943,
+      "delta_sdr_vs_mix": 19.75613849759102
+    },
+    "local_conv": {
+      "name": "Local Temporal CNN (w=3)",
+      "nmse": 1.7005774801969529,
+      "r2": -0.1453634786605835,
+      "mean_sdr": -12.852651664614678,
+      "delta_sdr_vs_mix": 19.357676524917288
+    },
+    "contextual": {
+      "name": "Contextual Sequence Model (Conv+Attn)",
+      "nmse": 0.8082761374115944,
+      "r2": 0.39107960402965547,
+      "mean_sdr": -12.158242424329122,
+      "delta_sdr_vs_mix": 20.05208576520284
+    }
+  }
+}

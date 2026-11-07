@@ -1,0 +1,16 @@
+{
+  "experiment": "Phase 9 \u2014 Stage B: Structured Deterministic Separation",
+  "timestamp": "2026-11-07 11:54:25",
+  "metrics": {
+    "untouched_mix_sdr": -32.210328189531964,
+    "direct_separator_sdr": -23.68940262570977,
+    "structured_physical_sdr": -26.6462182863305,
+    "naive_subtraction_sdr": -12.946565155188242,
+    "clean_ae_ceiling_sdr": -11.030789103110632
+  },
+  "gains_vs_untouched": {
+    "direct_gain_db": 8.520925563822193,
+    "structured_gain_db": 5.564109903201462,
+    "naive_oracle_gain_db": 19.26376303434372
+  }
+}

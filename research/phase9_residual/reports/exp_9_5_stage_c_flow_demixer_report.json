@@ -1,0 +1,11 @@
+{
+  "experiment": "Phase 9 \u2014 Stage C: Conditional Flow-Matching Generative Demixing",
+  "timestamp": "2026-11-07 11:55:10",
+  "metrics": {
+    "untouched_mix_sdr": -32.210328189531964,
+    "flow_matching_sdr": -32.08851376970609,
+    "clean_ae_ceiling_sdr": -11.033328334490458,
+    "sample_diversity_variance": 0.22507564475138983
+  },
+  "gain_vs_untouched_db": 0.12181441982587415
+}
