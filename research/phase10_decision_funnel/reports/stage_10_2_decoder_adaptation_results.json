@@ -1,0 +1,77 @@
+{
+  "mix_mean_sdr": -1.5332959164114832,
+  "mix_median_sdr": -0.20465493202209473,
+  "configurations": {
+    "Config_A_Frozen_Decoder": {
+      "sep_mean_sdr": 3.090444487275429,
+      "sep_median_sdr": 4.521942138671875,
+      "clean_ae_mean_sdr": 12.335833853454266,
+      "clean_ae_penalty_vs_frozen": 0.0,
+      "delta_sep_vs_frozen": 0.0,
+      "by_fam_sep": {
+        "bass": -6.985291202863057,
+        "hihat": 7.799865129093329,
+        "kick": 2.2707898937738857,
+        "lead": 7.025265693664551,
+        "percussion": 7.22660971681277,
+        "snare": 3.5789478143056233
+      },
+      "by_fam_clean": {
+        "bass": 10.468253732555443,
+        "hihat": 13.999267116189003,
+        "kick": 13.25930448449575,
+        "lead": 14.8963041305542,
+        "percussion": 14.114343321985668,
+        "snare": 7.839146951834361
+      }
+    },
+    "Config_B_Decoder_LoRA": {
+      "sep_mean_sdr": 5.15045411913719,
+      "sep_median_sdr": 5.536279201507568,
+      "clean_ae_mean_sdr": 12.114488933922596,
+      "clean_ae_penalty_vs_frozen": 0.22134491953167057,
+      "delta_sep_vs_frozen": 2.0600096318617607,
+      "by_fam_sep": {
+        "bass": -4.906611304316256,
+        "hihat": 8.83235815167427,
+        "kick": 5.434713203173417,
+        "lead": 6.809256076812744,
+        "percussion": 9.727925570474731,
+        "snare": 5.121031093597412
+      },
+      "by_fam_clean": {
+        "bass": 10.442415833473206,
+        "hihat": 13.598030791928371,
+        "kick": 12.805917060145966,
+        "lead": 14.382913589477539,
+        "percussion": 13.931930164910025,
+        "snare": 8.06544816493988
+      }
+    },
+    "Config_C_Residual_Adapter": {
+      "sep_mean_sdr": 3.1115863305851095,
+      "sep_median_sdr": 4.524010181427002,
+      "clean_ae_mean_sdr": 12.338142304744535,
+      "clean_ae_penalty_vs_frozen": -0.002308451290268465,
+      "delta_sep_vs_frozen": 0.021141843309680386,
+      "by_fam_sep": {
+        "bass": -6.941118799977833,
+        "hihat": 7.797015741467476,
+        "kick": 2.338559008561648,
+        "lead": 6.983898878097534,
+        "percussion": 7.232977671755685,
+        "snare": 3.556081505616506
+      },
+      "by_fam_clean": {
+        "bass": 10.468938145372602,
+        "hihat": 14.002627532929182,
+        "kick": 13.262255824529207,
+        "lead": 14.894862651824951,
+        "percussion": 14.117519920070967,
+        "snare": 7.840064978599548
+      }
+    }
+  },
+  "gate_decision": "ADAPT_DECODER",
+  "selected_adaptation": "Config_B_Decoder_LoRA"
+}

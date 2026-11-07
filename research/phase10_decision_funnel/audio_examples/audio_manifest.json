@@ -1,0 +1,92 @@
+[
+  {
+    "family": "bass",
+    "mixture_id": "test_0004",
+    "sdr_mix": -4.043669700622559,
+    "sdr_clean_ae": 7.666165828704834,
+    "sdr_latent_frozen": 1.9017635583877563,
+    "sdr_hybrid": 2.9156601428985596,
+    "paths": {
+      "mixture": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/bass_test_0004_1_mixture.wav",
+      "target_gt": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/bass_test_0004_2_target_gt.wav",
+      "clean_ae": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/bass_test_0004_3_clean_ae.wav",
+      "latent_frozen": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/bass_test_0004_4_latent_frozen.wav",
+      "hybrid_refiner": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/bass_test_0004_5_hybrid_refiner.wav"
+    }
+  },
+  {
+    "family": "hihat",
+    "mixture_id": "test_0000",
+    "sdr_mix": 9.35711669921875,
+    "sdr_clean_ae": 0.6013919115066528,
+    "sdr_latent_frozen": 0.5904573798179626,
+    "sdr_hybrid": 0.8877885937690735,
+    "paths": {
+      "mixture": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/hihat_test_0000_1_mixture.wav",
+      "target_gt": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/hihat_test_0000_2_target_gt.wav",
+      "clean_ae": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/hihat_test_0000_3_clean_ae.wav",
+      "latent_frozen": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/hihat_test_0000_4_latent_frozen.wav",
+      "hybrid_refiner": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/hihat_test_0000_5_hybrid_refiner.wav"
+    }
+  },
+  {
+    "family": "kick",
+    "mixture_id": "test_0005",
+    "sdr_mix": 3.140235185623169,
+    "sdr_clean_ae": 11.400848388671875,
+    "sdr_latent_frozen": 4.5521135330200195,
+    "sdr_hybrid": 5.6443047523498535,
+    "paths": {
+      "mixture": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/kick_test_0005_1_mixture.wav",
+      "target_gt": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/kick_test_0005_2_target_gt.wav",
+      "clean_ae": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/kick_test_0005_3_clean_ae.wav",
+      "latent_frozen": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/kick_test_0005_4_latent_frozen.wav",
+      "hybrid_refiner": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/kick_test_0005_5_hybrid_refiner.wav"
+    }
+  },
+  {
+    "family": "lead",
+    "mixture_id": "test_0021",
+    "sdr_mix": 4.084121227264404,
+    "sdr_clean_ae": 21.354507446289062,
+    "sdr_latent_frozen": 6.2327680587768555,
+    "sdr_hybrid": 5.42858362197876,
+    "paths": {
+      "mixture": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/lead_test_0021_1_mixture.wav",
+      "target_gt": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/lead_test_0021_2_target_gt.wav",
+      "clean_ae": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/lead_test_0021_3_clean_ae.wav",
+      "latent_frozen": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/lead_test_0021_4_latent_frozen.wav",
+      "hybrid_refiner": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/lead_test_0021_5_hybrid_refiner.wav"
+    }
+  },
+  {
+    "family": "percussion",
+    "mixture_id": "test_0003",
+    "sdr_mix": -21.716421127319336,
+    "sdr_clean_ae": 1.4777193069458008,
+    "sdr_latent_frozen": -4.715573310852051,
+    "sdr_hybrid": -3.8297626972198486,
+    "paths": {
+      "mixture": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/percussion_test_0003_1_mixture.wav",
+      "target_gt": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/percussion_test_0003_2_target_gt.wav",
+      "clean_ae": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/percussion_test_0003_3_clean_ae.wav",
+      "latent_frozen": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/percussion_test_0003_4_latent_frozen.wav",
+      "hybrid_refiner": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/percussion_test_0003_5_hybrid_refiner.wav"
+    }
+  },
+  {
+    "family": "snare",
+    "mixture_id": "test_0029",
+    "sdr_mix": -1.502828598022461,
+    "sdr_clean_ae": 7.635435581207275,
+    "sdr_latent_frozen": 2.7854528427124023,
+    "sdr_hybrid": 3.1294610500335693,
+    "paths": {
+      "mixture": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/snare_test_0029_1_mixture.wav",
+      "target_gt": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/snare_test_0029_2_target_gt.wav",
+      "clean_ae": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/snare_test_0029_3_clean_ae.wav",
+      "latent_frozen": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/snare_test_0029_4_latent_frozen.wav",
+      "hybrid_refiner": "/home/kim/Projects/SAO/stable-audio-tools/research/phase10_decision_funnel/audio_examples/snare_test_0029_5_hybrid_refiner.wav"
+    }
+  }
+]
